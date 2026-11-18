@@ -1,0 +1,29 @@
+THE HUNTER'S JOURNAL — ALL-IN-ONE ASI
+Windows x64. Install FolkloreHunterJournal.asi with Ultimate ASI Loader.
+Launch the game normally; the ASI loader initializes the plugin automatically.
+
+F8  Open/close Hunter's Journal
+F9  Show/hide in-game diagnostics (default ON)
+F10 Show/hide native Windows console (default ON)
+
+%LOCALAPPDATA%\FolkloreHunterJournal\journal.ini:
+[Journal]
+SafeMode=0
+DebugOverlay=1
+Console=1
+
+Persistent diagnostics:
+%LOCALAPPDATA%\FolkloreHunterJournal\journal.log
+%LOCALAPPDATA%\FolkloreHunterJournal\crash-trace.log
+
+Live in-game diagnostics combine the mod's initialization messages and
+best-effort file logs from %LOCALAPPDATA%\FolkloreHunter\Saved\Logs.
+Shipping builds may disable or relocate game logs.
+
+Active DX11 and DX12 renderers are detected from game swapchains, not just
+loaded DLL names. DX12 uses D3D11On12 with a captured direct command queue;
+in-game DX12 behavior is experimental and requires validation.
+
+On a fatal error, set SafeMode=1 to disable graphics hooks while preserving
+startup logs. An exception log can include handled first-chance exceptions.
+Do not use this ASI for anti-cheat bypass. Test in private/offline sessions.

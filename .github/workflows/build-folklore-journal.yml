@@ -1,0 +1,74 @@
+name: Build Folklore Hunter Journal input fix + native gameplay bridge
+on:
+  push:
+    branches: [builds/folklore-hunter-journal-asi-diagnostics, features/hunter-journal-input-theme, features/hunter-journal-item-catalog-pranks, features/hunter-journal-horror-scares, features/hunter-journal-esp-player-targeting, features/hunter-journal-physics-creatures-esp, features/hunter-journal-v10-flight-esp-monster, features/hunter-journal-v11-damage-protection, features/hunter-journal-v12-smooth-monster-control]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout project branch
+        uses: actions/checkout@v4
+      - name: Setup CMake
+        uses: lukka/get-cmake@latest
+      - name: Show toolchains
+        shell: pwsh
+        run: cmake --version
+      - name: Configure x64
+        shell: pwsh
+        run: cmake -S FolkloreHunterJournal-ASI -B FolkloreHunterJournal-ASI/build -G "Visual Studio 18 2026" -A x64
+      - name: Compile Release x64
+        shell: pwsh
+        run: cmake --build FolkloreHunterJournal-ASI/build --config Release --parallel
+      - name: Stage ASI and DLL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = Get-ChildItem FolkloreHunterJournal-ASI/build -Recurse -File -Filter "FolkloreHunterJournal.asi" | Where-Object {$_.DirectoryName -match "Release"} | Select-Object -First 1
+          if (-not $output) { throw "Compiled ASI not found" }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $output.FullName dist/FolkloreHunterJournal.asi
+          Copy-Item $output.FullName dist/FolkloreHunterJournal.dll
+          $pdb = Get-ChildItem FolkloreHunterJournal-ASI/build -Recurse -File -Filter "FolkloreHunterJournal.pdb" | Select-Object -First 1
+          if ($pdb) { Copy-Item $pdb.FullName dist/FolkloreHunterJournal.pdb }
+          $map = Get-ChildItem FolkloreHunterJournal-ASI/build -Recurse -File -Filter "FolkloreHunterJournal.map" | Select-Object -First 1
+          if ($map) { Copy-Item $map.FullName dist/FolkloreHunterJournal.map }
+          $bytes = [IO.File]::ReadAllBytes("dist/FolkloreHunterJournal.asi")
+          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { throw "Not PE" }
+          $pe = [BitConverter]::ToInt32($bytes,0x3C)
+          if ([BitConverter]::ToUInt16($bytes,$pe+4) -ne 0x8664) { throw "Not x64" }
+          @'
+          Folklore Hunter - THE HUNTER'S JOURNAL v0.5 experimental
+          Native ASI plugin; Windows x64; Ultimate ASI Loader required.
+          IMPORTANT: Remove old .asi versions before copying FolkloreHunterJournal.asi.
+          Do NOT copy the DLL and ASI simultaneously to the plugins folder.
+
+          F8: journal + capture mouse for UI, F9: debug overlay, F10: native console.
+          F9 overlay is visible by default. F10 console can be hidden from Options.
+          DX11/DX12 graphics support uses existing bridge.
+          Journal and diagnostic windows use dark hunter styling and adaptive size.\n          Supplies page: 19 clickable, searchable SDK-derived inventory items (no IDs typed).\n          Pranks page: host time, speed, weather, native experimental Bean/Ranger/Smores modes.
+
+          Crypto/Player ESP: 110ms actor cache, capped 180 markers; disabled
+          by default; enable under CRYPTIDS. Camera projection is experimental.
+          Host actions: only where World.AuthorityGameMode exists.
+          GiveItem prefers FL_Gamemode_C Blueprint implementation, then native.
+          Native action effects are NOT YET verified in the running game.
+          Item names must match those recognized by the game's own function.
+          Kick/ban, vanity, and other player-specific multiplayer controls
+          remain pending verified implementation; no claim of full coverage.
+
+          Settings: %LOCALAPPDATA%\FolkloreHunterJournal\journal.ini
+          Logs: journal.log and crash-trace.log in the same folder.
+          Set SafeMode=1 if the game crashes, or restore your previous ASI.
+          Test in an offline/private authorized session. No anti-cheat bypass.
+          '@ | Set-Content dist/README.txt
+          Get-FileHash dist/FolkloreHunterJournal.asi -Algorithm SHA256
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: FolkloreHunterJournal-x64-v12-SmoothMovement-Creatures-Cheats
+          path: dist/*
+          if-no-files-found: error

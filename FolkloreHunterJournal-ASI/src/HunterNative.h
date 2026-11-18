@@ -1,0 +1,104 @@
+#pragma once
+#include <Windows.h>
+#include <imgui.h>
+#include <cstdint>
+#include <string>
+#include <vector>
+namespace HunterNative {
+    constexpr UINT kGameTick = WM_APP + 0x358;
+    constexpr UINT kGameAction = WM_APP + 0x359;
+    struct CreatureInfo {
+        int objectIndex = -1;
+        std::string displayName;
+        bool isPawn = false;
+    };
+    struct VanityItem {
+        std::string label;
+        std::string className;
+        bool equipped = false;
+    };
+    struct PlayerInfo {
+        int objectIndex = -1;
+        std::string displayName;
+        bool local = false;
+        double health = -1;
+        bool alive = true;
+        bool invulnerable = false;
+    };
+    struct Status {
+        bool worldReady = false;
+        bool host = false;
+        bool cameraReady = false;
+        double localHealth = -1.0;
+        double localMaxHealth = -1.0;
+        bool invuln = false;
+        bool localGodProtected = false;
+        bool fallProtectionEnabled = false;
+        int fallProtectedPlayers = 0;
+        int godProtectedPlayers = 0;
+        int knownActors = 0;
+        int activeCryptids = 0;
+        int activePlayers = 0;
+        int scanned = 0;
+        int totalObjects = 0;
+        int levelsScanned = 0;
+        int actorsExamined = 0;
+        int espCandidates = 0;
+        int activeWildlife = 0;
+        int activeContainers = 0;
+        int activeQuestObjects = 0;
+        int activeLoot = 0;
+        int activeMobSpawners = 0;
+    };
+    void AttachWindow(HWND window);
+    void RequestTick();
+    void HandleWindowMessage(UINT message);
+    Status GetStatus();
+    std::vector<PlayerInfo> GetPlayers();
+    std::vector<CreatureInfo> GetCreatures();
+    std::vector<VanityItem> GetVanityItems();
+    bool RequestEquipVanity(const std::string& className);
+    // Gameplay changes are runtime experiments and may not replicate to clients.
+    bool RequestFallProtection(bool enabled);
+    bool RequestSpeedMultiplier(float factor, bool entireLobby);
+    bool RequestJumpBoost(float multiplier, bool entireLobby = false);
+    bool RequestGravity(float gravityScale, bool entireLobby);
+    bool RequestSpawnMobWave(int count, int selectedLiveCryptidIndex = -1);
+    bool RequestPossessCryptid(int objectIndex);
+    bool RequestRestoreHuman();
+    // Only abilities exposed by the matching creature's reflected class are invoked.
+    bool RequestMonsterAbility(int slot);
+    bool RequestNoclip(bool enabled);
+    bool RequestTargetHealth(int targetObjectIndex, double value);
+    bool RequestTargetItem(int targetObjectIndex, const std::string& itemClass, int amount);
+    bool RequestTargetNoise(int targetObjectIndex, double loudness, double rangeMeters);
+    bool RequestTargetRevive(int targetObjectIndex);
+    bool RequestTargetKill(int targetObjectIndex);
+    bool RequestTargetKick(int targetObjectIndex);
+    bool RequestTargetGodMode(int targetObjectIndex, bool enabled);
+    bool ESPEnabled();
+    bool MonsterModeActive();
+    bool NoclipActive();
+    int MonsterSpecies();
+    void DrawMonsterHUD(ImVec2 size);
+    void SetJournalOpen(bool isOpen);
+    void FeedRawMouse(LPARAM lParam);
+    void DrawESP(ImVec2 size);
+    void DrawESPSettings();
+    bool RequestGiveItem(const std::string& itemName, int amount);
+    bool RequestGodMode();
+    bool RequestAddXP(int xp);
+    bool RequestTime(float hour);
+    bool RequestTimeScale(float scale);
+    bool RequestAddSilver(int amount);
+    bool RequestInfiniteDamage();
+    // Item catalog uses the real UItem_*_C class names from the SDK.
+    bool RequestCatalogItem(const std::string& className, int amount);
+    bool RequestBeanMode();
+    bool RequestRangerMode();
+    bool RequestSmoreMode();
+    bool RequestRain(double intensity);
+    bool RequestSnow(double intensity);
+    bool RequestVampireScream();
+    bool RequestFlickerLights(bool cancel);
+}
