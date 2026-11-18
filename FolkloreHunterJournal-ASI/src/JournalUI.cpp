@@ -425,17 +425,18 @@ namespace FHJ
             if(ImGui::Button("RESTORE HUMAN CHARACTER",ImVec2(-1,30)))
                 HunterNative::RequestRestoreHuman();
             if(!state.host)ImGui::EndDisabled();
-            ImGui::TextDisabled("Puppet Mode preserves the human pawn but disables its gameplay input.");
-            ImGui::TextDisabled("Native movement and AI path-stop are dispatched; verify movement in-game.");
+            ImGui::TextDisabled("Remote cryptid control preserves the human pawn in the expedition.");
+            ImGui::TextDisabled("WASD uses native AI navigation (swept fallback); Shift sprint.");
+            ImGui::TextDisabled("Chase camera uses collision sweep to pull in near walls.");
             if(HunterNative::MonsterModeActive()) {
                 ImGui::Separator();
                 ImGui::TextColored(Palette::col_gold,"MONSTER ABILITIES");
                 if(ImGui::Button("MELEE ATTACK [LMB]",ImVec2(-1,29)))
                     HunterNative::RequestMonsterAbility(0);
                 const bool vampire=HunterNative::MonsterSpecies()==2;
-                if(!vampire)ImGui::BeginDisabled();
-                if(ImGui::Button("VAMPIRE SCREAM [Q]",ImVec2(-1,29)))
+                if(ImGui::Button(vampire?"VAMPIRE SCREAM [Q]":"CRYPTID ROAR / SCREAM [Q]",ImVec2(-1,29)))
                     HunterNative::RequestMonsterAbility(1);
+                if(!vampire)ImGui::BeginDisabled();
                 if(ImGui::Button("VAMPIRE INVISIBILITY [E]",ImVec2(-1,29)))
                     HunterNative::RequestMonsterAbility(2);
                 if(ImGui::Button("VAMPIRE CHANGE STANCE [R]",ImVec2(-1,29)))
@@ -443,7 +444,8 @@ namespace FHJ
                 if(ImGui::Button("VAMPIRE SCREAM AUDIO",ImVec2(-1,29)))
                     HunterNative::RequestMonsterAbility(4);
                 if(!vampire)ImGui::EndDisabled();
-                if(!vampire)ImGui::TextDisabled("Mothman/Wendigo unique abilities need verified class-specific parameters.");
+                ImGui::TextDisabled("Abilities are selected from the cryptid's reflected UFunctions.");
+                ImGui::TextDisabled("Unavailable methods and rejected signatures are logged in F9.");
             }
             ImGui::TextDisabled("F8 journal, F11 safe Return Human; hunter HUD hidden in monster mode.");
             Notice("SDK VALIDATION",
