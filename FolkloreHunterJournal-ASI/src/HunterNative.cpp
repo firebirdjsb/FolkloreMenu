@@ -134,6 +134,7 @@ namespace {
     bool gVampireInvisible=false;
     std::array<ULONGLONG,5> gAbilityTicks{};
     std::array<bool,3> gAbilityKeyDown{};
+    std::atomic_int gMonsterAttackSoundIndex{-1};
     ULONGLONG gLastAbilityTick=0;
     Vec3 gChaseSmoothedPos{};
     bool gChaseSmoothedValid=false;
@@ -484,6 +485,7 @@ namespace {
             gKinds.clear();gClassNames.clear();gFunctionCache.clear();
             gKnown.clear();
             gSoundScanCursor=0;gSoundCandidates.clear();gCameraShakeCandidates.clear();
+            gMonsterAttackSoundIndex.store(-1);
             gPhysicsBackups.clear();gFallBackups.clear();gGodBackups.clear();
             // Level transition invalidates actor pointers. Never restore input to
             // a destroyed body; clear references and capture state instead.
@@ -1844,8 +1846,15 @@ namespace {
         if(!pc || !play)return;
         int total=0;uintptr_t chunks=0;
         if(!GetObjects(total,chunks))return;
-        int best=-1,scoreBest=0;
+        int best=gMonsterAttackSoundIndex.load(),scoreBest=0;
+        bool explicitValid=false;
+        if(best>=0 && best<total) {
+            const auto chosen=ObjectAt(best,chunks);
+            explicitValid=chosen && IsSoundAssetClass(ReadPtr(chosen+0x10));
+        }
+        if(!explicitValid)best=-1;
         for(const auto& info:gSoundCandidates) {
+            if(explicitValid)break;
             const auto asset=ObjectAt(info.objectIndex,chunks);
             if(!asset || !IsSoundAssetClass(ReadPtr(asset+0x10)))continue;
             const auto label=Lower(std::wstring(info.displayName.begin(),info.displayName.end()));
@@ -3416,6 +3425,9 @@ void HunterNative::DrawMonsterHUD(ImVec2 screen) {
 bool HunterNative::RequestMonsterAbility(int slot) {
     if(slot<0 || slot>5 || !gMonsterActive.load())return false;
     return Enqueue({ActionType::MonsterAbility,"",slot,0,-1,0});
+}
+void HunterNative::SetMonsterAttackSound(int soundObjectIndex) {
+    gMonsterAttackSoundIndex.store(soundObjectIndex>=0?soundObjectIndex:-1);
 }
 
 bool HunterNative::RequestEquipVanity(const std::string& name) {
