@@ -1202,7 +1202,7 @@ namespace {
             gFlySpeedSaved=false;gOriginalFlyMovement=0;
             gNoclipEnabled=false;gNoclipPawn=0;
         }
-        FHJDiag::Log(enabled?L"Local noclip flying/collision request dispatched.":
+        FHJDiag::Log(enabled?L"Local noclip: flying/no collision enabled; WASD uses direct world-position movement.":
             L"Local noclip disabled; movement and collision restoration requested.");
     }
 
@@ -1598,9 +1598,11 @@ namespace {
             }
             return;
         }
-        // Native character input is accumulated for CharacterMovement::Tick.
-        // The old K2_SetActorLocation teleport-per-frame method was causing
-        // both jitter and a permanently idle AnimBlueprint locomotion state.
+        // Puppet mode must keep native AddMovementInput to drive the cryptid
+        // AnimBlueprint. Noclip is different: the local game's movement/input
+        // graph can consume the X/Y components of AddMovementInput even in
+        // MOVE_Flying, leaving only Space/Ctrl working. Noclip uses a separate
+        // explicit unswept world-space movement path below.
         const double dt=std::clamp(static_cast<double>(elapsed)*.001,0.0,.045);
         const auto camera=GetCamera(world);
         const double yaw=(monster?gMonsterYaw:camera.rot.yaw)*kPi/180.0;
@@ -1620,18 +1622,55 @@ namespace {
         const double ascend=flying?
             static_cast<double>(down(VK_SPACE))-static_cast<double>(down(VK_CONTROL)):0.0;
         Vec3 input{cy*front-sy*strafe,sy*front+cy*strafe,ascend};
-        if(flying) {
+        if(monster && flying) {
+            // Mothman follows camera pitch. Noclip intentionally stays on the
+            // XY plane for WASD so looking up/down never kills forward motion.
             input.x*=cp; input.y*=cp;
             input.z+=sp*front;
         }
         const double length=std::sqrt(input.x*input.x+input.y*input.y+input.z*input.z);
         if(length>1e-3) {
             input.x/=length;input.y/=length;input.z/=length;
-            if(!AddSmoothMovement(pawn,input,1.f)) {
+            if(!monster) {
+                if(pawn!=gNoclipPawn) {
+                    // If a respawn replaced the local pawn, do not move the
+                    // new body using a stale noclip session.
+                    gNoclipEnabled=false;gNoclipPawn=0;
+                    gFlySpeedSaved=false;gOriginalFlyMovement=0;
+                    FHJDiag::Log(L"NOCLIP: pawn changed; stopped free-flight safely.");
+                    return;
+                }
+                // Explicit movement bypasses Blueprint walk/strafe handling,
+                // which has been observed to suppress horizontal flight input.
+                // The actor still has MOVE_Flying and collision disabled.
+                Vec3 location{};
+                if(Position(pawn,location)) {
+                    const double speed=boost?1850.0:1150.0; // cm/s
+                    const Vec3 destination{
+                        location.x+input.x*speed*dt,
+                        location.y+input.y*speed*dt,
+                        location.z+input.z*speed*dt
+                    };
+                    const bool moved=SetActorLocationSafe(pawn,destination);
+                    if(!moved) {
+                        static ULONGLONG lastWarn=0;
+                        if(now-lastWarn>5000) {
+                            lastWarn=now;
+                            FHJDiag::Log(L"NOCLIP: K2_SetActorLocation rejected explicit movement. Check pawn authority / SDK offsets.");
+                        }
+                    }
+                } else {
+                    static ULONGLONG lastPosWarn=0;
+                    if(now-lastPosWarn>5000) {
+                        lastPosWarn=now;
+                        FHJDiag::Log(L"NOCLIP: could not read live player actor world location.");
+                    }
+                }
+            } else if(!AddSmoothMovement(pawn,input,1.f)) {
                 static ULONGLONG warned=0;
                 if(now-warned>8000) {
                     warned=now;
-                    FHJDiag::Log(L"Movement input could not be dispatched. No teleport fallback used.");
+                    FHJDiag::Log(L"CRYPTID: native movement input could not be dispatched.");
                 }
             }
         }
@@ -2521,16 +2560,20 @@ void HunterNative::DrawESP(ImVec2 display) {
         dl->AddLine({pt.x-5,pt.y},{pt.x+5,pt.y},color,1.2f);
         dl->AddLine({pt.x,pt.y-5},{pt.x,pt.y+5},color,1.2f);
         char label[160]{};
-        if(marker.health>=0 && marker.maxHealth>0)
+        const bool showHealth=marker.kind==1 || marker.kind==2;
+        if(showHealth && marker.health>=0 && marker.maxHealth>0)
             snprintf(label,sizeof(label),"%s %.0fm | HP %.0f / %.0f",
                 names[marker.kind],meters,marker.health,marker.maxHealth);
-        else if(marker.health>=0)
+        else if(showHealth && marker.health>=0)
             snprintf(label,sizeof(label),"%s %.0fm | HP %.0f",
                 names[marker.kind],meters,marker.health);
-        else snprintf(label,sizeof(label),"%s %.0fm | HP ?",names[marker.kind],meters);
+        else if(showHealth)
+            snprintf(label,sizeof(label),"%s %.0fm | HP ?",names[marker.kind],meters);
+        else
+            snprintf(label,sizeof(label),"%s %.0fm",names[marker.kind],meters);
         const float left=pt.x+radius+4;
         dl->AddText({left,pt.y-11},color,label);
-        if(marker.kind==2 && marker.health>=0 && marker.maxHealth>0) {
+        if(showHealth && marker.health>=0 && marker.maxHealth>0) {
             constexpr float width=94.f;
             const float ratio=std::clamp(
                 static_cast<float>(marker.health/marker.maxHealth),0.f,1.f);
