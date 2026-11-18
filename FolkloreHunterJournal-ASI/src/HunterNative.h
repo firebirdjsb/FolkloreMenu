@@ -56,6 +56,7 @@ namespace HunterNative {
         int activeLoot = 0;
         int activeMobSpawners = 0;
         int pendingSpawnTriggers = 0;
+        int confirmedSpawned = 0;
     };
     void AttachWindow(HWND window);
     void RequestTick();
