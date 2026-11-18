@@ -85,6 +85,11 @@ namespace {
     uintptr_t gHumanInputController=0;
     bool gHumanInputDisabled=false, gHumanIgnoreMovement=false, gHumanIgnoreLook=false;
     bool gPossessedCryptid = false;
+    // One map spawner can be used for many requests. Pace native TriggerSpawn
+    // invocations so a one-spawner level doesn't silently cap a wave at one.
+    struct SpawnWave {int remaining=0, requested=0, dispatched=0, speciesIndex=-1;
+        ULONGLONG nextTick=0;};
+    SpawnWave gSpawnWave{};
     std::atomic_bool gWildlife{true}, gContainers{true}, gQuest{true}, gLoot{true};
     
     uintptr_t gNoclipPawn = 0;
@@ -152,6 +157,7 @@ namespace {
     void MaintainGodProtection();
     void ForceActorNetUpdate(uintptr_t pawn);
     void FreeflightTick();
+    void AdvanceSpawnWave();
     std::atomic_bool gAutoJump{false};
     int gLastReported=0;
     constexpr double kPi=3.1415926535897932384626433832795;
@@ -412,10 +418,13 @@ namespace {
             gHumanHUD=0;gHumanHudHidden=false;gHudRestorePending=false;
             gChaseSmoothedValid=false;
             gGravityBackup=WorldGravityBackup{};
+            gSpawnWave=SpawnWave{};
             gNoclipPawn=0;gNoclipEnabled=false;
             FHJDiag::Log(L"World changed: reset ESP and player cache.");
         }
+        AdvanceSpawnWave();
         HunterNative::Status status{};
+        status.pendingSpawnTriggers=gSpawnWave.remaining;
         Camera cam{};
         std::vector<Marker> markers;
         std::vector<HunterNative::PlayerInfo> playersOut;
@@ -771,25 +780,26 @@ namespace {
         // and double-precision intensity inputs. Neither is Net replicated.
         const auto flag=actor+(rain?0x300:0x390);
         const bool enabled=intensity>0.001;
-        const bool changed=TryWrite(flag,enabled);
         alignas(8) uint8_t args[0x30]{};
         std::memcpy(args,&intensity,sizeof(intensity));
         if(!Invoke(actor,func,args)) {
             FHJDiag::Log(L"WEATHER: UFunction invocation failed.");
             return false;
         }
-        if(changed && enabled) {
-            // Spawn/initialize weather particle systems when enabling rain/snow
-            // on maps whose BP_WeatherTool started with that effect disabled.
-            const auto setup=FindFunction(L"BP_WeatherTool_C",L"Weather Setup Function");
-            if(setup)Invoke(actor,setup,nullptr);
-        }
-        bool readFlag=false;
-        Read(flag,readFlag);
-        FHJDiag::Log(changed && readFlag==enabled?
-            L"WEATHER: live weather tool flag verified and intensity function dispatched (local visibility only).":
-            L"WEATHER: intensity dispatched, but Enable_Rain/Snow flag could not be verified.");
-        return changed;
+        // The setter may turn the effect back on internally. Apply its enable
+        // flag *after* the setter, reconfigure particles on both enable/clear,
+        // then assert the final state after setup (which can rewrite flags).
+        const bool changed=TryWrite(flag,enabled);
+        const auto setup=FindFunction(L"BP_WeatherTool_C",L"Weather Setup Function");
+        if(setup)Invoke(actor,setup,nullptr);
+        if(!enabled)TryWrite(flag,false);
+        bool readFlag=!enabled;
+        const bool verified=Read(flag,readFlag) && readFlag==enabled;
+        FHJDiag::Log(changed && verified ?
+            (enabled?L"WEATHER: native intensity set and enable flag verified.":
+                     L"WEATHER: intensity zeroed, particle setup refreshed, enable flag cleared.") :
+            L"WEATHER: could not verify final Enable_Rain/Snow flag after native setter.");
+        return changed && verified;
     }
     bool IsVampire(uintptr_t actor) {
         auto klass=ReadPtr(actor+0x10);
@@ -1829,39 +1839,72 @@ namespace {
                 L"World gravity changed locally; remote players not targeted.");
         } else FHJDiag::Log(L"WorldGravityZ update failed.");
     }
+    void AdvanceSpawnWave() {
+        if(gSpawnWave.remaining<=0)return;
+        const auto now=GetTickCount64();
+        if(now<gSpawnWave.nextTick)return;
+        const auto world=World();
+        if(!world || !ReadPtr(world+0x158)) {
+            FHJDiag::Log(L"CRYPTID SPAWN: wave cancelled because host authority was lost.");
+            gSpawnWave=SpawnWave{};return;
+        }
+        const auto trigger=FindFunction(L"BP_MobSpawner_C",L"TriggerSpawn");
+        if(!trigger) {
+            FHJDiag::Log(L"CRYPTID SPAWN: native BP_MobSpawner_C.TriggerSpawn missing.");
+            gSpawnWave=SpawnWave{};return;
+        }
+        std::vector<uintptr_t> spawners;
+        int total=0;
+        for(const auto& level:GetWorldLevels(world,total))
+            for(int i=0;i<level.count;++i) {
+                const auto actor=ReadPtr(level.data+static_cast<size_t>(i)*8);
+                if(actor && ClassName(ReadPtr(actor+0x10))==L"BP_MobSpawner_C")
+                    spawners.push_back(actor);
+            }
+        if(spawners.empty()) {
+            FHJDiag::Log(L"CRYPTID SPAWN: no live native mob spawners in this hunt.");
+            gSpawnWave=SpawnWave{};return;
+        }
+        const auto actor=spawners[static_cast<size_t>(gSpawnWave.dispatched)%spawners.size()];
+        uintptr_t species=0;
+        for(const auto& found:gKnown)
+            if(found.kind==2 && found.index==gSpawnWave.speciesIndex) {
+                int32_t live=-1;
+                if(Read(found.address+0xC,live) && live==found.index)
+                    species=ReadPtr(found.address+0x10);
+                break;
+            }
+        uintptr_t originalClass=0;
+        const bool overridden=species && Read(actor+0x2B8,originalClass) &&
+            TryWrite(actor+0x2B8,species); // temporarily override MobClass
+        alignas(8) uint8_t args[0xA0]{};
+        const bool invoked=Invoke(actor,trigger,args);
+        if(overridden && !TryWrite(actor+0x2B8,originalClass))
+            FHJDiag::Log(L"CRYPTID SPAWN: failed to restore original MobClass.");
+        if(!invoked) {
+            FHJDiag::Log(L"CRYPTID SPAWN: TriggerSpawn call failed; stopping queued wave.");
+            gSpawnWave=SpawnWave{};return;
+        }
+        ++gSpawnWave.dispatched;
+        --gSpawnWave.remaining;
+        gSpawnWave.nextTick=now+550;
+        wchar_t msg[180]{};
+        swprintf_s(msg,L"CRYPTID SPAWN: native TriggerSpawn request %d/%d; %d remaining. Verify live cryptid count.",
+            gSpawnWave.dispatched,gSpawnWave.requested,gSpawnWave.remaining);
+        FHJDiag::Log(msg);
+        if(gSpawnWave.remaining==0)
+            FHJDiag::Log(L"CRYPTID SPAWN: all requests dispatched; actual actor creation depends on the game's spawner rules.");
+    }
     void SpawnCreatureWave(int count,int liveCryptidIndex) {
         const auto world=World();
         if(!world || !ReadPtr(world+0x158)) {
             FHJDiag::Log(L"Creature spawn rejected: host GameMode required.");return;
         }
-        const auto spawn=FindFunction(L"BP_MobSpawner_C",L"TriggerSpawn");
-        if(!spawn) {FHJDiag::Log(L"BP_MobSpawner_C.TriggerSpawn not loaded.");return;}
-        // Optional type override uses a real currently loaded CryptidBase-derived
-        // UClass, selected from a live actor. The source MobClass is restored.
-        uintptr_t species=0;
-        for(const auto& found:gKnown)
-            if(found.kind==2 && found.index==liveCryptidIndex)
-                species=ReadPtr(found.address+0x10);
-        int total=0,sent=0;
-        const auto levels=GetWorldLevels(world,total);
-        for(const auto& level:levels) {
-            for(int i=0;i<level.count && sent<count;++i) {
-                const auto actor=ReadPtr(level.data+static_cast<size_t>(i)*8);
-                if(!actor || ClassName(ReadPtr(actor+0x10))!=L"BP_MobSpawner_C")continue;
-                // This spawn tool chooses the species configured on the map spawner.
-                uintptr_t originalClass=0;
-                const bool overrideClass=species && Read(actor+0x2B8,originalClass) &&
-                    TryWrite(actor+0x2B8,species); // BP_MobSpawner_C::MobClass
-                alignas(8) unsigned char args[0xA0]{};
-                if(Invoke(actor,spawn,args))++sent;
-                if(overrideClass && !TryWrite(actor+0x2B8,originalClass))
-                    FHJDiag::Log(L"Spawner MobClass could not be restored; check world state.");
-            }
-            if(sent>=count)break;
+        if(!FindFunction(L"BP_MobSpawner_C",L"TriggerSpawn")) {
+            FHJDiag::Log(L"Creature spawn rejected: TriggerSpawn not loaded.");return;
         }
-        wchar_t msg[190]{};
-        swprintf_s(msg,L"Spawn dispatches: %d (species and spawn count follow level MobClass/SpawnCount)",sent);
-        FHJDiag::Log(msg);
+        gSpawnWave={count,count,0,liveCryptidIndex,0};
+        FHJDiag::Log(L"CRYPTID SPAWN: queued paced native spawn wave; a single map spawner can receive multiple calls.");
     }
     void PossessCreature(int index,bool restore) {
         const auto world=World();
