@@ -117,6 +117,7 @@ namespace {
     bool gMonsterSpeedsSaved=false;
     bool gMonsterModeSaved=false;
     bool gMonsterFlightActive=false;
+    bool gGroundJumpHeld=false;
     // AI path following accepts movement for AI-possessed cryptids; a regular
     // Pawn.AddMovementInput call can be ignored by their controller.
     ULONGLONG gMonsterLastMoveRequest=0;
@@ -1879,7 +1880,7 @@ namespace {
         }
         gMonsterMovement=0;
         gMonsterSpeedsSaved=false;gMonsterModeSaved=false;
-        gMonsterFlightActive=false;
+        gMonsterFlightActive=false;gGroundJumpHeld=false;
         if(controllerLive && gMonsterBrain && gMonsterBrainWasRunning) {
             const auto restart=FindFunction(L"BrainComponent",L"RestartLogic");
             if(restart)Invoke(gMonsterBrain,restart,nullptr);
@@ -1891,7 +1892,10 @@ namespace {
         gMonsterMovement=ReadPtr(gMonsterPawn+0x330); // ACharacter.CharacterMovement
         if(!gMonsterMovement)return;
         const int species=gMonsterHUD.species;
+        // Flight is a species ability, NOT a universal possession cheat.
+        // Wendigo, Vampire and unknown cryptids never enter MOVE_Flying.
         gMonsterFlightActive=(species==1);
+        gGroundJumpHeld=false;
         gMonsterModeSaved=Read(gMonsterMovement+0x221,gMonsterPriorMovement);
         const auto setMode=FindFunction(L"CharacterMovementComponent",L"SetMovementMode");
         if(setMode) {
@@ -2108,6 +2112,7 @@ namespace {
         gChaseSmoothedValid=false;gLastMotionTick=0;
         UpdateMonsterHUD();
         StopMonsterAI();ConfigureMonsterMovement();CacheCryptidActions();
+        UpdateMonsterHUD(); // respawned creature's exact abilities replace the previous HUD
         const auto world=World();
         const auto gi=ReadPtr(world+0x1D8);
         const auto locals=ReadPtr(gi+0x38);
@@ -2246,11 +2251,12 @@ namespace {
             std::lock_guard<std::mutex> guard(gMonsterStatusMutex);
             species=gMonsterHUD.species;
         }
-        // Read Space/Ctrl for every cryptid, including vampires and
-        // wendigos: the first vertical key switches ground species to flight.
-        const bool flying=!monster || gMonsterFlightActive || species==1;
-        const double ascend=static_cast<double>(down(VK_SPACE))-
-                            static_cast<double>(down(VK_CONTROL));
+        // Only the human's independent noclip and Mothman's verified
+        // winged-control profile may ascend/descend. Wendigo must stay grounded.
+        const bool flying=!monster || species==1;
+        const double ascend=flying?
+            static_cast<double>(down(VK_SPACE))-
+            static_cast<double>(down(VK_CONTROL)):0.0;
         Vec3 input{cy*front-sy*strafe,sy*front+cy*strafe,ascend};
         if(monster && flying) {
             // Mothman follows camera pitch. Noclip intentionally stays on the
@@ -2294,15 +2300,9 @@ namespace {
                 }
             }
         } else {
-            // Space/Ctrl enter fly mode on *all* controlled cryptids.
-            if(std::fabs(ascend)>0.01 && !gMonsterFlightActive) {
-                gMonsterFlightActive=true;
-                StopCryptidPath();
-                const auto cm=ReadPtr(pawn+0x330);
-                const auto set=FindFunction(L"CharacterMovementComponent",L"SetMovementMode");
-                if(cm && set){uint8_t v[2]{5,0};Invoke(cm,set,v);}
-                FHJDiag::Log(L"CRYPTID FLIGHT: Space/Ctrl enabled free-flight for controlled creature.");
-            }
+            // Mothman is the only aerial cryptid in this control profile.
+            // Ground species never receive direct no-clip or vertical movement.
+            gMonsterFlightActive=(species==1);
             if(gMonsterFlightActive) {
                 StopCryptidPath();
                 const auto movement=ReadPtr(pawn+0x330);
@@ -2319,6 +2319,16 @@ namespace {
                     }
                 }
             } else {
+                // Space invokes Character.Jump rather than enabling flight.
+                // This uses normal walk physics and leaves collision intact.
+                const bool jump=down(VK_SPACE);
+                if(jump && !gGroundJumpHeld) {
+                    const auto jumpFn=FindFunction(L"Character",L"Jump");
+                    uint16_t params=0;
+                    if(jumpFn && Read(jumpFn+0xB6,params) && params==0)
+                        Invoke(pawn,jumpFn,nullptr);
+                }
+                gGroundJumpHeld=jump;
                 Vec3 horizontal{input.x,input.y,0.0};
                 const double lenXY=std::hypot(horizontal.x,horizontal.y);
                 if(lenXY>1e-3) {
@@ -2961,6 +2971,7 @@ namespace {
         StopMonsterAI();
         ConfigureMonsterMovement();
         CacheCryptidActions();
+        UpdateMonsterHUD(); // refresh HUD after the selected species' function cache is built
         SuspendHumanControls(pc);
         HideHumanHUD();
         FHJDiag::Log(L"Monster puppet mode: human controller remains possessed. WASD native movement, Q/E/R ability, F11 restore.");
