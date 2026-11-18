@@ -449,6 +449,27 @@ namespace FHJ
                 ImGui::TextDisabled("Q/E/R fire on key-down (not key release). E toggles supported invisibility.");
                 ImGui::TextDisabled("The selected cryptid's method names/ParmSize are logged for F9 review.");
                 ImGui::TextDisabled("LMB attempts the native creature sound event, then loaded melee audio assets.");
+                const auto audio=HunterNative::GetSounds();
+                static int meleeSound=-1;
+                std::string meleeLabel="AUTO / MATCH CRYPTID MELEE";
+                for(const auto& sound:audio)
+                    if(sound.objectIndex==meleeSound)meleeLabel=sound.displayName;
+                if(ImGui::BeginCombo("LMB attack sound",meleeLabel.c_str())) {
+                    if(ImGui::Selectable("AUTO / MATCH CRYPTID MELEE",meleeSound<0)) {
+                        meleeSound=-1;HunterNative::SetMonsterAttackSound(-1);
+                    }
+                    for(const auto& sound:audio) {
+                        ImGui::PushID(sound.objectIndex);
+                        if(ImGui::Selectable(sound.displayName.c_str(),
+                                             sound.objectIndex==meleeSound)) {
+                            meleeSound=sound.objectIndex;
+                            HunterNative::SetMonsterAttackSound(meleeSound);
+                        }
+                        ImGui::PopID();
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::TextDisabled("Pick a loaded native game sound if AUTO is silent (no external audio files).");
             }
             ImGui::TextDisabled("F8 journal, F11 safe Return Human; hunter HUD hidden in monster mode.");
             Notice("SDK VALIDATION",
