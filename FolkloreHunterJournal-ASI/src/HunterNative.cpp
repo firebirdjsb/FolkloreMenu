@@ -221,6 +221,8 @@ namespace {
         }
         return false;
     }
+    bool GetObjects(int& count,uintptr_t& chunks);
+    uintptr_t ObjectAt(int index,uintptr_t chunks);
     bool IsSoundAssetClass(uintptr_t cls) {
         for(int depth=0;cls && depth<25;++depth) {
             const auto name=ClassName(cls);
@@ -1401,8 +1403,8 @@ namespace {
         if(setMode) {
             // Native physics & AnimBP stay active. Mothman flies; ground
             // cryptids walk (the AI's previous mode is restored on exit).
-            const uint8_t args[2]{static_cast<uint8_t>(species==1?5:1),0};
-            if(!Invoke(gMonsterMovement,setMode,const_cast<uint8_t*>(args)))
+            uint8_t args[2]{static_cast<uint8_t>(species==1?5:1),0};
+            if(!Invoke(gMonsterMovement,setMode,args))
                 FHJDiag::Log(L"Monster Mode: could not set native movement mode.");
         }
         gMonsterSpeedsSaved=Read(gMonsterMovement+0x268,gMonsterOriginalWalkSpeed) &&
