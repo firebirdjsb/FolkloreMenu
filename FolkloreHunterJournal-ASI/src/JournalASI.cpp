@@ -166,8 +166,10 @@ namespace {
             else RestoreGamePointer();
             return 0;
         }
+        // Only puppet mode takes the human pawn's controls. Noclip keeps the
+        // normal game input pipeline active so walking keys are not starved.
         if(!gShowMenu.load(std::memory_order_acquire) &&
-           (HunterNative::MonsterModeActive() || HunterNative::NoclipActive())) {
+           HunterNative::MonsterModeActive()) {
             if(HunterNative::MonsterModeActive() &&
                msg==WM_KEYUP && (wparam=='Q'||wparam=='E'||wparam=='R')) {
                 HunterNative::RequestMonsterAbility(wparam=='Q'?1:wparam=='E'?2:3);
