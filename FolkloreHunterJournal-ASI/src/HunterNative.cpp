@@ -114,6 +114,7 @@ namespace {
     float gMonsterOriginalWalkSpeed=0.f, gMonsterOriginalFlySpeed=0.f;
     bool gMonsterSpeedsSaved=false;
     bool gMonsterModeSaved=false;
+    bool gMonsterFlightActive=false;
     // AI path following accepts movement for AI-possessed cryptids; a regular
     // Pawn.AddMovementInput call can be ignored by their controller.
     ULONGLONG gMonsterLastMoveRequest=0;
@@ -1698,6 +1699,7 @@ namespace {
         }
         gMonsterMovement=0;
         gMonsterSpeedsSaved=false;gMonsterModeSaved=false;
+        gMonsterFlightActive=false;
         if(gMonsterBrain && gMonsterBrainWasRunning) {
             const auto restart=FindFunction(L"BrainComponent",L"RestartLogic");
             if(restart)Invoke(gMonsterBrain,restart,nullptr);
@@ -1709,6 +1711,7 @@ namespace {
         gMonsterMovement=ReadPtr(gMonsterPawn+0x330); // ACharacter.CharacterMovement
         if(!gMonsterMovement)return;
         const int species=gMonsterHUD.species;
+        gMonsterFlightActive=(species==1);
         gMonsterModeSaved=Read(gMonsterMovement+0x221,gMonsterPriorMovement);
         const auto setMode=FindFunction(L"CharacterMovementComponent",L"SetMovementMode");
         if(setMode) {
@@ -1859,13 +1862,10 @@ namespace {
                 FHJDiag::Log(L"NOCLIP: player changed; stopped free-flight safely.");
                 return;
             }
-            if(!gNoclipPositionValid) {
+            if(!gNoclipPositionValid)
                 gNoclipPositionValid=Position(pawn,gNoclipPosition);
-            }
             if(gNoclipPositionValid) {
-                // The only permitted movement is explicit WASD + Space/Ctrl.
-                // Holding the last position on zero input prevents spontaneous
-                // upward/downward motion from CharacterMovement and game BP.
+                // No keys => exact position hold, never float or sink.
                 const double speed=boost?1850.0:1150.0;
                 gNoclipPosition.x+=input.x*speed*dt;
                 gNoclipPosition.y+=input.y*speed*dt;
@@ -1874,54 +1874,55 @@ namespace {
                 const auto stop=FindFunction(L"MovementComponent",L"StopMovementImmediately");
                 if(movement && stop)Invoke(movement,stop,nullptr);
                 if(!SetActorLocationSafe(pawn,gNoclipPosition)) {
-                    static ULONGLONG lastWarn=0;
-                    if(now-lastWarn>5000) {
-                        lastWarn=now;
-                        FHJDiag::Log(L"NOCLIP: engine rejected position hold/move; server authority may be correcting the pawn.");
+                    static ULONGLONG warned=0;
+                    if(now-warned>5000) {
+                        warned=now;
+                        FHJDiag::Log(L"NOCLIP: engine rejected world-position hold; inspect host authority.");
                     }
                 }
             }
-        } else if(length>1e-3) {
-            } else {
-                    static ULONGLONG lastPosWarn=0;
-                    if(now-lastPosWarn>5000) {
-                        lastPosWarn=now;
-                        FHJDiag::Log(L"NOCLIP: could not read live player actor world location.");
+        } else {
+            // Space/Ctrl enter fly mode on *all* controlled cryptids.
+            if(std::fabs(ascend)>0.01 && !gMonsterFlightActive) {
+                gMonsterFlightActive=true;
+                StopCryptidPath();
+                const auto cm=ReadPtr(pawn+0x330);
+                const auto set=FindFunction(L"CharacterMovementComponent",L"SetMovementMode");
+                if(cm && set){uint8_t v[2]{5,0};Invoke(cm,set,v);}
+                FHJDiag::Log(L"CRYPTID FLIGHT: Space/Ctrl enabled free-flight for controlled creature.");
+            }
+            if(gMonsterFlightActive) {
+                StopCryptidPath();
+                const auto movement=ReadPtr(pawn+0x330);
+                const auto stop=FindFunction(L"MovementComponent",L"StopMovementImmediately");
+                if(movement && stop)Invoke(movement,stop,nullptr);
+                if(length>1e-3) {
+                    Vec3 current{};
+                    if(Position(pawn,current)) {
+                        const double speed=boost?1100.0:690.0;
+                        const Vec3 dest{current.x+input.x*speed*dt,
+                                        current.y+input.y*speed*dt,
+                                        current.z+input.z*speed*dt};
+                        SetActorLocationSafe(pawn,dest,true,false);
                     }
                 }
             } else {
-                // Native AI pathing only accepts ground-plane commands.
-                // Mothman/flying species retain vertical AddMovementInput.
                 Vec3 horizontal{input.x,input.y,0.0};
                 const double lenXY=std::hypot(horizontal.x,horizontal.y);
-                bool handled=true;
                 if(lenXY>1e-3) {
                     horizontal.x/=lenXY;horizontal.y/=lenXY;
-                    handled=MoveCryptidWithAI(horizontal,now);
-                } else StopCryptidPath();
-                if(!handled) {
-                    // Navigation data can be absent in scripted maps. A
-                    // *swept* UE Actor move respects collision and gives
-                    // visible fallback control rather than silent failure.
-                    Vec3 pos{};
-                    if(Position(pawn,pos)) {
-                        const double speed=boost?850.0:500.0;
-                        const Vec3 dest{pos.x+horizontal.x*speed*dt,
-                                        pos.y+horizontal.y*speed*dt,
-                                        pos.z+input.z*speed*dt};
-                        if(!SetActorLocationSafe(pawn,dest,true,false) &&
-                           now-gLastCreatureMethodWarning>6000) {
-                            gLastCreatureMethodWarning=now;
-                            FHJDiag::Log(L"CRYPTID MOVE: native navigation and swept movement both rejected; check host authority.");
+                    if(!MoveCryptidWithAI(horizontal,now)) {
+                        Vec3 pos{};
+                        if(Position(pawn,pos)) {
+                            const double speed=boost?850.0:500.0;
+                            const Vec3 dest{pos.x+horizontal.x*speed*dt,
+                                            pos.y+horizontal.y*speed*dt,pos.z};
+                            SetActorLocationSafe(pawn,dest,true,false);
                         }
                     }
-                } else if(flying && std::fabs(input.z)>0.05) {
-                    // Vertical flight is still an engine movement input;
-                    // ground cryptids never receive vertical travel.
-                    AddSmoothMovement(pawn,{0.0,0.0,input.z},1.f);
-                }
+                } else StopCryptidPath();
             }
-        } else if(monster) StopCryptidPath();
+        }
         const auto movement=ReadPtr(pawn+0x330);
         if(movement) {
             if(!monster && gNoclipEnabled) {
