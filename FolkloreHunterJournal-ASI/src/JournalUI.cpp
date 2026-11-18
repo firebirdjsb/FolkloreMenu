@@ -378,11 +378,14 @@ namespace FHJ
             ImGui::TextColored(Palette::col_gold,"CRYPTID SPAWNING [HOST]");
             static int wave=1,selectedCreature=-1;
             ImGui::SliderInt("Native spawner triggers",&wave,1,10);
-            ImGui::Text("Queued spawn requests: %d",state.pendingSpawnTriggers);
+            ImGui::Text("Queued requests: %d | Directly created: %d",
+                state.pendingSpawnTriggers,state.confirmedSpawned);
             if(!state.host)ImGui::BeginDisabled();
             if(ImGui::Button("TRIGGER LOADED MOB SPAWNERS",ImVec2(-1,32)))
                 HunterNative::RequestSpawnMobWave(wave,selectedCreature);
             if(!state.host)ImGui::EndDisabled();
+            ImGui::TextDisabled("Verified cryptid classes use native deferred spawning;");
+            ImGui::TextDisabled("other classes fall back to the map's TriggerSpawn rules.");
             ImGui::TextDisabled("Select a live cryptid below to override spawner MobClass for one trigger,");
             ImGui::TextDisabled("or leave it unselected for each map spawner's default species.");
             const auto creatures=HunterNative::GetCreatures();
