@@ -90,7 +90,7 @@ namespace {
     // One map spawner can be used for many requests. Pace native TriggerSpawn
     // invocations so a one-spawner level doesn't silently cap a wave at one.
     struct SpawnWave {int remaining=0, requested=0, dispatched=0, speciesIndex=-1;
-        ULONGLONG nextTick=0;};
+        ULONGLONG nextTick=0;int created=0;};
     SpawnWave gSpawnWave{};
     std::atomic_bool gWildlife{true}, gContainers{true}, gQuest{true}, gLoot{true};
     
@@ -457,6 +457,7 @@ namespace {
         if(world)ScanLoadedSounds();
         HunterNative::Status status{};
         status.pendingSpawnTriggers=gSpawnWave.remaining;
+        status.confirmedSpawned=gSpawnWave.created;
         Camera cam{};
         std::vector<Marker> markers;
         std::vector<HunterNative::PlayerInfo> playersOut;
@@ -1979,6 +1980,47 @@ namespace {
                 L"World gravity changed locally; remote players not targeted.");
         } else FHJDiag::Log(L"WorldGravityZ update failed.");
     }
+    bool SpawnNativeCryptid(uintptr_t spawner,uintptr_t species,int ordinal) {
+        if(!spawner || !species || ClassKind(species)!=2 || !IsPawnClass(species))
+            return false;
+        const auto context=FindObjectByName(L"Default__GameplayStatics");
+        const auto begin=FindFunction(L"GameplayStatics",L"BeginDeferredActorSpawnFromClass");
+        const auto finish=FindFunction(L"GameplayStatics",L"FinishSpawningActor");
+        const auto world=World();
+        if(!context || !begin || !finish || !world)return false;
+        Vec3 location{};
+        if(!Position(spawner,location))return false;
+        // Space adjacent requested creatures so they do not overlap the
+        // spawner or each other; locations are UE5 world units (centimeters).
+        const double theta=static_cast<double>(ordinal)*2.399963229728653;
+        const double radius=300.0+static_cast<double>(ordinal/6)*140.0;
+        Transform64 transform{};
+        transform.location.x=location.x+std::cos(theta)*radius;
+        transform.location.y=location.y+std::sin(theta)*radius;
+        transform.location.z=location.z+75.0;
+        alignas(8) uint8_t beginArgs[0x90]{};
+        std::memcpy(beginArgs,&world,8);
+        std::memcpy(beginArgs+8,&species,8);
+        std::memcpy(beginArgs+0x10,&transform,sizeof(transform));
+        beginArgs[0x70]=1; // ESpawnActorCollisionHandlingMethod AlwaysSpawn
+        if(!Invoke(context,begin,beginArgs))return false;
+        uintptr_t spawned=0;
+        std::memcpy(&spawned,beginArgs+0x88,sizeof(spawned));
+        if(!spawned)return false;
+        alignas(8) uint8_t finishArgs[0x80]{};
+        std::memcpy(finishArgs,&spawned,sizeof(spawned));
+        std::memcpy(finishArgs+0x10,&transform,sizeof(transform));
+        if(!Invoke(context,finish,finishArgs))return false;
+        uintptr_t returned=0;
+        std::memcpy(&returned,finishArgs+0x78,sizeof(returned));
+        int32_t id=-1;
+        if(returned && Read(returned+0x0C,id) && id>=0 &&
+           ClassKind(ReadPtr(returned+0x10))==2) {
+            ForceActorNetUpdate(returned);
+            return true;
+        }
+        return false;
+    }
     void AdvanceSpawnWave() {
         if(gSpawnWave.remaining<=0)return;
         const auto now=GetTickCount64();
@@ -2015,25 +2057,36 @@ namespace {
                 break;
             }
         uintptr_t originalClass=0;
-        const bool overridden=species && Read(actor+0x2B8,originalClass) &&
-            TryWrite(actor+0x2B8,species); // temporarily override MobClass
-        alignas(8) uint8_t args[0xA0]{};
-        const bool invoked=Invoke(actor,trigger,args);
-        if(overridden && !TryWrite(actor+0x2B8,originalClass))
-            FHJDiag::Log(L"CRYPTID SPAWN: failed to restore original MobClass.");
+        Read(actor+0x2B8,originalClass);
+        // The existing native GameplayStatics deferred actor path (used for
+        // chase cameras) returns an actor pointer we can actually validate.
+        // Prefer this for cryptid-derived classes so a map with one spawner
+        // can create multiple independent actors without TriggerSpawn cooldown.
+        const uintptr_t spawnClass=species?species:originalClass;
+        const bool created=SpawnNativeCryptid(actor,spawnClass,gSpawnWave.dispatched);
+        bool invoked=created;
+        if(!created) {
+            const bool overridden=species && originalClass &&
+                TryWrite(actor+0x2B8,species);
+            alignas(8) uint8_t args[0xA0]{};
+            invoked=Invoke(actor,trigger,args);
+            if(overridden && !TryWrite(actor+0x2B8,originalClass))
+                FHJDiag::Log(L"CRYPTID SPAWN: failed to restore original MobClass.");
+        }
         if(!invoked) {
-            FHJDiag::Log(L"CRYPTID SPAWN: TriggerSpawn call failed; stopping queued wave.");
+            FHJDiag::Log(L"CRYPTID SPAWN: direct actor spawn and map TriggerSpawn both failed.");
             gSpawnWave=SpawnWave{};return;
         }
         ++gSpawnWave.dispatched;
+        if(created)++gSpawnWave.created;
         --gSpawnWave.remaining;
         gSpawnWave.nextTick=now+550;
-        wchar_t msg[180]{};
-        swprintf_s(msg,L"CRYPTID SPAWN: native TriggerSpawn request %d/%d; %d remaining. Verify live cryptid count.",
-            gSpawnWave.dispatched,gSpawnWave.requested,gSpawnWave.remaining);
+        wchar_t msg[220]{};
+        swprintf_s(msg,L"CRYPTID SPAWN: request %d/%d; %d actor(s) directly created and verified, %d pending. Map spawner fallback may apply its own rules.",
+            gSpawnWave.dispatched,gSpawnWave.requested,gSpawnWave.created,gSpawnWave.remaining);
         FHJDiag::Log(msg);
         if(gSpawnWave.remaining==0)
-            FHJDiag::Log(L"CRYPTID SPAWN: all requests dispatched; actual actor creation depends on the game's spawner rules.");
+            FHJDiag::Log(L"CRYPTID SPAWN: queued wave complete. Check active cryptid count and remote replication.");
     }
     void SpawnCreatureWave(int count,int liveCryptidIndex) {
         const auto world=World();
