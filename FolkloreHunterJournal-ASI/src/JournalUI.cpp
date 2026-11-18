@@ -295,8 +295,9 @@ namespace FHJ
             static bool noclip = false;
             if(ImGui::Checkbox("Local noclip / free-fly (experimental)", &noclip))
                 HunterNative::RequestNoclip(noclip);
-            ImGui::TextDisabled("Free flight: WASD camera-relative movement, Space up, Ctrl down, Shift boost.");
-            ImGui::TextDisabled("Game clients may receive server correction; test while hosting.");
+            ImGui::TextDisabled("Noclip: WASD moves horizontally relative to camera yaw, Space up, Ctrl down.");
+            ImGui::TextDisabled("Hold Shift to boost. Uses direct actor movement; test while hosting.");
+            ImGui::TextDisabled("ESP health values/bars only appear on PLAYERS and CRYPTIDS.");
             Notice("MULTIPLAYER AUTHORITY", status.host ? "Authoritative GameMode detected; host actions available." : "Client-only session: host actions are disabled.", !status.host);
         }
 
