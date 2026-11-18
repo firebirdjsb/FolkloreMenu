@@ -196,6 +196,8 @@ namespace {
     void MaintainGodProtection();
     void ForceActorNetUpdate(uintptr_t pawn);
     void FreeflightTick();
+    uintptr_t CreatureSkillFunction(int species,int slot);
+    std::string CreatureSkillLabel(int species,int slot,uintptr_t fn);
     void AdvanceSpawnWave();
     std::atomic_bool gAutoJump{false};
     int gLastReported=0;
@@ -1972,56 +1974,30 @@ namespace {
         const auto now=GetTickCount64();
         const auto minInterval=slot==0?430ULL:280ULL;
         if(now-gAbilityTicks[static_cast<size_t>(slot)]<minInterval)return;
-        bool vampire=false;
-        for(auto parent=ReadPtr(gMonsterPawn+0x10),depth=0ULL;
-            parent && depth<25; ++depth) {
-            if(ClassName(parent)==L"BP_VampireBase_C")vampire=true;
-            const auto next=ReadPtr(parent+0x40);
-            if(!next || next==parent)break;
-            parent=next;
+        int species=0;
+        {
+            std::lock_guard<std::mutex> guard(gMonsterStatusMutex);
+            species=gMonsterHUD.species;
         }
         if(gMonsterFunctions.empty())CacheCryptidActions();
-        uintptr_t fn=0;
+        const auto fn=CreatureSkillFunction(species,slot);
         alignas(8) uint8_t args[0x20]{};
         bool advanceStance=false;
-        if(slot==0) {
-            fn=NoArgCryptidAction({L"Server_Attack",L"AUTH_Attack",
-                L"Attack",L"PerformAttack",L"StartAttack",L"Melee",
-                L"PrimaryAttack",L"DoMeleeAttack"});
-        } else if(slot==1) {
-            fn=NoArgCryptidAction({L"AUTH_Scream",L"Server_Scream",
-                L"Scream",L"Roar",L"DoScream",L"PlayRoar"});
-        } else if(slot==2 && vampire) {
-            fn=NoArgCryptidAction({L"Invisible",L"AUTH_Invisible",
-                L"GoInvisible",L"ToggleInvisible",L"ActivateInvisibility"});
-            if(!fn)for(const wchar_t* name:{L"SetInvisible",L"SetInvisibility",
-                                             L"AUTH_SetInvisible",L"SetIsInvisible"}) {
-                const auto it=gMonsterFunctions.find(name);
-                uint16_t size=0;
-                if(it!=gMonsterFunctions.end() && Read(it->second+0xB6,size) &&
-                   (size==1 || size==2)) {
-                    fn=it->second;
-                    args[0]=gVampireInvisible?0:1;
-                    break;
-                }
+        // Only Vampire supports the reflected invisibility/stance setters.
+        // Ground Wendigo cannot inherit either skill or Mothman's flying.
+        if(species==2 && slot==2 && fn) {
+            const auto name=ObjectName(fn);
+            if(name==L"SetInvisible" || name==L"SetInvisibility" ||
+               name==L"AUTH_SetInvisible" || name==L"SetIsInvisible")
+                args[0]=gVampireInvisible?0:1;
+        }
+        if(species==2 && slot==3 && fn) {
+            const auto name=ObjectName(fn);
+            if(name==L"SetStance" || name==L"AUTH_SetStance") {
+                const int stance=(gVampireStance+1)%3;
+                std::memcpy(args,&stance,sizeof(stance));
+                advanceStance=true;
             }
-        } else if(slot==3 && vampire) {
-            fn=NoArgCryptidAction({L"CycleStance",L"ChangeStance",L"SwitchStance"});
-            if(!fn)for(const wchar_t* name:{L"SetStance",L"AUTH_SetStance"}) {
-                const auto it=gMonsterFunctions.find(name);
-                uint16_t size=0;
-                if(it!=gMonsterFunctions.end() && Read(it->second+0xB6,size) &&
-                   (size==1 || size==4 || size==8)) {
-                    fn=it->second;
-                    const int stance=(gVampireStance+1)%3;
-                    std::memcpy(args,&stance,4);
-                    advanceStance=true;
-                    break;
-                }
-            }
-        } else if(slot==4 && vampire) {
-            fn=NoArgCryptidAction({L"All_ScreamSound",L"ScreamSound",
-                L"PlayScreamSound",L"PlayScream"});
         }
         if(!fn) {
             if(now-gLastCreatureMethodWarning>3200) {
@@ -2036,7 +2012,7 @@ namespace {
         if(Invoke(gMonsterPawn,fn,args)) {
             gAbilityTicks[static_cast<size_t>(slot)]=now;
             if(slot==0)PlayControlledMeleeAudio();
-            if(slot==2)gVampireInvisible=!gVampireInvisible;
+            if(species==2 && slot==2)gVampireInvisible=!gVampireInvisible;
             if(advanceStance)gVampireStance=(gVampireStance+1)%3;
             wchar_t msg[220]{};
             swprintf_s(msg,L"CRYPTID ABILITY slot %d: invoked native %s; effects must be verified on the host.",slot,name.c_str());
