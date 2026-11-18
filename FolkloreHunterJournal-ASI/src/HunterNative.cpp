@@ -1224,13 +1224,14 @@ namespace {
     };
     static_assert(sizeof(Transform64)==0x60);
 
-    bool SetActorLocationSafe(uintptr_t actor,const Vec3& next) {
+    bool SetActorLocationSafe(uintptr_t actor,const Vec3& next,
+                              bool sweep=false,bool teleport=true) {
         const auto f=FindFunction(L"Actor",L"K2_SetActorLocation");
         if(!actor || !f)return false;
         alignas(8) uint8_t args[0x128]{};
         std::memcpy(args,&next,sizeof(next));
-        args[0x18]=0; // bSweep = false (explicit noclip/ghost movement)
-        args[0x120]=1; // bTeleport = true
+        args[0x18]=sweep?1:0; // collision sweep for cryptid fallback
+        args[0x120]=teleport?1:0; // teleport remains appropriate for camera/noclip
         if(!Invoke(actor,f,args))return false;
         return args[0x121]!=0;
     }
@@ -1257,6 +1258,66 @@ namespace {
             if(obj && ObjectName(obj)==name)return obj;
         }
         return 0;
+    }
+
+    // Sphere trace between cryptid shoulder and camera. A SpringArm collision
+    // probe is the native UE solution; here the already-spawned CameraActor
+    // gets an equivalent reflected sweep, without a guessed SpringArm offset.
+    // Exact UE5.5 FHitResult(0xE8) and SphereTraceSingle parameter layout are
+    // verified against UFunction size/return metadata before invocation.
+    bool ConstrainChaseCamera(const Vec3& pivot,const Vec3& wanted,Vec3& clipped) {
+        static uintptr_t fn=0,defaultSystem=0;
+        static ULONGLONG lookupRetry=0;
+        const auto tick=GetTickCount64();
+        if((!fn || !defaultSystem) && tick>=lookupRetry) {
+            lookupRetry=tick+10000;
+            if(!fn)fn=FindFunction(L"KismetSystemLibrary",L"SphereTraceSingle");
+            if(!defaultSystem)
+                defaultSystem=FindObjectByName(L"Default__KismetSystemLibrary");
+        }
+        if(!fn || !defaultSystem)return false;
+        uint16_t parmsSize=0,returnOffset=0;
+        if(!Read(fn+0xB6,parmsSize) || !Read(fn+0xB8,returnOffset) ||
+           parmsSize<0x169 || parmsSize>0x178 || returnOffset!=0x168) {
+            static bool logged=false;
+            if(!logged) {
+                logged=true;
+                FHJDiag::Log(L"CHASE CAMERA: SphereTraceSingle SDK layout differs; using close-camera fallback.");
+            }
+            return false;
+        }
+        alignas(8) uint8_t args[0x178]{};
+        const uintptr_t ctx=gMonsterPawn;
+        std::memcpy(args,&ctx,8);
+        std::memcpy(args+0x08,&pivot,sizeof(pivot));
+        std::memcpy(args+0x20,&wanted,sizeof(wanted));
+        const float radius=27.f;
+        std::memcpy(args+0x38,&radius,sizeof(radius));
+        args[0x3C]=1; // TraceTypeQuery2; default Engine Camera collision channel
+        args[0x3D]=0; // non-complex collision
+        uintptr_t ignored[1]{gMonsterPawn};
+        struct ActorArray{uintptr_t data;int32_t num,max;};
+        const ActorArray ignore{reinterpret_cast<uintptr_t>(ignored),1,1};
+        static_assert(sizeof(ActorArray)==16);
+        std::memcpy(args+0x40,&ignore,sizeof(ignore));
+        args[0x50]=0;  // DrawDebugTrace::None
+        args[0x140]=1; // bIgnoreSelf
+        if(!Invoke(defaultSystem,fn,args))return false;
+        clipped=wanted;
+        // HitResult::Time (0x04) is the trace fraction. Both the reflected
+        // return value and blocking-hit flag must be true before clamping.
+        if(args[0x168] && (args[0x58+0xAD]&1)) {
+            float impact=1.f;
+            std::memcpy(&impact,args+0x58+0x04,sizeof(impact));
+            if(!std::isfinite(impact) || impact<0.f || impact>1.f)return false;
+            const double dx=wanted.x-pivot.x,dy=wanted.y-pivot.y,
+                         dz=wanted.z-pivot.z;
+            const double distance=std::sqrt(dx*dx+dy*dy+dz*dz);
+            const double backoff=distance>1.0?26.0/distance:1.0;
+            const double alpha=std::clamp(static_cast<double>(impact)-backoff,0.0,1.0);
+            clipped={pivot.x+dx*alpha,pivot.y+dy*alpha,pivot.z+dz*alpha};
+        }
+        return true;
     }
     bool CreateMonsterCamera(uintptr_t pc,const Vec3& position) {
         const auto world=World();
@@ -1885,20 +1946,35 @@ namespace {
                 if(species==1){distance=540; height=260;}
                 else if(species==2){distance=315;height=170;}
                 else if(species==3){distance=410;height=235;}
+                const Vec3 pivot{location.x,location.y,location.z+height};
                 const Vec3 goal{
-                    location.x-cy*distance,
-                    location.y-sy*distance,
-                    location.z+height-std::sin(pitch)*distance*.18
+                    pivot.x-cy*distance,
+                    pivot.y-sy*distance,
+                    pivot.z-std::sin(pitch)*distance*.18
                 };
+                Vec3 safeGoal{};
+                if(!ConstrainChaseCamera(pivot,goal,safeGoal)) {
+                    // If the trace is unavailable, don't put a blind camera
+                    // several meters through unknown map geometry.
+                    const double close=72.0;
+                    safeGoal={pivot.x-cy*close,pivot.y-sy*close,
+                              pivot.z-std::sin(pitch)*close*.18};
+                }
                 if(!gChaseSmoothedValid) {
-                    gChaseSmoothedPos=goal;
+                    gChaseSmoothedPos=safeGoal;
                     gChaseSmoothedValid=true;
                 } else {
                     const double alpha=1.-std::exp(-12.*dt);
-                    gChaseSmoothedPos.x+=(goal.x-gChaseSmoothedPos.x)*alpha;
-                    gChaseSmoothedPos.y+=(goal.y-gChaseSmoothedPos.y)*alpha;
-                    gChaseSmoothedPos.z+=(goal.z-gChaseSmoothedPos.z)*alpha;
+                    gChaseSmoothedPos.x+=(safeGoal.x-gChaseSmoothedPos.x)*alpha;
+                    gChaseSmoothedPos.y+=(safeGoal.y-gChaseSmoothedPos.y)*alpha;
+                    gChaseSmoothedPos.z+=(safeGoal.z-gChaseSmoothedPos.z)*alpha;
                 }
+                // A smoothed trajectory can pass through a wall around a
+                // corner even when its destination was trace-safe. Re-probe
+                // the actual interpolated position before every camera move.
+                Vec3 actual=gChaseSmoothedPos;
+                if(ConstrainChaseCamera(pivot,actual,actual))
+                    gChaseSmoothedPos=actual;
                 SetActorLocationSafe(gChaseCamera,gChaseSmoothedPos);
                 SetActorRotationSafe(gChaseCamera,{gMonsterPitch,gMonsterYaw,0.0});
             }
