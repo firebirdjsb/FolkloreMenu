@@ -108,6 +108,13 @@ namespace {
     float gMonsterOriginalWalkSpeed=0.f, gMonsterOriginalFlySpeed=0.f;
     bool gMonsterSpeedsSaved=false;
     bool gMonsterModeSaved=false;
+    // AI path following accepts movement for AI-possessed cryptids; a regular
+    // Pawn.AddMovementInput call can be ignored by their controller.
+    ULONGLONG gMonsterLastMoveRequest=0;
+    bool gMonsterPathActive=false;
+    double gMonsterMoveDirX=0.0,gMonsterMoveDirY=0.0;
+    std::unordered_map<std::wstring,uintptr_t> gMonsterFunctions;
+    ULONGLONG gLastCreatureMethodWarning=0;
     uint8_t gMonsterPriorMovement=1;
     uintptr_t gHumanHUD=0;
     int32_t gHumanHUDIndex=-1;
@@ -464,6 +471,8 @@ namespace {
             gMonsterIndex=-1;gCameraIndex=-1;gLastMotionTick=0;
             gMonsterAIController=0;gMonsterBrain=0;gMonsterBrainWasRunning=false;
             gMonsterMovement=0;gMonsterSpeedsSaved=false;gPuppeteering=false;
+            gMonsterPathActive=false;gMonsterLastMoveRequest=0;
+            gMonsterFunctions.clear();
             gHumanHUD=0;gHumanHudHidden=false;gHudRestorePending=false;
             gChaseSmoothedValid=false;
             gGravityBackup=WorldGravityBackup{};
@@ -1460,6 +1469,7 @@ namespace {
     void StopMonsterAI() {
         const auto ai=ReadPtr(gMonsterPawn+0x2D8); // APawn.Controller
         if(!ai)return;
+        gMonsterAIController=ai;
         // Stop active path following as well as the behavior tree. Stopping
         // BrainComponent alone leaves the last MoveTo request running.
         const auto stopPath=FindFunction(L"AIController",L"StopMovement");
@@ -1472,7 +1482,6 @@ namespace {
         const auto state=FindFunction(L"BrainComponent",L"IsRunning");
         bool running=false;
         if(state)Invoke(brain,state,&running);
-        gMonsterAIController=ai;
         gMonsterBrain=brain;
         gMonsterBrainWasRunning=running;
         const auto stop=FindFunction(L"BrainComponent",L"StopLogic");
@@ -1485,7 +1494,102 @@ namespace {
             FHJDiag::Log(L"Monster Mode: AI brain paused; animation graph remains active.");
         }
     }
+
+    // In UE5.5, AAIController::MoveToLocation is a reflected UFUNCTION.
+    // CharacterMovement applies navigation-requested velocity and drives
+    // AnimBlueprint locomotion, unlike ignored player AddMovementInput.
+    bool MoveCryptidWithAI(const Vec3& input,ULONGLONG now) {
+        if(!gMonsterAIController || !gMonsterPawn)return false;
+        const auto fn=FindFunction(L"AIController",L"MoveToLocation");
+        if(!fn)return false;
+        // Check UFunction::ParmsSize/ReturnValueOffset before relying on this
+        // UE5.5 layout. Never issue a speculative ProcessEvent signature.
+        uint16_t size=0,returnOffset=0;
+        if(!Read(fn+0xB6,size) || !Read(fn+0xB8,returnOffset) ||
+           size<0x2A || size>0x38 || returnOffset!=0x29) {
+            static ULONGLONG last=0;
+            if(now-last>10000) {
+                last=now;
+                FHJDiag::Log(L"CRYPTID MOVE: MoveToLocation reflected signature differs; using swept fallback.");
+            }
+            return false;
+        }
+        if(now-gMonsterLastMoveRequest<180 &&
+           input.x*gMonsterMoveDirX+input.y*gMonsterMoveDirY>.97)
+            return true; // existing path following moves the character natively
+        Vec3 origin{};
+        if(!Position(gMonsterPawn,origin))return false;
+        // A short moving target feels like directional input while navigation
+        // still prevents walking through level geometry.
+        const Vec3 target{origin.x+input.x*390.0,
+                          origin.y+input.y*390.0,origin.z};
+        alignas(8) uint8_t args[0x38]{};
+        std::memcpy(args,&target,sizeof(target));
+        const float acceptance=24.0f;
+        std::memcpy(args+0x18,&acceptance,sizeof(acceptance));
+        args[0x1C]=0; // StopOnOverlap: disabled, use explicit acceptance radius
+        args[0x1D]=1; // bUsePathfinding
+        args[0x1E]=1; // bProjectDestinationToNavigation
+        args[0x1F]=1; // bCanStrafe
+        args[0x28]=1; // bAllowPartialPath
+        if(!Invoke(gMonsterAIController,fn,args))return false;
+        // EPathFollowingRequestResult: Failed=0, AlreadyAtGoal=1,
+        // RequestSuccessful=2. Do not equate ProcessEvent success with motion.
+        if(args[0x29]==0)return false;
+        gMonsterLastMoveRequest=now;
+        gMonsterMoveDirX=input.x;gMonsterMoveDirY=input.y;
+        gMonsterPathActive=true;
+        return true;
+    }
+    void StopCryptidPath() {
+        if(!gMonsterPathActive)return;
+        if(gMonsterAIController) {
+            const auto stop=FindFunction(L"AIController",L"StopMovement");
+            if(stop)Invoke(gMonsterAIController,stop,nullptr);
+        }
+        gMonsterPathActive=false;
+        gMonsterLastMoveRequest=0;
+    }
+    void CacheCryptidActions() {
+        gMonsterFunctions.clear();
+        auto cls=ReadPtr(gMonsterPawn+0x10);
+        std::vector<uintptr_t> hierarchy;
+        for(int n=0;n<25 && cls;++n) {
+            hierarchy.push_back(cls);
+            const auto next=ReadPtr(cls+0x40);
+            if(!next || next==cls)break;
+            cls=next;
+        }
+        int count=0;uintptr_t chunks=0;
+        if(!GetObjects(count,chunks))return;
+        // Visit derived class first so its own attack/ability implementation
+        // wins over an inherited method with the same UFunction name.
+        for(const auto owner:hierarchy) {
+            for(int i=0;i<count;++i) {
+                const auto obj=ObjectAt(i,chunks);
+                if(!obj || ReadPtr(obj+0x20)!=owner ||
+                   ClassName(ReadPtr(obj+0x10))!=L"Function")continue;
+                const auto name=ObjectName(obj);
+                if(!name.empty())gMonsterFunctions.emplace(name,obj);
+            }
+        }
+        wchar_t msg[160]{};
+        swprintf_s(msg,L"CRYPTID: indexed %u reflected functions from creature class hierarchy.",
+            static_cast<unsigned>(gMonsterFunctions.size()));
+        FHJDiag::Log(msg);
+    }
+    uintptr_t NoArgCryptidAction(std::initializer_list<const wchar_t*> candidates) {
+        for(const wchar_t* name:candidates) {
+            const auto it=gMonsterFunctions.find(name);
+            if(it==gMonsterFunctions.end())continue;
+            uint16_t params=0;
+            if(Read(it->second+0xB6,params) && params==0)return it->second;
+        }
+        return 0;
+    }
     void RestoreMonsterAI() {
+        StopCryptidPath();
+        gMonsterFunctions.clear();
         if(gMonsterMovement && gMonsterSpeedsSaved) {
             TryWrite(gMonsterMovement+0x268,gMonsterOriginalWalkSpeed);
             TryWrite(gMonsterMovement+0x274,gMonsterOriginalFlySpeed);
@@ -2279,6 +2383,7 @@ namespace {
         UpdateMonsterHUD();
         StopMonsterAI();
         ConfigureMonsterMovement();
+        CacheCryptidActions();
         SuspendHumanControls(pc);
         HideHumanHUD();
         FHJDiag::Log(L"Monster puppet mode: human controller remains possessed. WASD native movement, Q/E/R ability, F11 restore.");
