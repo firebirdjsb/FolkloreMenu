@@ -166,6 +166,9 @@ namespace {
         bool possessConfirmed=false;
         bool respawning=false;
         float respawnSeconds=0.f;
+        // Only the current cryptid's callable, reflected skills appear.
+        std::array<bool,5> available{};
+        std::array<std::string,5> skills{};
     } gMonsterHUD;
     struct WorldGravityBackup {
         uintptr_t worldSettings=0;
@@ -1531,6 +1534,11 @@ namespace {
         gMonsterHUD.possessConfirmed=true;
         gMonsterHUD.respawning=false;
         gMonsterHUD.respawnSeconds=0.f;
+        for(int slot=0;slot<5;++slot) {
+            const auto fn=CreatureSkillFunction(species,slot);
+            gMonsterHUD.available[static_cast<size_t>(slot)]=fn!=0;
+            gMonsterHUD.skills[static_cast<size_t>(slot)]=CreatureSkillLabel(species,slot,fn);
+        }
     }
     // UE5.5 SDK Engine.Pawn.AddMovementInput: FVector (0x18), float, bool.
     // CharacterMovement consumes this input on its own tick and updates
@@ -1775,6 +1783,76 @@ namespace {
         }
         return 0;
     }
+    // The species is detected from the live inherited Blueprint class.
+    // Expose a skill only if its UFunction exists and has a compatible
+    // parameter layout. No generic vampire skills are assigned to Wendigo.
+    uintptr_t CreatureSkillFunction(int species,int slot) {
+        switch(slot) {
+            case 0: return NoArgCryptidAction({
+                L"Server_Attack",L"AUTH_Attack",L"Attack",L"PerformAttack",
+                L"StartAttack",L"Melee",L"PrimaryAttack",L"DoMeleeAttack"});
+            case 1:
+                if(species==1) return NoArgCryptidAction({
+                    L"Screech",L"AUTH_Screech",L"Shriek",L"AUTH_Shriek",
+                    L"All_ScreamSound",L"Scream",L"Roar"});
+                if(species==3) return NoArgCryptidAction({
+                    L"AUTH_Scream",L"Howl",L"AUTH_Howl",L"Roar",
+                    L"Server_Scream",L"Scream"});
+                return NoArgCryptidAction({
+                    L"AUTH_Scream",L"Server_Scream",L"Scream",
+                    L"Roar",L"DoScream",L"PlayRoar"});
+            case 2:
+                if(species==1) return NoArgCryptidAction({
+                    L"Dive",L"DiveAttack",L"AUTH_Dive",L"BeginDive",
+                    L"Swoop",L"SwoopAttack"});
+                if(species==3) return NoArgCryptidAction({
+                    L"Lunge",L"AUTH_Lunge",L"Charge",
+                    L"AUTH_Charge",L"Pounce",L"LeapAttack"});
+                if(species!=2)return 0;
+                if(const auto fn=NoArgCryptidAction({
+                    L"Invisible",L"AUTH_Invisible",L"GoInvisible",
+                    L"ToggleInvisible",L"ActivateInvisibility"}))return fn;
+                for(const wchar_t* name:{L"SetInvisible",L"SetInvisibility",
+                                         L"AUTH_SetInvisible",L"SetIsInvisible"}) {
+                    const auto it=gMonsterFunctions.find(name);
+                    uint16_t size=0;
+                    if(it!=gMonsterFunctions.end() && Read(it->second+0xB6,size) &&
+                       (size==1 || size==2))return it->second;
+                }
+                return 0;
+            case 3:
+                if(species==1)return NoArgCryptidAction({
+                    L"Flap",L"AUTH_Flap",L"FlapWings",L"WindBlast"});
+                if(species==3)return NoArgCryptidAction({
+                    L"Rage",L"AUTH_Rage",L"Enrage",L"AUTH_Enrage",
+                    L"Frenzy",L"FeralRoar"});
+                if(species!=2)return 0;
+                if(const auto fn=NoArgCryptidAction({
+                    L"CycleStance",L"ChangeStance",L"SwitchStance"}))return fn;
+                for(const wchar_t* name:{L"SetStance",L"AUTH_SetStance"}) {
+                    const auto it=gMonsterFunctions.find(name);
+                    uint16_t size=0;
+                    if(it!=gMonsterFunctions.end() && Read(it->second+0xB6,size) &&
+                       (size==1 || size==4 || size==8))return it->second;
+                }
+                return 0;
+            case 4:
+                return species==2 ? NoArgCryptidAction({
+                    L"All_ScreamSound",L"ScreamSound",L"PlayScreamSound",
+                    L"PlayScream"}):0;
+            default:return 0;
+        }
+    }
+    std::string CreatureSkillLabel(int species,int slot,uintptr_t fn) {
+        if(!fn)return {};
+        if(slot==0)return "LMB MELEE";
+        // Show the *actual* reflected method, not a guessed gameplay power.
+        const auto method=ObjectName(fn);
+        const std::string name(method.begin(),method.end());
+        const char* key=slot==1?"Q":slot==2?"E":slot==3?"R":"AUDIO";
+        return std::string(key)+" "+name;
+    }
+
     void RestoreMonsterAI() {
         int32_t actorId=-1;
         const bool actorLive=gMonsterPawn &&
