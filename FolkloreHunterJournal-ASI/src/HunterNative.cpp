@@ -37,7 +37,7 @@ namespace {
     struct Camera { Vec3 pos{}; Rot rot{}; float fov{}; };
     struct ActorEntry { uintptr_t address{}; int index{}; int kind{}; };
     struct LevelView { uintptr_t data{}; int32_t count{}; int32_t start{}; };
-    enum class ActionType { GiveItem, CatalogItem, GodMode, AddXP, Time, TimeScale, AddSilver, InfiniteDamage, BeanMode, RangerMode, SmoreMode, Rain, Snow, ClearWeather, VampireScream, FlickerLights, CancelFlicker, TargetHealth, TargetItem, TargetNoise, TargetRevive, TargetKill, TargetKick, TargetGodMode, TargetSound, NoclipOn, NoclipOff, FallProtection, SpeedChange, JumpBoost, GravityChange, SpawnMob, PossessCryptid, RestoreHuman, MonsterAbility, EquipVanity };
+    enum class ActionType { GiveItem, CatalogItem, GodMode, AddXP, Time, TimeScale, AddSilver, InfiniteDamage, BeanMode, RangerMode, SmoreMode, Rain, Snow, ClearWeather, VampireScream, FlickerLights, CancelFlicker, TargetHealth, TargetItem, TargetNoise, TargetRevive, TargetKill, TargetKick, TargetGodMode, TargetSound, TargetCameraShake, NoclipOn, NoclipOff, FallProtection, SpeedChange, JumpBoost, GravityChange, SpawnMob, PossessCryptid, RestoreHuman, MonsterAbility, EquipVanity };
     struct Action { ActionType type{}; std::string item; int amount{}; float value{}; int target{-1}; double precise{}; };
     std::mutex gMutex;
     std::mutex gActionsMutex;
@@ -51,6 +51,7 @@ namespace {
     std::vector<HunterNative::PlayerInfo> gRoster;
     std::vector<HunterNative::CreatureInfo> gCreatures;
     std::vector<HunterNative::SoundInfo> gSounds, gSoundCandidates;
+    std::vector<HunterNative::CameraShakeInfo> gCameraShakes, gCameraShakeCandidates;
     int gSoundScanCursor=0;
     struct VanityChoice { uintptr_t klass{}; std::string name; bool equipped{}; };
     std::vector<VanityChoice> gVanityChoices;
@@ -223,6 +224,16 @@ namespace {
     }
     bool GetObjects(int& count,uintptr_t& chunks);
     uintptr_t ObjectAt(int index,uintptr_t chunks);
+    bool IsCameraShakeClass(uintptr_t klass) {
+        if(ClassName(klass)==L"CameraShakeBase")return false; // abstract base
+        for(int depth=0;klass && depth<25;++depth) {
+            if(ClassName(klass)==L"CameraShakeBase")return depth>0;
+            const auto parent=ReadPtr(klass+0x40);
+            if(!parent || parent==klass)break;
+            klass=parent;
+        }
+        return false;
+    }
     bool IsSoundAssetClass(uintptr_t cls) {
         for(int depth=0;cls && depth<25;++depth) {
             const auto name=ClassName(cls);
@@ -234,19 +245,26 @@ namespace {
         return false;
     }
     void ScanLoadedSounds() {
-        if(gSoundCandidates.size()>=256)return;
+        if(gSoundCandidates.size()>=256 && gCameraShakeCandidates.size()>=96)return;
         int total=0;uintptr_t chunks=0;
         if(!GetObjects(total,chunks))return;
         for(int n=0;n<600 && gSoundScanCursor<total;++n,++gSoundScanCursor) {
             const auto sound=ObjectAt(gSoundScanCursor,chunks);
-            if(!sound || !IsSoundAssetClass(ReadPtr(sound+0x10)))continue;
+            if(!sound)continue;
+            const auto type=ClassName(ReadPtr(sound+0x10));
+            const bool asset=gSoundCandidates.size()<256 &&
+                IsSoundAssetClass(ReadPtr(sound+0x10));
+            const bool shakeClass=gCameraShakeCandidates.size()<96 &&
+                (type==L"Class" || type==L"BlueprintGeneratedClass") &&
+                IsCameraShakeClass(sound);
+            if(!asset && !shakeClass)continue;
             auto name=ObjectName(sound);
             if(name.empty())continue;
-            // List actual packaged USoundBase assets, not generated UI audio.
             int32_t index=-1;
             if(!Read(sound+0x0C,index) || index!=gSoundScanCursor)continue;
-            gSoundCandidates.push_back({index,std::string(name.begin(),name.end())});
-            if(gSoundCandidates.size()>=256)break;
+            if(asset)gSoundCandidates.push_back({index,std::string(name.begin(),name.end())});
+            if(shakeClass)gCameraShakeCandidates.push_back(
+                {index,std::string(name.begin(),name.end())});
         }
     }
     int ClassKind(uintptr_t cls) {
@@ -433,7 +451,7 @@ namespace {
             gScanIndex=0;
             gKinds.clear();gClassNames.clear();gFunctionCache.clear();
             gKnown.clear();
-            gSoundScanCursor=0;gSoundCandidates.clear();
+            gSoundScanCursor=0;gSoundCandidates.clear();gCameraShakeCandidates.clear();
             gPhysicsBackups.clear();gFallBackups.clear();gGodBackups.clear();
             // Level transition invalidates actor pointers. Never restore input to
             // a destroyed body; clear references and capture state instead.
@@ -621,6 +639,7 @@ namespace {
             gCreatures=std::move(creaturesOut);
             gVanityChoices=std::move(vanity);
             gSounds=gSoundCandidates;
+            gCameraShakes=gCameraShakeCandidates;
         }
         static ULONGLONG lastReport=0;
         const auto now=GetTickCount64();
@@ -932,6 +951,53 @@ namespace {
         swprintf_s(message,L"FLASHLIGHT: invoked native component flicker on %d players (network visibility unverified).",count);
         FHJDiag::Log(message);
         return count>0;
+    }
+    void ExecuteClientCameraShake(const Action& a) {
+        if(!ReadPtr(World()+0x158)) {
+            FHJDiag::Log(L"CLIENT SCARE: authoritative host required.");return;
+        }
+        int count=0;uintptr_t chunks=0;
+        if(!GetObjects(count,chunks) || a.amount<0 || a.amount>=count)return;
+        const auto shake=ObjectAt(a.amount,chunks);
+        int32_t actual=-1;
+        const auto metaclass=ClassName(ReadPtr(shake+0x10));
+        if(!shake || !Read(shake+0x0C,actual) || actual!=a.amount ||
+           (metaclass!=L"Class" && metaclass!=L"BlueprintGeneratedClass") ||
+           !IsCameraShakeClass(shake)) {
+            FHJDiag::Log(L"CLIENT SCARE: selected camera shake subclass not loaded.");return;
+        }
+        const auto fn=FindFunction(L"PlayerController",L"ClientStartCameraShake");
+        if(!fn) {
+            FHJDiag::Log(L"CLIENT SCARE: native ClientStartCameraShake RPC missing.");return;
+        }
+        std::vector<uintptr_t> controllers;
+        const auto add=[&](uintptr_t pawn) {
+            const auto pc=ReadPtr(pawn+0x2D8);
+            if(pc && std::find(controllers.begin(),controllers.end(),pc)==controllers.end())
+                controllers.push_back(pc);
+        };
+        if(a.target>=0) {
+            const auto pawn=SelectedPawn(a.target);
+            if(pawn)add(pawn);
+        } else {
+            add(LocalPawn());
+            for(const auto& player:gKnown)if(player.kind==1)add(player.address);
+        }
+        int sent=0;
+        for(const auto pc:controllers) {
+            // UE5.5 ClientStartCameraShake(TSubclassOf, float Scale,
+            // ECameraShakePlaySpace, FRotator). FRotator is 3 doubles.
+            alignas(8) uint8_t args[0x30]{};
+            const float intensity=std::clamp(a.value,0.1f,2.f);
+            std::memcpy(args,&shake,sizeof(shake));
+            std::memcpy(args+8,&intensity,sizeof(intensity));
+            args[0xC]=0; // CameraLocal; zeroed UserPlaySpaceRot
+            if(Invoke(pc,fn,args))++sent;
+        }
+        wchar_t msg[200]{};
+        swprintf_s(msg,L"CLIENT SCARE: native camera shake sent to %d/%d selected controllers; playback awaits multiplayer test.",
+            sent,static_cast<int>(controllers.size()));
+        FHJDiag::Log(msg);
     }
     void ExecuteClientSound(const Action& a) {
         if(!ReadPtr(World()+0x158)) {
@@ -2253,6 +2319,7 @@ namespace {
             ExecuteNoclip(a.type==ActionType::NoclipOn);return;
         }
         if(a.type==ActionType::TargetSound) {ExecuteClientSound(a);return;}
+        if(a.type==ActionType::TargetCameraShake) {ExecuteClientCameraShake(a);return;}
         if(a.type==ActionType::TargetHealth || a.type==ActionType::TargetNoise ||
            a.type==ActionType::TargetRevive || a.type==ActionType::TargetKill ||
            a.type==ActionType::TargetKick || a.type==ActionType::TargetGodMode) {
@@ -2308,6 +2375,7 @@ namespace {
             case ActionType::TargetKick:
             case ActionType::TargetGodMode:
             case ActionType::TargetSound:
+            case ActionType::TargetCameraShake:
             case ActionType::NoclipOn:
             case ActionType::NoclipOff:
             case ActionType::FallProtection:
@@ -2404,6 +2472,10 @@ std::vector<HunterNative::CreatureInfo> HunterNative::GetCreatures() {
 std::vector<HunterNative::SoundInfo> HunterNative::GetSounds() {
     std::lock_guard<std::mutex> lock(gMutex);
     return gSounds;
+}
+std::vector<HunterNative::CameraShakeInfo> HunterNative::GetCameraShakes() {
+    std::lock_guard<std::mutex> lock(gMutex);
+    return gCameraShakes;
 }
 std::vector<HunterNative::VanityItem> HunterNative::GetVanityItems() {
     std::lock_guard<std::mutex> lock(gMutex);
@@ -2548,6 +2620,11 @@ bool HunterNative::RequestTargetSound(int playerIndex,int soundIndex,float volum
     if(playerIndex< -1 || soundIndex<0 || !std::isfinite(volume) ||
        volume<0.05f || volume>2.0f)return false;
     return Enqueue({ActionType::TargetSound,"",soundIndex,volume,playerIndex,0});
+}
+bool HunterNative::RequestTargetCameraShake(int playerIndex,int shakeClassIndex,float scale) {
+    if(playerIndex< -1 || shakeClassIndex<0 || !std::isfinite(scale) ||
+       scale<0.1f || scale>2.0f)return false;
+    return Enqueue({ActionType::TargetCameraShake,"",shakeClassIndex,scale,playerIndex,0});
 }
 
 bool HunterNative::RequestTargetRevive(int id) {
