@@ -133,6 +133,7 @@ namespace {
     int gVampireStance=0;
     bool gVampireInvisible=false;
     std::array<ULONGLONG,5> gAbilityTicks{};
+    std::array<bool,3> gAbilityKeyDown{};
     ULONGLONG gLastAbilityTick=0;
     Vec3 gChaseSmoothedPos{};
     bool gChaseSmoothedValid=false;
@@ -1888,7 +1889,7 @@ namespace {
         if(gMonsterFunctions.empty())CacheCryptidActions();
         uintptr_t fn=0;
         alignas(8) uint8_t args[0x20]{};
-        bool toggleInvisibility=false,advanceStance=false;
+        bool advanceStance=false;
         if(slot==0) {
             fn=NoArgCryptidAction({L"Server_Attack",L"AUTH_Attack",
                 L"Attack",L"PerformAttack",L"StartAttack",L"Melee",
@@ -1907,7 +1908,6 @@ namespace {
                    (size==1 || size==2)) {
                     fn=it->second;
                     args[0]=gVampireInvisible?0:1;
-                    toggleInvisibility=true;
                     break;
                 }
             }
@@ -1963,21 +1963,21 @@ namespace {
     // World game time is supplied by an Unreal UFunction (pauses with the
     // actual world). Only use the OS clock if this UE reflection is absent.
     double ControlledWorldSeconds(uintptr_t world) {
-        static uintptr_t timeFn=0;
+        static uintptr_t timeFn=0,system=0;
         static ULONGLONG retry=0;
         const auto now=GetTickCount64();
         if(!timeFn && now>=retry) {
             retry=now+10000;
             timeFn=FindFunction(L"KismetSystemLibrary",L"GetGameTimeInSeconds");
+            system=FindObjectByName(L"Default__KismetSystemLibrary");
         }
-        if(timeFn) {
+        if(timeFn && system) {
             uint16_t size=0,ret=0;
             if(Read(timeFn+0xB6,size) && Read(timeFn+0xB8,ret) &&
                ret==8 && (size==12 || size==16)) {
                 alignas(8) uint8_t args[0x18]{};
                 std::memcpy(args,&world,8);
-                if(Invoke(FindObjectByName(L"Default__KismetSystemLibrary"),
-                          timeFn,args)) {
+                if(Invoke(system,timeFn,args)) {
                     double value=0;
                     if(size==16)std::memcpy(&value,args+8,8);
                     else {float v=0;std::memcpy(&v,args+8,4);value=v;}
@@ -2160,6 +2160,17 @@ namespace {
         const double front=static_cast<double>(down('W'))-static_cast<double>(down('S'));
         const double strafe=static_cast<double>(down('D'))-static_cast<double>(down('A'));
         const bool boost=down(VK_SHIFT);
+        if(monster) {
+            // Windows messages are consumed to suppress human-pawn actions.
+            // Detect key-down edges ourselves, including raw-input bindings.
+            constexpr int keys[3]{'Q','E','R'};
+            for(int i=0;i<3;++i) {
+                const bool pressed=down(keys[i]);
+                if(pressed && !gAbilityKeyDown[static_cast<size_t>(i)])
+                    ExecuteMonsterAbility(i+1);
+                gAbilityKeyDown[static_cast<size_t>(i)]=pressed;
+            }
+        }
         int species=0;
         if(monster) {
             std::lock_guard<std::mutex> guard(gMonsterStatusMutex);
@@ -2857,7 +2868,7 @@ namespace {
         gMonsterYaw=std::isfinite(previous.rot.yaw)?previous.rot.yaw:0.;
         gMonsterPitch=std::clamp(std::isfinite(previous.rot.pitch)?previous.rot.pitch:0.,-80.,80.);
         gLastMotionTick=0;
-        gLastAbilityTick=0;gAbilityTicks.fill(0);
+        gLastAbilityTick=0;gAbilityTicks.fill(0);gAbilityKeyDown.fill(false);
         gVampireStance=0;gVampireInvisible=false;
         Vec3 pos{};
         if(!Position(selected,pos) || !CreateMonsterCamera(pc,pos)) {
