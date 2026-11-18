@@ -37,7 +37,7 @@ namespace {
     struct Camera { Vec3 pos{}; Rot rot{}; float fov{}; };
     struct ActorEntry { uintptr_t address{}; int index{}; int kind{}; };
     struct LevelView { uintptr_t data{}; int32_t count{}; int32_t start{}; };
-    enum class ActionType { GiveItem, CatalogItem, GodMode, AddXP, Time, TimeScale, AddSilver, InfiniteDamage, BeanMode, RangerMode, SmoreMode, Rain, Snow, VampireScream, FlickerLights, CancelFlicker, TargetHealth, TargetItem, TargetNoise, TargetRevive, TargetKill, TargetKick, TargetGodMode, NoclipOn, NoclipOff, FallProtection, SpeedChange, JumpBoost, GravityChange, SpawnMob, PossessCryptid, RestoreHuman, MonsterAbility, EquipVanity };
+    enum class ActionType { GiveItem, CatalogItem, GodMode, AddXP, Time, TimeScale, AddSilver, InfiniteDamage, BeanMode, RangerMode, SmoreMode, Rain, Snow, VampireScream, FlickerLights, CancelFlicker, TargetHealth, TargetItem, TargetNoise, TargetRevive, TargetKill, TargetKick, TargetGodMode, TargetSound, NoclipOn, NoclipOff, FallProtection, SpeedChange, JumpBoost, GravityChange, SpawnMob, PossessCryptid, RestoreHuman, MonsterAbility, EquipVanity };
     struct Action { ActionType type{}; std::string item; int amount{}; float value{}; int target{-1}; double precise{}; };
     std::mutex gMutex;
     std::mutex gActionsMutex;
@@ -50,6 +50,8 @@ namespace {
     std::vector<Marker> gMarkers;
     std::vector<HunterNative::PlayerInfo> gRoster;
     std::vector<HunterNative::CreatureInfo> gCreatures;
+    std::vector<HunterNative::SoundInfo> gSounds, gSoundCandidates;
+    int gSoundScanCursor=0;
     struct VanityChoice { uintptr_t klass{}; std::string name; bool equipped{}; };
     std::vector<VanityChoice> gVanityChoices;
     // Saved original values for correct reversibility, keyed to live pawn identity.
@@ -218,6 +220,32 @@ namespace {
             cls=parent;
         }
         return false;
+    }
+    bool IsSoundAssetClass(uintptr_t cls) {
+        for(int depth=0;cls && depth<25;++depth) {
+            const auto name=ClassName(cls);
+            if(name==L"SoundBase")return true;
+            const auto parent=ReadPtr(cls+0x40);
+            if(!parent || parent==cls)break;
+            cls=parent;
+        }
+        return false;
+    }
+    void ScanLoadedSounds() {
+        if(gSoundCandidates.size()>=256)return;
+        int total=0;uintptr_t chunks=0;
+        if(!GetObjects(total,chunks))return;
+        for(int n=0;n<600 && gSoundScanCursor<total;++n,++gSoundScanCursor) {
+            const auto sound=ObjectAt(gSoundScanCursor,chunks);
+            if(!sound || !IsSoundAssetClass(ReadPtr(sound+0x10)))continue;
+            auto name=ObjectName(sound);
+            if(name.empty())continue;
+            // List actual packaged USoundBase assets, not generated UI audio.
+            int32_t index=-1;
+            if(!Read(sound+0x0C,index) || index!=gSoundScanCursor)continue;
+            gSoundCandidates.push_back({index,std::string(name.begin(),name.end())});
+            if(gSoundCandidates.size()>=256)break;
+        }
     }
     int ClassKind(uintptr_t cls) {
         if (!cls) return 0;
@@ -403,6 +431,7 @@ namespace {
             gScanIndex=0;
             gKinds.clear();gClassNames.clear();gFunctionCache.clear();
             gKnown.clear();
+            gSoundScanCursor=0;gSoundCandidates.clear();
             gPhysicsBackups.clear();gFallBackups.clear();gGodBackups.clear();
             // Level transition invalidates actor pointers. Never restore input to
             // a destroyed body; clear references and capture state instead.
@@ -423,6 +452,7 @@ namespace {
             FHJDiag::Log(L"World changed: reset ESP and player cache.");
         }
         AdvanceSpawnWave();
+        if(world)ScanLoadedSounds();
         HunterNative::Status status{};
         status.pendingSpawnTriggers=gSpawnWave.remaining;
         Camera cam{};
@@ -587,6 +617,7 @@ namespace {
             gRoster=std::move(playersOut);
             gCreatures=std::move(creaturesOut);
             gVanityChoices=std::move(vanity);
+            gSounds=gSoundCandidates;
         }
         static ULONGLONG lastReport=0;
         const auto now=GetTickCount64();
@@ -867,6 +898,58 @@ namespace {
         swprintf_s(message,L"FLASHLIGHT: invoked native component flicker on %d players (network visibility unverified).",count);
         FHJDiag::Log(message);
         return count>0;
+    }
+    void ExecuteClientSound(const Action& a) {
+        if(!ReadPtr(World()+0x158)) {
+            FHJDiag::Log(L"CLIENT AUDIO: authoritative session host required.");return;
+        }
+        int count=0;uintptr_t chunks=0;
+        if(!GetObjects(count,chunks) || a.amount<0 || a.amount>=count) {
+            FHJDiag::Log(L"CLIENT AUDIO: invalid sound object index.");return;
+        }
+        const auto asset=ObjectAt(a.amount,chunks);
+        int32_t liveIndex=-1;
+        if(!asset || !Read(asset+0x0C,liveIndex) || liveIndex!=a.amount ||
+           !IsSoundAssetClass(ReadPtr(asset+0x10))) {
+            FHJDiag::Log(L"CLIENT AUDIO: sound asset unloaded or not USoundBase.");return;
+        }
+        const auto clientPlay=FindFunction(L"PlayerController",L"ClientPlaySound");
+        if(!clientPlay) {
+            FHJDiag::Log(L"CLIENT AUDIO: native PlayerController.ClientPlaySound RPC unavailable.");return;
+        }
+        std::vector<uintptr_t> targets;
+        const auto addPawn=[&](uintptr_t pawn) {
+            const auto controller=ReadPtr(pawn+0x2D8);
+            if(controller &&
+                std::find(targets.begin(),targets.end(),controller)==targets.end())
+                targets.push_back(controller);
+        };
+        if(a.target>=0) {
+            const auto pawn=SelectedPawn(a.target);
+            if(pawn)addPawn(pawn);
+        } else {
+            addPawn(LocalPawn());
+            for(const auto& actor:gKnown)if(actor.kind==1)addPawn(actor.address);
+        }
+        if(targets.empty()) {
+            FHJDiag::Log(L"CLIENT AUDIO: no live selected/roster player controller.");return;
+        }
+        int dispatched=0;
+        for(const auto controller:targets) {
+            // UE5.5 native ClientPlaySound(USoundBase*,float,float) is
+            // an owning-client RPC: server sends to each chosen controller.
+            alignas(8) uint8_t args[0x10]{};
+            const float volume=std::clamp(a.value,0.05f,2.0f);
+            const float pitch=1.0f;
+            std::memcpy(args,&asset,sizeof(asset));
+            std::memcpy(args+8,&volume,sizeof(volume));
+            std::memcpy(args+12,&pitch,sizeof(pitch));
+            if(Invoke(controller,clientPlay,args))++dispatched;
+        }
+        wchar_t msg[230]{};
+        swprintf_s(msg,L"CLIENT AUDIO: dispatched PlayerController.ClientPlaySound on %d/%d controller(s), USoundBase index %d. Client playback needs in-game verification.",
+            dispatched,static_cast<int>(targets.size()),a.amount);
+        FHJDiag::Log(msg);
     }
     void ExecuteTargetedAction(const Action& a) {
         const auto world=World();
@@ -2059,6 +2142,7 @@ namespace {
         if(a.type==ActionType::NoclipOn || a.type==ActionType::NoclipOff) {
             ExecuteNoclip(a.type==ActionType::NoclipOn);return;
         }
+        if(a.type==ActionType::TargetSound) {ExecuteClientSound(a);return;}
         if(a.type==ActionType::TargetHealth || a.type==ActionType::TargetNoise ||
            a.type==ActionType::TargetRevive || a.type==ActionType::TargetKill ||
            a.type==ActionType::TargetKick || a.type==ActionType::TargetGodMode) {
@@ -2110,6 +2194,7 @@ namespace {
             case ActionType::TargetKill:
             case ActionType::TargetKick:
             case ActionType::TargetGodMode:
+            case ActionType::TargetSound:
             case ActionType::NoclipOn:
             case ActionType::NoclipOff:
             case ActionType::FallProtection:
@@ -2202,6 +2287,10 @@ std::vector<HunterNative::PlayerInfo> HunterNative::GetPlayers() {
 std::vector<HunterNative::CreatureInfo> HunterNative::GetCreatures() {
     std::lock_guard<std::mutex> lock(gMutex);
     return gCreatures;
+}
+std::vector<HunterNative::SoundInfo> HunterNative::GetSounds() {
+    std::lock_guard<std::mutex> lock(gMutex);
+    return gSounds;
 }
 std::vector<HunterNative::VanityItem> HunterNative::GetVanityItems() {
     std::lock_guard<std::mutex> lock(gMutex);
@@ -2338,6 +2427,11 @@ bool HunterNative::RequestTargetNoise(int index,double loudness,double maxRangeM
     if(index<0 || !std::isfinite(loudness) || loudness<0 || loudness>100 ||
         !std::isfinite(maxRangeMeters) || maxRangeMeters<1 || maxRangeMeters>2000) return false;
     return Enqueue({ActionType::TargetNoise,"",0,static_cast<float>(maxRangeMeters),index,loudness});
+}
+bool HunterNative::RequestTargetSound(int playerIndex,int soundIndex,float volume) {
+    if(playerIndex< -1 || soundIndex<0 || !std::isfinite(volume) ||
+       volume<0.05f || volume>2.0f)return false;
+    return Enqueue({ActionType::TargetSound,"",soundIndex,volume,playerIndex,0});
 }
 
 bool HunterNative::RequestTargetRevive(int id) {
