@@ -37,7 +37,7 @@ namespace {
     struct Camera { Vec3 pos{}; Rot rot{}; float fov{}; };
     struct ActorEntry { uintptr_t address{}; int index{}; int kind{}; };
     struct LevelView { uintptr_t data{}; int32_t count{}; int32_t start{}; };
-    enum class ActionType { GiveItem, CatalogItem, GodMode, AddXP, Time, TimeScale, AddSilver, InfiniteDamage, BeanMode, RangerMode, SmoreMode, Rain, Snow, VampireScream, FlickerLights, CancelFlicker, TargetHealth, TargetItem, TargetNoise, TargetRevive, TargetKill, TargetKick, TargetGodMode, TargetSound, NoclipOn, NoclipOff, FallProtection, SpeedChange, JumpBoost, GravityChange, SpawnMob, PossessCryptid, RestoreHuman, MonsterAbility, EquipVanity };
+    enum class ActionType { GiveItem, CatalogItem, GodMode, AddXP, Time, TimeScale, AddSilver, InfiniteDamage, BeanMode, RangerMode, SmoreMode, Rain, Snow, ClearWeather, VampireScream, FlickerLights, CancelFlicker, TargetHealth, TargetItem, TargetNoise, TargetRevive, TargetKill, TargetKick, TargetGodMode, TargetSound, NoclipOn, NoclipOff, FallProtection, SpeedChange, JumpBoost, GravityChange, SpawnMob, PossessCryptid, RestoreHuman, MonsterAbility, EquipVanity };
     struct Action { ActionType type{}; std::string item; int amount{}; float value{}; int target{-1}; double precise{}; };
     std::mutex gMutex;
     std::mutex gActionsMutex;
@@ -833,6 +833,37 @@ namespace {
                      L"WEATHER: intensity zeroed, particle setup refreshed, enable flag cleared.") :
             L"WEATHER: could not verify final Enable_Rain/Snow flag after native setter.");
         return changed && verified;
+    }
+    bool ExecuteClearWeather() {
+        const auto actor=FindWeatherActor();
+        if(!actor) {
+            FHJDiag::Log(L"WEATHER CLEAR: active BP_WeatherTool_C not found.");return false;
+        }
+        const auto rain=FindFunction(L"BP_WeatherTool_C",L"Set Overall Rain Intensity");
+        const auto snow=FindFunction(L"BP_WeatherTool_C",L"Set Overall Snow Intensity");
+        if(!rain || !snow) {
+            FHJDiag::Log(L"WEATHER CLEAR: one or both native intensity setters missing.");return false;
+        }
+        alignas(8) uint8_t args[0x30]{};
+        const double zero=0.0;
+        std::memcpy(args,&zero,sizeof(zero));
+        const bool rainSent=Invoke(actor,rain,args);
+        const bool snowSent=Invoke(actor,snow,args);
+        // Atomically clear both toggles after both setters. The native setup
+        // may revive a weather flag; assert OFF again afterwards.
+        const bool a=TryWrite(actor+0x300,false);
+        const bool b=TryWrite(actor+0x390,false);
+        const auto setup=FindFunction(L"BP_WeatherTool_C",L"Weather Setup Function");
+        if(setup)Invoke(actor,setup,nullptr);
+        TryWrite(actor+0x300,false);
+        TryWrite(actor+0x390,false);
+        bool rainEnabled=true,snowEnabled=true;
+        const bool verified=Read(actor+0x300,rainEnabled) &&
+            Read(actor+0x390,snowEnabled) && !rainEnabled && !snowEnabled;
+        FHJDiag::Log(rainSent && snowSent && a && b && verified ?
+            L"WEATHER CLEAR: rain/snow intensity zeroed and BOTH enable flags verified off.":
+            L"WEATHER CLEAR: native requests sent but reset incomplete; inspect live WeatherTool.");
+        return rainSent && snowSent && a && b && verified;
     }
     bool IsVampire(uintptr_t actor) {
         auto klass=ReadPtr(actor+0x10);
@@ -2175,6 +2206,9 @@ namespace {
             case ActionType::Snow:
                 ExecuteWeather(a);
                 return;
+            case ActionType::ClearWeather:
+                ExecuteClearWeather();
+                return;
             case ActionType::BeanMode:fn=L"EnableBeanMode";break;
             case ActionType::RangerMode:fn=L"EnableRangerMode";break;
             case ActionType::SmoreMode:fn=L"EnableSmoreMode";break;
@@ -2407,6 +2441,9 @@ bool HunterNative::RequestRain(double amount) {
 bool HunterNative::RequestSnow(double amount) {
     return std::isfinite(amount) && amount>=0.0 && amount<=1.0 ?
         Enqueue({ActionType::Snow,"",0,static_cast<float>(amount)}):false;
+}
+bool HunterNative::RequestClearWeather() {
+    return Enqueue({ActionType::ClearWeather,"",0,0});
 }
 
 bool HunterNative::RequestVampireScream() {return Enqueue({ActionType::VampireScream,"",0,0});}
