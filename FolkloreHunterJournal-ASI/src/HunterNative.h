@@ -14,6 +14,10 @@ namespace HunterNative {
         double health = -1.0;
         double maxHealth = -1.0;
     };
+    struct CameraShakeInfo {
+        int objectIndex = -1;
+        std::string displayName;
+    };
     struct SoundInfo {
         int objectIndex = -1;
         std::string displayName;
@@ -65,6 +69,7 @@ namespace HunterNative {
     std::vector<PlayerInfo> GetPlayers();
     std::vector<CreatureInfo> GetCreatures();
     std::vector<SoundInfo> GetSounds();
+    std::vector<CameraShakeInfo> GetCameraShakes();
     std::vector<VanityItem> GetVanityItems();
     bool RequestEquipVanity(const std::string& className);
     // Gameplay changes are runtime experiments and may not replicate to clients.
@@ -84,6 +89,7 @@ namespace HunterNative {
     // PlayerController.ClientPlaySound is a native owning-client RPC.
     // Target -1 sends one request per scanned player on the authoritative host.
     bool RequestTargetSound(int targetObjectIndex, int soundObjectIndex, float volume);
+    bool RequestTargetCameraShake(int targetObjectIndex, int shakeClassObjectIndex, float scale);
     bool RequestTargetRevive(int targetObjectIndex);
     bool RequestTargetKill(int targetObjectIndex);
     bool RequestTargetKick(int targetObjectIndex);
