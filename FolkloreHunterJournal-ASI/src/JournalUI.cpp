@@ -426,29 +426,15 @@ namespace FHJ
                 HunterNative::RequestRestoreHuman();
             if(!state.host)ImGui::EndDisabled();
             ImGui::TextDisabled("Remote cryptid control preserves the human pawn in the expedition.");
-            ImGui::TextDisabled("WASD uses native AI navigation; Shift sprint. Space/Ctrl enable free-flight.");
-            ImGui::TextDisabled("Farther chase camera with wall traces and reduced motion blur.");
-            ImGui::TextDisabled("On death: 15s world-time countdown, then one native map-spawner request.");
-            ImGui::TextDisabled("Replacement cryptid keeps the camera, ability HUD and human control suspension.");
+            ImGui::TextDisabled("Mothman: aerial movement (Space up / Ctrl down).");
+            ImGui::TextDisabled("Wendigo and Vampire: ground movement only (Space jump, no noclip).");
+            ImGui::TextDisabled("Creature-specific native skill keybinds appear ONLY on the possession HUD.");
+            ImGui::TextDisabled("Unsupported abilities are hidden, not assigned from another cryptid.");
+            ImGui::TextDisabled("On death: 15s world-time countdown and native map respawn tracking.");
             if(HunterNative::MonsterModeActive()) {
                 ImGui::Separator();
-                ImGui::TextColored(Palette::col_gold,"MONSTER ABILITIES");
-                if(ImGui::Button("MELEE ATTACK [LMB]",ImVec2(-1,29)))
-                    HunterNative::RequestMonsterAbility(0);
-                const bool vampire=HunterNative::MonsterSpecies()==2;
-                if(ImGui::Button(vampire?"VAMPIRE SCREAM [Q]":"CRYPTID ROAR / SCREAM [Q]",ImVec2(-1,29)))
-                    HunterNative::RequestMonsterAbility(1);
-                if(!vampire)ImGui::BeginDisabled();
-                if(ImGui::Button("VAMPIRE INVISIBILITY [E]",ImVec2(-1,29)))
-                    HunterNative::RequestMonsterAbility(2);
-                if(ImGui::Button("VAMPIRE CHANGE STANCE [R]",ImVec2(-1,29)))
-                    HunterNative::RequestMonsterAbility(3);
-                if(ImGui::Button("VAMPIRE SCREAM AUDIO",ImVec2(-1,29)))
-                    HunterNative::RequestMonsterAbility(4);
-                if(!vampire)ImGui::EndDisabled();
-                ImGui::TextDisabled("Q/E/R fire on key-down (not key release). E toggles supported invisibility.");
-                ImGui::TextDisabled("The selected cryptid's method names/ParmSize are logged for F9 review.");
-                ImGui::TextDisabled("LMB attempts the native creature sound event, then loaded melee audio assets.");
+                ImGui::TextColored(Palette::col_gold,"ATTACK AUDIO CONFIGURATION");
+                ImGui::TextDisabled("Use LMB in-game to attack. Only supported skills appear in the HUD.");
                 const auto audio=HunterNative::GetSounds();
                 static int meleeSound=-1;
                 std::string meleeLabel="AUTO / MATCH CRYPTID MELEE";
