@@ -1774,13 +1774,21 @@ namespace {
         return 0;
     }
     void RestoreMonsterAI() {
-        StopCryptidPath();
+        int32_t actorId=-1;
+        const bool actorLive=gMonsterPawn &&
+            Read(gMonsterPawn+0xC,actorId) && actorId==gMonsterIndex;
+        const bool movementLive=actorLive && gMonsterMovement &&
+            ReadPtr(gMonsterPawn+0x330)==gMonsterMovement;
+        const bool controllerLive=actorLive && gMonsterAIController &&
+            ReadPtr(gMonsterPawn+0x2D8)==gMonsterAIController;
+        if(controllerLive)StopCryptidPath();
+        else {gMonsterPathActive=false;gMonsterLastMoveRequest=0;}
         gMonsterFunctions.clear();
-        if(gMonsterMovement && gMonsterSpeedsSaved) {
+        if(movementLive && gMonsterSpeedsSaved) {
             TryWrite(gMonsterMovement+0x268,gMonsterOriginalWalkSpeed);
             TryWrite(gMonsterMovement+0x274,gMonsterOriginalFlySpeed);
         }
-        if(gMonsterMovement && gMonsterModeSaved) {
+        if(movementLive && gMonsterModeSaved) {
             const auto setMode=FindFunction(L"CharacterMovementComponent",L"SetMovementMode");
             if(setMode) {
                 uint8_t args[2]{gMonsterPriorMovement,0};
@@ -1790,7 +1798,7 @@ namespace {
         gMonsterMovement=0;
         gMonsterSpeedsSaved=false;gMonsterModeSaved=false;
         gMonsterFlightActive=false;
-        if(gMonsterBrain && gMonsterBrainWasRunning) {
+        if(controllerLive && gMonsterBrain && gMonsterBrainWasRunning) {
             const auto restart=FindFunction(L"BrainComponent",L"RestartLogic");
             if(restart)Invoke(gMonsterBrain,restart,nullptr);
             FHJDiag::Log(L"Monster Mode: previous AI behavior restored.");
