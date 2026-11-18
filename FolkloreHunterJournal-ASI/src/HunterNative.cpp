@@ -33,7 +33,7 @@ namespace {
     struct Rot { double pitch{},yaw{},roll{}; };
     struct Name { int32_t index{}; uint32_t number{}; };
     struct FStringView { wchar_t* data{}; int32_t size{},capacity{}; };
-    struct Marker { Vec3 pos{}; int kind{}; double health{-1.0}; };
+    struct Marker { Vec3 pos{}; int kind{}; double health{-1.0}, maxHealth{-1.0}; };
     struct Camera { Vec3 pos{}; Rot rot{}; float fov{}; };
     struct ActorEntry { uintptr_t address{}; int index{}; int kind{}; };
     struct LevelView { uintptr_t data{}; int32_t count{}; int32_t start{}; };
@@ -479,6 +479,13 @@ namespace {
                     creature.objectIndex=actor.index;
                     auto cls=ReadPtr(actor.address+0x10);
                     creature.isPawn=IsPawnClass(cls);
+                    // Reflected BP_Cryptid_Base_C::Health / MaxHealth (0x710 / 0x718).
+                    if(!Read(actor.address+0x710,creature.health) ||
+                       !std::isfinite(creature.health) || creature.health<0)
+                        creature.health=-1.0;
+                    if(!Read(actor.address+0x718,creature.maxHealth) ||
+                       !std::isfinite(creature.maxHealth) || creature.maxHealth<=0)
+                        creature.maxHealth=-1.0;
                     const auto name=ClassName(cls);
                     creature.displayName=std::string(name.begin(),name.end());
                     creaturesOut.push_back(std::move(creature));
@@ -499,7 +506,19 @@ namespace {
                 const double distance=std::hypot(std::hypot(loc.x-cam.pos.x,
                     loc.y-cam.pos.y),loc.z-cam.pos.z);
                 if(distance>gMaxDistanceMeters.load()*100.0)continue;
-                markers.push_back({loc,actor.kind,-1.0});
+                double actorHealth=-1.0,actorMaxHealth=-1.0;
+                if(actor.kind==2) {
+                    if(!Read(actor.address+0x710,actorHealth) ||
+                       !std::isfinite(actorHealth) || actorHealth<0)actorHealth=-1.0;
+                    if(!Read(actor.address+0x718,actorMaxHealth) ||
+                       !std::isfinite(actorMaxHealth) || actorMaxHealth<=0)actorMaxHealth=-1.0;
+                } else if(actor.kind==1) {
+                    if(!Read(actor.address+0x8A0,actorHealth) ||
+                       !std::isfinite(actorHealth) || actorHealth<0)actorHealth=-1.0;
+                    if(!Read(actor.address+0x8A8,actorMaxHealth) ||
+                       !std::isfinite(actorMaxHealth) || actorMaxHealth<=0)actorMaxHealth=-1.0;
+                }
+                markers.push_back({loc,actor.kind,actorHealth,actorMaxHealth});
             }
             status.espCandidates=static_cast<int>(markers.size());
             status.fallProtectionEnabled=gProtectFall.load();
@@ -2099,10 +2118,24 @@ void HunterNative::DrawESP(ImVec2 display) {
         dl->AddLine({pt.x-5,pt.y},{pt.x+5,pt.y},color,1.2f);
         dl->AddLine({pt.x,pt.y-5},{pt.x,pt.y+5},color,1.2f);
         char label[160]{};
-        if(marker.health>=0 && std::isfinite(marker.health))
-            snprintf(label,sizeof(label),"%s %.0fm HP %.0f",names[marker.kind],meters,marker.health);
-        else snprintf(label,sizeof(label),"%s %.0fm",names[marker.kind],meters);
-        dl->AddText({pt.x+radius+4,pt.y-9},color,label);
+        if(marker.health>=0 && marker.maxHealth>0)
+            snprintf(label,sizeof(label),"%s %.0fm | HP %.0f / %.0f",
+                names[marker.kind],meters,marker.health,marker.maxHealth);
+        else if(marker.health>=0)
+            snprintf(label,sizeof(label),"%s %.0fm | HP %.0f",
+                names[marker.kind],meters,marker.health);
+        else snprintf(label,sizeof(label),"%s %.0fm | HP ?",names[marker.kind],meters);
+        const float left=pt.x+radius+4;
+        dl->AddText({left,pt.y-11},color,label);
+        if(marker.kind==2 && marker.health>=0 && marker.maxHealth>0) {
+            constexpr float width=94.f;
+            const float ratio=std::clamp(
+                static_cast<float>(marker.health/marker.maxHealth),0.f,1.f);
+            dl->AddRectFilled({left,pt.y+7},{left+width,pt.y+13},
+                IM_COL32(34,37,33,210),2.f);
+            dl->AddRectFilled({left,pt.y+7},{left+width*ratio,pt.y+13},
+                color,2.f);
+        }
     }
 }
 void HunterNative::DrawESPSettings() {
