@@ -1837,7 +1837,10 @@ namespace {
         const auto event=NoArgCryptidAction({L"All_AttackSound",
             L"AUTH_AttackSound",L"PlayAttackSound",L"AttackSound",
             L"PlayMeleeSound",L"MeleeSound",L"PlayClawSound"});
-        if(event && Invoke(gMonsterPawn,event,nullptr))return;
+        // A manual asset override must be audible even if ProcessEvent
+        // returns success for a Blueprint sound event that plays nothing.
+        if(gMonsterAttackSoundIndex.load()<0 &&
+           event && Invoke(gMonsterPawn,event,nullptr))return;
 
         // For classes without an exposed melee sound event, use a loaded
         // cooked USoundBase through the local owning PlayerController RPC.
