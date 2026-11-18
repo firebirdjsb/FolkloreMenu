@@ -378,6 +378,7 @@ namespace FHJ
             ImGui::TextColored(Palette::col_gold,"CRYPTID SPAWNING [HOST]");
             static int wave=1,selectedCreature=-1;
             ImGui::SliderInt("Native spawner triggers",&wave,1,10);
+            ImGui::Text("Queued spawn requests: %d",state.pendingSpawnTriggers);
             if(!state.host)ImGui::BeginDisabled();
             if(ImGui::Button("TRIGGER LOADED MOB SPAWNERS",ImVec2(-1,32)))
                 HunterNative::RequestSpawnMobWave(wave,selectedCreature);
@@ -388,9 +389,11 @@ namespace FHJ
             ImGui::TextColored(Palette::col_gold,"BECOME A LIVE CRYPTID [EXPERIMENTAL]");
             std::string selectedLabel="Select a live cryptid";
             bool isPawn=false;
+            double cryptidHP=-1.0, cryptidMaxHP=-1.0;
             for(const auto& creature:creatures) if(creature.objectIndex==selectedCreature) {
                 selectedLabel=creature.displayName+" #"+std::to_string(creature.objectIndex);
                 isPawn=creature.isPawn;
+                cryptidHP=creature.health;cryptidMaxHP=creature.maxHealth;
             }
             if(ImGui::BeginCombo("Cryptid",selectedLabel.c_str())) {
                 for(const auto& creature:creatures) {
@@ -402,6 +405,14 @@ namespace FHJ
                 }
                 ImGui::EndCombo();
             }
+            if(cryptidHP>=0) {
+                if(cryptidMaxHP>0) {
+                    ImGui::Text("CRYPTID HEALTH: %.0f / %.0f",cryptidHP,cryptidMaxHP);
+                    ImGui::ProgressBar(std::clamp(
+                        static_cast<float>(cryptidHP/cryptidMaxHP),0.f,1.f),
+                        ImVec2(-1,10));
+                } else ImGui::Text("CRYPTID HEALTH: %.0f / ?",cryptidHP);
+            } else ImGui::TextDisabled("Cryptid HP: select a live cryptid to inspect");
             if(!state.host || selectedCreature<0 || !isPawn)ImGui::BeginDisabled();
             if(ImGui::Button("CONTROL CRYPTID [PUPPET MODE]",ImVec2(-1,32)))
                 HunterNative::RequestPossessCryptid(selectedCreature);
@@ -410,8 +421,8 @@ namespace FHJ
             if(ImGui::Button("RESTORE HUMAN CHARACTER",ImVec2(-1,30)))
                 HunterNative::RequestRestoreHuman();
             if(!state.host)ImGui::EndDisabled();
-            ImGui::TextDisabled("Puppet Mode keeps your human pawn possessed, avoiding solo-session restart.");
-            ImGui::TextDisabled("Native movement input drives monster walking/running animation.");
+            ImGui::TextDisabled("Puppet Mode preserves the human pawn but disables its gameplay input.");
+            ImGui::TextDisabled("Native movement and AI path-stop are dispatched; verify movement in-game.");
             if(HunterNative::MonsterModeActive()) {
                 ImGui::Separator();
                 ImGui::TextColored(Palette::col_gold,"MONSTER ABILITIES");
@@ -575,7 +586,33 @@ namespace FHJ
             ImGui::TextColored(Palette::col_gold,"THE HOST'S HAUNTINGS");
 
             const auto selectedPrankTarget=DrawPlayerSelect("Scare target (host actions)");
-            ImGui::TextDisabled("Shared horror effects target current world; player-specific noise below targets selection.");
+            ImGui::TextDisabled("Select a player for a client-side native sound or AI noise event.");
+            const auto sounds=HunterNative::GetSounds();
+            static int selectedSound=-1;
+            static float selectedSoundVolume=1.f;
+            std::string soundName="Choose a loaded game sound";
+            for(const auto& sound:sounds)if(sound.objectIndex==selectedSound)
+                soundName=sound.displayName;
+            if(ImGui::BeginCombo("Native horror sound",soundName.c_str())) {
+                for(const auto& sound:sounds) {
+                    ImGui::PushID(sound.objectIndex);
+                    if(ImGui::Selectable(sound.displayName.c_str(),
+                        selectedSound==sound.objectIndex))selectedSound=sound.objectIndex;
+                    ImGui::PopID();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::TextDisabled("Loaded in-game sounds found: %d. Catalog fills as assets are scanned.",
+                static_cast<int>(sounds.size()));
+            ImGui::SliderFloat("Remote sound volume",&selectedSoundVolume,.1f,2.f,"%.1fx");
+            if(!HunterNative::GetStatus().host || selectedSound<0)ImGui::BeginDisabled();
+            if(ImGui::Button("PLAY SOUND ON SELECTED HUNTER",ImVec2(-1,30)))
+                HunterNative::RequestTargetSound(selectedPrankTarget,selectedSound,selectedSoundVolume);
+            if(ImGui::Button("PLAY SOUND ON ALL HUNTERS",ImVec2(-1,30)))
+                HunterNative::RequestTargetSound(-1,selectedSound,selectedSoundVolume);
+            if(!HunterNative::GetStatus().host || selectedSound<0)ImGui::EndDisabled();
+            ImGui::TextDisabled("Uses PlayerController.ClientPlaySound (owning-client RPC).");
+            ImGui::TextDisabled("Remote visuals need a networked game effect; local ImGui scare art cannot replicate.");
             if(selectedPrankTarget>=0) {
                 static float loudness=5.f, range=70.f;
                 ImGui::SliderFloat("Noise loudness",&loudness,0.1f,25.f);
@@ -593,7 +630,7 @@ namespace FHJ
             if (ImGui::Button("RESTORE HUNTERS' FLASHLIGHTS  [HOST]",ImVec2(-1,32)))
                 HunterNative::RequestFlickerLights(true);
             if (!horrorHost.host) ImGui::EndDisabled();
-            ImGui::TextDisabled("Multicast declarations confirmed in SDK. Host effects require live actors.");
+            ImGui::TextDisabled("Native host effects require loaded actors and two-client playback testing.");
             ImGui::Separator();
 
             const auto status=HunterNative::GetStatus();
