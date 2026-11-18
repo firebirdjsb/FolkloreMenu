@@ -1638,44 +1638,67 @@ namespace {
         if(!Read(gMonsterPawn+0x0C,index) || index!=gMonsterIndex)return;
         const auto now=GetTickCount64();
         if(now-gLastAbilityTick<650)return; // bound ability spam
-        const auto cls=ReadPtr(gMonsterPawn+0x10);
-        bool vampire=false,cryptid=false;
-        uintptr_t parent=cls;
-        for(int depth=0;parent && depth<25;++depth) {
-            const auto n=ClassName(parent);
-            if(n==L"BP_VampireBase_C")vampire=true;
-            if(n==L"BP_Cryptid_Base_C")cryptid=true;
+        bool vampire=false;
+        for(auto parent=ReadPtr(gMonsterPawn+0x10),depth=0ULL;
+            parent && depth<25; ++depth) {
+            if(ClassName(parent)==L"BP_VampireBase_C")vampire=true;
             const auto next=ReadPtr(parent+0x40);
             if(!next || next==parent)break;
             parent=next;
         }
+        if(gMonsterFunctions.empty())CacheCryptidActions();
         uintptr_t fn=0;
         alignas(8) uint8_t args[0x20]{};
-        switch(slot) {
-            case 0:
-                // Native melee method preserves the creature's anim montage chain.
-                fn=FindFunction(vampire?L"BP_VampireBase_C":L"BP_Cryptid_Base_C",L"Melee");
-                break;
-            case 1: if(vampire)fn=FindFunction(L"BP_VampireBase_C",L"AUTH_Scream");break;
-            case 2: if(vampire)fn=FindFunction(L"BP_VampireBase_C",L"Invisible");break;
-            case 3: if(vampire) {
-                fn=FindFunction(L"BP_VampireBase_C",L"SetStance");
-                gVampireStance=(gVampireStance+1)%3;
-                std::memcpy(args,&gVampireStance,4);
-                break;
+        if(slot==0) {
+            // Server attack entry point first: the prior implementation chose
+            // Melee unconditionally and never reached Server_Attack if Melee
+            // happened to be present but required gameplay state/parameters.
+            fn=NoArgCryptidAction({L"Server_Attack",L"AUTH_Attack",
+                L"Attack",L"PerformAttack",L"StartAttack",L"Melee",
+                L"PrimaryAttack",L"DoMeleeAttack"});
+        } else if(slot==1) {
+            fn=NoArgCryptidAction({L"AUTH_Scream",L"Server_Scream",
+                L"Scream",L"Roar",L"DoScream",L"PlayRoar"});
+        } else if(slot==2 && vampire) {
+            fn=NoArgCryptidAction({L"Invisible",L"AUTH_Invisible",
+                L"GoInvisible",L"ToggleInvisible",L"SetInvisible"});
+        } else if(slot==3 && vampire) {
+            fn=NoArgCryptidAction({L"CycleStance",L"ChangeStance",L"SwitchStance"});
+            if(!fn) {
+                const auto it=gMonsterFunctions.find(L"SetStance");
+                if(it!=gMonsterFunctions.end()) {
+                    uint16_t size=0;
+                    if(Read(it->second+0xB6,size) && size==4) {
+                        fn=it->second;
+                        gVampireStance=(gVampireStance+1)%3;
+                        std::memcpy(args,&gVampireStance,4);
+                    }
+                }
             }
-            case 4: if(vampire)fn=FindFunction(L"BP_VampireBase_C",L"All_ScreamSound");break;
-            default:break;
+        } else if(slot==4 && vampire) {
+            fn=NoArgCryptidAction({L"All_ScreamSound",L"ScreamSound",
+                L"PlayScreamSound",L"PlayScream"});
         }
-        if(!fn && slot==0 && cryptid)fn=FindFunction(L"BP_Cryptid_Base_C",L"Server_Attack");
         if(!fn) {
-            FHJDiag::Log(L"Monster ability unavailable: no verified no-arg native function for this species.");
+            if(now-gLastCreatureMethodWarning>4000) {
+                gLastCreatureMethodWarning=now;
+                wchar_t msg[192]{};
+                swprintf_s(msg,L"CRYPTID ABILITY slot %d: no matching zero-argument method in selected creature hierarchy. Method list and SDK signature need verification.",slot);
+                FHJDiag::Log(msg);
+            }
             return;
         }
+        const auto name=ObjectName(fn);
         if(Invoke(gMonsterPawn,fn,args)) {
             gLastAbilityTick=now;
-            FHJDiag::Log(L"Monster ability dispatched on existing cryptid actor; animation/effect subject to game authority.");
-        } else FHJDiag::Log(L"Monster ability reflection dispatch failed.");
+            wchar_t msg[220]{};
+            swprintf_s(msg,L"CRYPTID ABILITY slot %d: invoked native %s on host; check animation and damage/effect in-game.",slot,name.c_str());
+            FHJDiag::Log(msg);
+        } else {
+            wchar_t msg[160]{};
+            swprintf_s(msg,L"CRYPTID ABILITY: ProcessEvent failed for %s.",name.c_str());
+            FHJDiag::Log(msg);
+        }
     }
     void FreeflightTick() {
         const ULONGLONG now=GetTickCount64();
@@ -1702,11 +1725,9 @@ namespace {
             }
             return;
         }
-        // Puppet mode must keep native AddMovementInput to drive the cryptid
-        // AnimBlueprint. Noclip is different: the local game's movement/input
-        // graph can consume the X/Y components of AddMovementInput even in
-        // MOVE_Flying, leaving only Space/Ctrl working. Noclip uses a separate
-        // explicit unswept world-space movement path below.
+        // AI-owned cryptids are driven by AIController::MoveToLocation so the
+        // CharacterMovement / AnimBlueprint locomotion receives a real path.
+        // Local noclip is separate and uses world-space movement.
         const double dt=std::clamp(static_cast<double>(elapsed)*.001,0.0,.045);
         const auto camera=GetCamera(world);
         const double yaw=(monster?gMonsterYaw:camera.rot.yaw)*kPi/180.0;
@@ -1770,14 +1791,39 @@ namespace {
                         FHJDiag::Log(L"NOCLIP: could not read live player actor world location.");
                     }
                 }
-            } else if(!AddSmoothMovement(pawn,input,1.f)) {
-                static ULONGLONG warned=0;
-                if(now-warned>8000) {
-                    warned=now;
-                    FHJDiag::Log(L"CRYPTID: native movement input could not be dispatched.");
+            } else {
+                // Native AI pathing only accepts ground-plane commands.
+                // Mothman/flying species retain vertical AddMovementInput.
+                Vec3 horizontal{input.x,input.y,0.0};
+                const double lenXY=std::hypot(horizontal.x,horizontal.y);
+                bool handled=true;
+                if(lenXY>1e-3) {
+                    horizontal.x/=lenXY;horizontal.y/=lenXY;
+                    handled=MoveCryptidWithAI(horizontal,now);
+                } else StopCryptidPath();
+                if(!handled) {
+                    // Navigation data can be absent in scripted maps. A
+                    // *swept* UE Actor move respects collision and gives
+                    // visible fallback control rather than silent failure.
+                    Vec3 pos{};
+                    if(Position(pawn,pos)) {
+                        const double speed=boost?850.0:500.0;
+                        const Vec3 dest{pos.x+horizontal.x*speed*dt,
+                                        pos.y+horizontal.y*speed*dt,
+                                        pos.z+input.z*speed*dt};
+                        if(!SetActorLocationSafe(pawn,dest,true,false) &&
+                           now-gLastCreatureMethodWarning>6000) {
+                            gLastCreatureMethodWarning=now;
+                            FHJDiag::Log(L"CRYPTID MOVE: native navigation and swept movement both rejected; check host authority.");
+                        }
+                    }
+                } else if(flying && std::fabs(input.z)>0.05) {
+                    // Vertical flight is still an engine movement input;
+                    // ground cryptids never receive vertical travel.
+                    AddSmoothMovement(pawn,{0.0,0.0,input.z},1.f);
                 }
             }
-        }
+        } else if(monster) StopCryptidPath();
         const auto movement=ReadPtr(pawn+0x330);
         if(movement) {
             if(!monster && gNoclipEnabled) {
