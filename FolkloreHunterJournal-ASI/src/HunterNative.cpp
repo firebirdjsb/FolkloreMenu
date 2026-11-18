@@ -11,6 +11,7 @@
 #include <mutex>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 #include <string>
 #include <cmath>
@@ -139,6 +140,17 @@ namespace {
     int32_t gMonsterIndex=-1, gCameraIndex=-1;
     double gMonsterYaw=0.0, gMonsterPitch=0.0;
     double gFlightSpeed=1100.0;
+    // Controlled creature identity survives the old UObject being destroyed.
+    // After a game-world countdown a native map spawner is triggered once,
+    // and the camera/HUD are rebound only to a verified new cryptid actor.
+    uintptr_t gControlledCryptidClass=0;
+    uintptr_t gControlledRespawnSpawner=0;
+    int32_t gControlledRespawnSpawnerIndex=-1;
+    std::unordered_set<int32_t> gControlledExistingIds;
+    double gControlledRespawnStart=-1.0, gControlledRespawnRemaining=0.0;
+    bool gControlledSpawnRequested=false;
+    ULONGLONG gNextControlledRespawnScan=0;
+    Vec3 gControlledLastPosition{};
     ULONGLONG gLastMotionTick=0, gLastScanTick=0, gLastAttackTick=0;
     std::mutex gMonsterStatusMutex;
     struct MonsterHUDState {
@@ -147,6 +159,8 @@ namespace {
         double health=0.0, maxHealth=0.0;
         bool cameraReady=false;
         bool possessConfirmed=false;
+        bool respawning=false;
+        float respawnSeconds=0.f;
     } gMonsterHUD;
     struct WorldGravityBackup {
         uintptr_t worldSettings=0;
@@ -480,6 +494,11 @@ namespace {
             gMonsterMovement=0;gMonsterSpeedsSaved=false;gPuppeteering=false;
             gMonsterPathActive=false;gMonsterLastMoveRequest=0;
             gMonsterFunctions.clear();
+            gControlledCryptidClass=0;
+            gControlledRespawnSpawner=0;gControlledRespawnSpawnerIndex=-1;
+            gControlledExistingIds.clear();
+            gControlledRespawnStart=-1.0;gControlledRespawnRemaining=0.0;
+            gControlledSpawnRequested=false;gNextControlledRespawnScan=0;
             gHumanHUD=0;gHumanHudHidden=false;gHudRestorePending=false;
             gChaseSmoothedValid=false;
             gGravityBackup=WorldGravityBackup{};
@@ -1479,6 +1498,15 @@ namespace {
     }
     void UpdateMonsterHUD() {
         if(!gMonsterActive.load())return;
+        if(gControlledRespawnStart>=0.0) {
+            std::lock_guard<std::mutex> lock(gMonsterStatusMutex);
+            gMonsterHUD.respawning=true;
+            gMonsterHUD.respawnSeconds=static_cast<float>(
+                std::max(0.0,gControlledRespawnRemaining));
+            gMonsterHUD.health=0.0;
+            gMonsterHUD.cameraReady=gChaseCamera!=0;
+            return;
+        }
         HunterNative::CreatureInfo dummy;
         std::string name;
         auto cls=ReadPtr(gMonsterPawn+0x10);
@@ -1499,6 +1527,8 @@ namespace {
         gMonsterHUD.maxHealth=maxHealth;
         gMonsterHUD.cameraReady=gChaseCamera!=0;
         gMonsterHUD.possessConfirmed=true;
+        gMonsterHUD.respawning=false;
+        gMonsterHUD.respawnSeconds=0.f;
     }
     // UE5.5 SDK Engine.Pawn.AddMovementInput: FVector (0x18), float, bool.
     // CharacterMovement consumes this input on its own tick and updates
@@ -1842,13 +1872,183 @@ namespace {
             FHJDiag::Log(msg);
         }
     }
+
+    void ResetControlledRespawnSession() {
+        gControlledCryptidClass=0;
+        gControlledRespawnSpawner=0;gControlledRespawnSpawnerIndex=-1;
+        gControlledExistingIds.clear();
+        gControlledRespawnStart=-1.0;gControlledRespawnRemaining=0.0;
+        gControlledSpawnRequested=false;gNextControlledRespawnScan=0;
+    }
+    // World game time is supplied by an Unreal UFunction (pauses with the
+    // actual world). Only use the OS clock if this UE reflection is absent.
+    double ControlledWorldSeconds(uintptr_t world) {
+        static uintptr_t timeFn=0;
+        static ULONGLONG retry=0;
+        const auto now=GetTickCount64();
+        if(!timeFn && now>=retry) {
+            retry=now+10000;
+            timeFn=FindFunction(L"KismetSystemLibrary",L"GetGameTimeInSeconds");
+        }
+        if(timeFn) {
+            uint16_t size=0,ret=0;
+            if(Read(timeFn+0xB6,size) && Read(timeFn+0xB8,ret) &&
+               ret==8 && (size==12 || size==16)) {
+                alignas(8) uint8_t args[0x18]{};
+                std::memcpy(args,&world,8);
+                if(Invoke(FindObjectByName(L"Default__KismetSystemLibrary"),
+                          timeFn,args)) {
+                    double value=0;
+                    if(size==16)std::memcpy(&value,args+8,8);
+                    else {float v=0;std::memcpy(&v,args+8,4);value=v;}
+                    if(std::isfinite(value) && value>=0)return value;
+                }
+            }
+        }
+        return static_cast<double>(now)*.001;
+    }
+    void CaptureControlledCryptidSession() {
+        ResetControlledRespawnSession();
+        gControlledCryptidClass=ReadPtr(gMonsterPawn+0x10);
+        Position(gMonsterPawn,gControlledLastPosition);
+        const auto world=World();
+        double bestDistance=1e30;
+        int total=0;
+        for(const auto& level:GetWorldLevels(world,total))
+            for(int i=0;i<level.count;++i) {
+                const auto actor=ReadPtr(level.data+static_cast<size_t>(i)*8);
+                if(!actor)continue;
+                const auto cls=ReadPtr(actor+0x10);
+                if(cls==gControlledCryptidClass) {
+                    int32_t id=-1;
+                    if(Read(actor+0xC,id)&&id>=0)
+                        gControlledExistingIds.insert(id);
+                }
+                if(ClassName(cls)==L"BP_MobSpawner_C") {
+                    Vec3 pos{};
+                    if(!Position(actor,pos))continue;
+                    const double dist=std::hypot(
+                        std::hypot(pos.x-gControlledLastPosition.x,
+                                   pos.y-gControlledLastPosition.y),
+                        pos.z-gControlledLastPosition.z);
+                    if(dist<bestDistance) {
+                        bestDistance=dist;
+                        gControlledRespawnSpawner=actor;
+                        Read(actor+0xC,gControlledRespawnSpawnerIndex);
+                    }
+                }
+            }
+        FHJDiag::Log(gControlledRespawnSpawner?
+            L"CRYPTID RESPAWN: captured creature class and nearest native map spawner.":
+            L"CRYPTID RESPAWN: no native map spawner found; will follow an existing game respawn only.");
+    }
+    bool RebindControlledCryptid(uintptr_t newPawn) {
+        int32_t id=-1;
+        if(!newPawn || ReadPtr(newPawn+0x10)!=gControlledCryptidClass ||
+           !Read(newPawn+0xC,id) || id<0)return false;
+        // An old AI/controller pointer must never be accessed after the old
+        // cryptid has been destroyed. The new pawn supplies fresh components.
+        gMonsterBrain=0;gMonsterAIController=0;gMonsterBrainWasRunning=false;
+        gMonsterMovement=0;gMonsterSpeedsSaved=false;gMonsterModeSaved=false;
+        gMonsterPathActive=false;gMonsterLastMoveRequest=0;
+        gMonsterPawn=newPawn;gMonsterIndex=id;
+        gControlledExistingIds.insert(id);
+        gControlledRespawnStart=-1.0;gControlledRespawnRemaining=0.0;
+        gControlledSpawnRequested=false;
+        gChaseSmoothedValid=false;gLastMotionTick=0;
+        UpdateMonsterHUD();
+        StopMonsterAI();ConfigureMonsterMovement();CacheCryptidActions();
+        const auto world=World();
+        const auto gi=ReadPtr(world+0x1D8);
+        const auto locals=ReadPtr(gi+0x38);
+        const auto local=ReadPtr(locals);
+        const auto pc=ReadPtr(local+0x30);
+        if(pc && gChaseCamera)SetCameraViewTarget(pc,gChaseCamera);
+        HideHumanHUD();
+        FHJDiag::Log(L"CRYPTID RESPAWN: rebound creature, camera, HUD, AI movement and ability functions; human pawn preserved.");
+        return true;
+    }
+    bool MonitorControlledRespawn(uintptr_t world,ULONGLONG now) {
+        if(!gMonsterActive.load())return true;
+        int32_t liveId=-1;
+        double hp=-1.0;
+        const bool valid=gMonsterPawn &&
+            Read(gMonsterPawn+0xC,liveId) && liveId==gMonsterIndex &&
+            ReadPtr(gMonsterPawn+0x10)==gControlledCryptidClass;
+        const bool alive=valid && Read(gMonsterPawn+0x710,hp) &&
+            std::isfinite(hp) && hp>0;
+        if(alive) {
+            if(gControlledRespawnStart>=0.0)RebindControlledCryptid(gMonsterPawn);
+            else Position(gMonsterPawn,gControlledLastPosition);
+            return true;
+        }
+        const double worldNow=ControlledWorldSeconds(world);
+        if(gControlledRespawnStart<0.0) {
+            gControlledRespawnStart=worldNow;
+            gControlledSpawnRequested=false;
+            gNextControlledRespawnScan=0;
+            StopCryptidPath();
+            FHJDiag::Log(L"CRYPTID RESPAWN: death/despawn detected; host countdown started. Camera and human HUD ownership preserved.");
+        }
+        constexpr double kRespawnDelay=15.0;
+        const double elapsed=std::max(0.0,worldNow-gControlledRespawnStart);
+        gControlledRespawnRemaining=std::max(0.0,kRespawnDelay-elapsed);
+        if(now>=gNextControlledRespawnScan) {
+            gNextControlledRespawnScan=now+350;
+            int total=0;
+            for(const auto& level:GetWorldLevels(world,total)) {
+                for(int i=0;i<level.count;++i) {
+                    const auto actor=ReadPtr(level.data+static_cast<size_t>(i)*8);
+                    if(!actor || ReadPtr(actor+0x10)!=gControlledCryptidClass)
+                        continue;
+                    int32_t id=-1;
+                    if(!Read(actor+0xC,id)||id<0)continue;
+                    if(valid && actor==gMonsterPawn)continue;
+                    if(gControlledExistingIds.count(id))continue;
+                    double candidateHp=0.0;
+                    if(!Read(actor+0x710,candidateHp) ||
+                       !std::isfinite(candidateHp)||candidateHp<=0.0)continue;
+                    if(RebindControlledCryptid(actor))return true;
+                }
+            }
+        }
+        if(elapsed>=kRespawnDelay && !gControlledSpawnRequested) {
+            gControlledSpawnRequested=true; // one request; no spawn flood
+            int32_t spawnerId=-1;
+            const bool spawnerValid=gControlledRespawnSpawner &&
+                Read(gControlledRespawnSpawner+0xC,spawnerId) &&
+                spawnerId==gControlledRespawnSpawnerIndex &&
+                ClassName(ReadPtr(gControlledRespawnSpawner+0x10))==L"BP_MobSpawner_C";
+            if(!spawnerValid || !ReadPtr(world+0x158)) {
+                FHJDiag::Log(L"CRYPTID RESPAWN: host native spawner unavailable; waiting for game's own respawn without forcing an actor.");
+            } else {
+                const auto fn=FindFunction(L"BP_MobSpawner_C",L"TriggerSpawn");
+                const auto spawner=gControlledRespawnSpawner;
+                const auto saved=ReadPtr(spawner+0x2B8);
+                bool overridden=false;
+                if(saved && saved!=gControlledCryptidClass)
+                    overridden=TryWrite(spawner+0x2B8,gControlledCryptidClass);
+                alignas(8) uint8_t args[0xA0]{};
+                const bool requested=fn && Invoke(spawner,fn,args);
+                if(overridden && !TryWrite(spawner+0x2B8,saved))
+                    FHJDiag::Log(L"CRYPTID RESPAWN WARNING: map spawner MobClass restore failed.");
+                FHJDiag::Log(requested?
+                    L"CRYPTID RESPAWN: invoked native map TriggerSpawn after 15-second world countdown; tracking replacement actor.":
+                    L"CRYPTID RESPAWN: TriggerSpawn unavailable or rejected; continue monitoring the map for game respawn.");
+            }
+        }
+        UpdateMonsterHUD();
+        return false; // camera and human control stay in cryptid mode
+    }
     void FreeflightTick() {
         const ULONGLONG now=GetTickCount64();
         const ULONGLONG elapsed=gLastMotionTick?now-gLastMotionTick:16;
         gLastMotionTick=now;
-        if(!gWindow || gJournalOpen.load() || GetForegroundWindow()!=gWindow)return;
         const auto world=World();
         if(!world || world!=gPrevWorld)return;
+        // Respawn must keep progressing even with the journal open.
+        if(gMonsterActive.load() && !MonitorControlledRespawn(world,now))return;
+        if(!gWindow || gJournalOpen.load() || GetForegroundWindow()!=gWindow)return;
         const bool monster=gMonsterActive.load();
         const auto pawn=monster?gMonsterPawn:LocalPawn();
         if(!pawn || (!monster && !gNoclipEnabled))return;
@@ -2537,6 +2737,7 @@ namespace {
             gMonsterActive.store(false);
             gPuppeteering=false;gPossessedCryptid=false;
             gMonsterPawn=0;gMonsterIndex=-1;gChaseSmoothedValid=false;
+            ResetControlledRespawnSession();
             gHumanPawn=0;gHumanIndex=-1;
             FHJDiag::Log(L"Restore Human: camera/HUD/AI reset without Controller.Possess; hunt remains active.");
             return;
@@ -2570,6 +2771,7 @@ namespace {
         gHumanIndex=humanIndex;
         gMonsterPawn=selected;
         gMonsterIndex=index;
+        CaptureControlledCryptidSession();
         gChaseSmoothedValid=false;
         const Camera previous=GetCamera(world);
         gMonsterYaw=std::isfinite(previous.rot.yaw)?previous.rot.yaw:0.;
@@ -2580,6 +2782,7 @@ namespace {
         Vec3 pos{};
         if(!Position(selected,pos) || !CreateMonsterCamera(pc,pos)) {
             gMonsterPawn=0;gMonsterIndex=-1;
+            ResetControlledRespawnSession();
             ReleaseMonsterCamera(pc,gHumanPawn);
             FHJDiag::Log(L"Monster Mode cancelled: chase-camera setup failed; human still possessed.");
             return;
