@@ -606,8 +606,10 @@ namespace FHJ
                 static_cast<int>(sounds.size()));
             ImGui::SliderFloat("Remote sound volume",&selectedSoundVolume,.1f,2.f,"%.1fx");
             if(!HunterNative::GetStatus().host || selectedSound<0)ImGui::BeginDisabled();
+            if(selectedPrankTarget<0)ImGui::BeginDisabled();
             if(ImGui::Button("PLAY SOUND ON SELECTED HUNTER",ImVec2(-1,30)))
                 HunterNative::RequestTargetSound(selectedPrankTarget,selectedSound,selectedSoundVolume);
+            if(selectedPrankTarget<0)ImGui::EndDisabled();
             if(ImGui::Button("PLAY SOUND ON ALL HUNTERS",ImVec2(-1,30)))
                 HunterNative::RequestTargetSound(-1,selectedSound,selectedSoundVolume);
             if(!HunterNative::GetStatus().host || selectedSound<0)ImGui::EndDisabled();
