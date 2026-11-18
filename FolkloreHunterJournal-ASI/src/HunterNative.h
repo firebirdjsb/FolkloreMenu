@@ -11,6 +11,8 @@ namespace HunterNative {
         int objectIndex = -1;
         std::string displayName;
         bool isPawn = false;
+        double health = -1.0;
+        double maxHealth = -1.0;
     };
     struct VanityItem {
         std::string label;
