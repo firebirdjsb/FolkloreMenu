@@ -617,7 +617,34 @@ namespace FHJ
                 HunterNative::RequestTargetSound(-1,selectedSound,selectedSoundVolume);
             if(!HunterNative::GetStatus().host || selectedSound<0)ImGui::EndDisabled();
             ImGui::TextDisabled("Uses PlayerController.ClientPlaySound (owning-client RPC).");
-            ImGui::TextDisabled("Remote visuals need a networked game effect; local ImGui scare art cannot replicate.");
+            const auto shakes=HunterNative::GetCameraShakes();
+            static int selectedShake=-1;
+            static float shakeIntensity=1.f;
+            std::string shakeName="Choose a loaded camera shake class";
+            for(const auto& item:shakes)if(item.objectIndex==selectedShake)
+                shakeName=item.displayName;
+            if(ImGui::BeginCombo("Online scare camera effect",shakeName.c_str())) {
+                for(const auto& item:shakes) {
+                    ImGui::PushID(item.objectIndex);
+                    if(ImGui::Selectable(item.displayName.c_str(),
+                        selectedShake==item.objectIndex))selectedShake=item.objectIndex;
+                    ImGui::PopID();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::TextDisabled("Loaded native camera shakes: %d",
+                static_cast<int>(shakes.size()));
+            ImGui::SliderFloat("Scare shake intensity",&shakeIntensity,.1f,2.f,"%.1fx");
+            if(!HunterNative::GetStatus().host || selectedShake<0)ImGui::BeginDisabled();
+            if(selectedPrankTarget<0)ImGui::BeginDisabled();
+            if(ImGui::Button("SHAKE SELECTED HUNTER'S CAMERA",ImVec2(-1,30)))
+                HunterNative::RequestTargetCameraShake(selectedPrankTarget,selectedShake,shakeIntensity);
+            if(selectedPrankTarget<0)ImGui::EndDisabled();
+            if(ImGui::Button("SHAKE ALL HUNTERS' CAMERAS",ImVec2(-1,30)))
+                HunterNative::RequestTargetCameraShake(-1,selectedShake,shakeIntensity);
+            if(!HunterNative::GetStatus().host || selectedShake<0)ImGui::EndDisabled();
+            ImGui::TextDisabled("Native shake + sound can reach owning clients; custom local ImGui art cannot.");
+            ImGui::TextDisabled("For an online scare, trigger the sound and shake on the same target.");
             if(selectedPrankTarget>=0) {
                 static float loudness=5.f, range=70.f;
                 ImGui::SliderFloat("Noise loudness",&loudness,0.1f,25.f);
