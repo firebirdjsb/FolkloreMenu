@@ -666,9 +666,8 @@ namespace FHJ
             ImGui::BulletText("S'more: FL_Gamemode.EnableSmoreMode (Blueprint override)");
             ImGui::TextDisabled("Their effects are NOT documented; dispatch is logged; gameplay must be tested.");
             ImGui::TextDisabled("Some developer modes may persist until restarting the session.");
-            if(ImGui::Button("CLEAR ALL WEATHER EFFECTS",ImVec2(-1,30))) {
-                HunterNative::RequestRain(0);HunterNative::RequestSnow(0);
-            }
+            if(ImGui::Button("CLEAR ALL RAIN + SNOW",ImVec2(-1,30)))
+                HunterNative::RequestClearWeather();
             ImGui::TextDisabled("Time of day and movement cheats were moved out of MISCHIEF.");
             ImGui::Spacing();
             if (!status.host) ImGui::EndDisabled();
