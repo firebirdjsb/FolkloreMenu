@@ -99,6 +99,12 @@ namespace {
     uint8_t gPriorMovement = 1;
     bool gPriorCollision = true;
     bool gNoclipEnabled = false;
+    // Minecraft-style free-flight holds its own position every simulation
+    // update. CharacterMovement/Blueprint velocity cannot create idle drift.
+    Vec3 gNoclipPosition{};
+    bool gNoclipPositionValid=false;
+    uintptr_t gNoclipController=0;
+    bool gNoclipIgnoredMove=false;
     float gOriginalFlySpeed=0.f;
     uintptr_t gOriginalFlyMovement=0;
     bool gFlySpeedSaved=false;
@@ -478,6 +484,7 @@ namespace {
             gGravityBackup=WorldGravityBackup{};
             gSpawnWave=SpawnWave{};
             gNoclipPawn=0;gNoclipEnabled=false;
+            gNoclipPositionValid=false;gNoclipController=0;gNoclipIgnoredMove=false;
             FHJDiag::Log(L"World changed: reset ESP and player cache.");
         }
         AdvanceSpawnWave();
@@ -1174,8 +1181,24 @@ namespace {
                 Read(movement+0x221,gPriorMovement);
                 uint8_t flags=0;Read(pawn+0x5C,flags);
                 gPriorCollision=(flags&0x80)!=0;
+                if(!Position(pawn,gNoclipPosition)) {
+                    FHJDiag::Log(L"NOCLIP: failed to capture current location; free-flight not enabled.");
+                    return;
+                }
+                gNoclipPositionValid=true;
                 gNoclipPawn=pawn;gNoclipEnabled=true;
                 gOriginalFlyMovement=movement;
+                const auto gi=ReadPtr(world+0x1D8);
+                const auto locals=ReadPtr(gi+0x38);
+                const auto local=ReadPtr(locals);
+                gNoclipController=ReadPtr(local+0x30);
+                const auto ignore=FindFunction(L"Controller",L"SetIgnoreMoveInput");
+                if(ignore && gNoclipController) {
+                    bool preventGameInput=true;
+                    gNoclipIgnoredMove=Invoke(gNoclipController,ignore,&preventGameInput);
+                }
+                const auto stop=FindFunction(L"MovementComponent",L"StopMovementImmediately");
+                if(stop)Invoke(movement,stop,nullptr);
                 gFlySpeedSaved=Read(movement+0x274,gOriginalFlySpeed);
                 if(gFlySpeedSaved) {
                     const float speed=1150.f;
@@ -1185,6 +1208,7 @@ namespace {
         } else if(gNoclipPawn!=pawn) {
             // Do not touch a stale actor after respawn.
             gNoclipEnabled=false;gNoclipPawn=0;
+            gNoclipPositionValid=false;gNoclipIgnoredMove=false;gNoclipController=0;
             gFlySpeedSaved=false;gOriginalFlyMovement=0;
             FHJDiag::Log(L"Noclip: original pawn was replaced; cleared stale free-fly state.");return;
         }
@@ -1200,7 +1224,12 @@ namespace {
             bool previousCollision=gPriorCollision;
             Invoke(pawn,collisionFunc,&previousCollision);
             if(gFlySpeedSaved)TryWrite(movement+0x274,gOriginalFlySpeed);
-            gNoclipEnabled=false;gNoclipPawn=0;
+            gNoclipEnabled=false;gNoclipPawn=0;gNoclipPositionValid=false;
+            if(gNoclipIgnoredMove && gNoclipController) {
+                const auto allow=FindFunction(L"Controller",L"SetIgnoreMoveInput");
+                if(allow){bool no=false;Invoke(gNoclipController,allow,&no);}
+            }
+            gNoclipController=0;gNoclipIgnoredMove=false;
             gFlySpeedSaved=false;gOriginalFlyMovement=0;
             FHJDiag::Log(L"Noclip: native movement/collision setup failed; original values restored.");
             return;
@@ -1208,8 +1237,13 @@ namespace {
         if(!enabled) {
             if(gFlySpeedSaved && gOriginalFlyMovement==movement)
                 TryWrite(movement+0x274,gOriginalFlySpeed);
+            if(gNoclipIgnoredMove && gNoclipController) {
+                const auto allow=FindFunction(L"Controller",L"SetIgnoreMoveInput");
+                if(allow){bool no=false;Invoke(gNoclipController,allow,&no);}
+            }
+            gNoclipController=0;gNoclipIgnoredMove=false;
             gFlySpeedSaved=false;gOriginalFlyMovement=0;
-            gNoclipEnabled=false;gNoclipPawn=0;
+            gNoclipEnabled=false;gNoclipPawn=0;gNoclipPositionValid=false;
         }
         FHJDiag::Log(enabled?L"Local noclip: flying/no collision enabled; WASD uses direct world-position movement.":
             L"Local noclip disabled; movement and collision restoration requested.");
@@ -1817,35 +1851,38 @@ namespace {
         const double length=std::sqrt(input.x*input.x+input.y*input.y+input.z*input.z);
         if(length>1e-3) {
             input.x/=length;input.y/=length;input.z/=length;
-            if(!monster) {
-                if(pawn!=gNoclipPawn) {
-                    // If a respawn replaced the local pawn, do not move the
-                    // new body using a stale noclip session.
-                    gNoclipEnabled=false;gNoclipPawn=0;
-                    gFlySpeedSaved=false;gOriginalFlyMovement=0;
-                    FHJDiag::Log(L"NOCLIP: pawn changed; stopped free-flight safely.");
-                    return;
-                }
-                // Explicit movement bypasses Blueprint walk/strafe handling,
-                // which has been observed to suppress horizontal flight input.
-                // The actor still has MOVE_Flying and collision disabled.
-                Vec3 location{};
-                if(Position(pawn,location)) {
-                    const double speed=boost?1850.0:1150.0; // cm/s
-                    const Vec3 destination{
-                        location.x+input.x*speed*dt,
-                        location.y+input.y*speed*dt,
-                        location.z+input.z*speed*dt
-                    };
-                    const bool moved=SetActorLocationSafe(pawn,destination);
-                    if(!moved) {
-                        static ULONGLONG lastWarn=0;
-                        if(now-lastWarn>5000) {
-                            lastWarn=now;
-                            FHJDiag::Log(L"NOCLIP: K2_SetActorLocation rejected explicit movement. Check pawn authority / SDK offsets.");
-                        }
+        }
+        if(!monster) {
+            if(pawn!=gNoclipPawn) {
+                gNoclipEnabled=false;gNoclipPawn=0;gNoclipPositionValid=false;
+                gFlySpeedSaved=false;gOriginalFlyMovement=0;
+                FHJDiag::Log(L"NOCLIP: player changed; stopped free-flight safely.");
+                return;
+            }
+            if(!gNoclipPositionValid) {
+                gNoclipPositionValid=Position(pawn,gNoclipPosition);
+            }
+            if(gNoclipPositionValid) {
+                // The only permitted movement is explicit WASD + Space/Ctrl.
+                // Holding the last position on zero input prevents spontaneous
+                // upward/downward motion from CharacterMovement and game BP.
+                const double speed=boost?1850.0:1150.0;
+                gNoclipPosition.x+=input.x*speed*dt;
+                gNoclipPosition.y+=input.y*speed*dt;
+                gNoclipPosition.z+=input.z*speed*dt;
+                const auto movement=ReadPtr(pawn+0x330);
+                const auto stop=FindFunction(L"MovementComponent",L"StopMovementImmediately");
+                if(movement && stop)Invoke(movement,stop,nullptr);
+                if(!SetActorLocationSafe(pawn,gNoclipPosition)) {
+                    static ULONGLONG lastWarn=0;
+                    if(now-lastWarn>5000) {
+                        lastWarn=now;
+                        FHJDiag::Log(L"NOCLIP: engine rejected position hold/move; server authority may be correcting the pawn.");
                     }
-                } else {
+                }
+            }
+        } else if(length>1e-3) {
+            } else {
                     static ULONGLONG lastPosWarn=0;
                     if(now-lastPosWarn>5000) {
                         lastPosWarn=now;
