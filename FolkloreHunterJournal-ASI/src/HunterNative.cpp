@@ -1324,22 +1324,18 @@ namespace {
     // Exact UE5.5 FHitResult(0xE8) and SphereTraceSingle parameter layout are
     // verified against UFunction size/return metadata before invocation.
     bool ConstrainChaseCamera(const Vec3& pivot,const Vec3& wanted,Vec3& clipped) {
-        static uintptr_t fn=0,defaultSystem=0;
+        static uintptr_t sphere=0,line=0,defaultSystem=0;
         static ULONGLONG lookupRetry=0;
         const auto tick=GetTickCount64();
-        if((!fn || !defaultSystem) && tick>=lookupRetry) {
+        if((!sphere || !defaultSystem) && tick>=lookupRetry) {
             lookupRetry=tick+10000;
-            if(!fn)fn=FindFunction(L"KismetSystemLibrary",L"SphereTraceSingle");
+            if(!sphere)sphere=FindFunction(L"KismetSystemLibrary",L"SphereTraceSingle");
+            if(!line)line=FindFunction(L"KismetSystemLibrary",L"LineTraceSingle");
             if(!defaultSystem)
                 defaultSystem=FindObjectByName(L"Default__KismetSystemLibrary");
         }
-        bool lineFallback=false;
-        if(!fn) {
-            static uintptr_t line=0;
-            if(!line)line=FindFunction(L"KismetSystemLibrary",L"LineTraceSingle");
-            fn=line;
-            lineFallback=(line!=0);
-        }
+        const bool lineFallback=!sphere && line;
+        const auto fn=sphere?sphere:line;
         if(!fn || !defaultSystem)return false;
         uint16_t parmsSize=0,returnOffset=0;
         if(!Read(fn+0xB6,parmsSize) || !Read(fn+0xB8,returnOffset) ||
@@ -2192,9 +2188,14 @@ namespace {
         }
         if(!monster) {
             if(pawn!=gNoclipPawn) {
+                if(gNoclipIgnoredMove && gNoclipController) {
+                    const auto allow=FindFunction(L"Controller",L"SetIgnoreMoveInput");
+                    if(allow){bool no=false;Invoke(gNoclipController,allow,&no);}
+                }
+                gNoclipController=0;gNoclipIgnoredMove=false;
                 gNoclipEnabled=false;gNoclipPawn=0;gNoclipPositionValid=false;
                 gFlySpeedSaved=false;gOriginalFlyMovement=0;
-                FHJDiag::Log(L"NOCLIP: player changed; stopped free-flight safely.");
+                FHJDiag::Log(L"NOCLIP: player changed; restored controller input and stopped free-flight safely.");
                 return;
             }
             if(!gNoclipPositionValid)
