@@ -82,6 +82,8 @@ namespace {
     std::unordered_map<uintptr_t, GodBackup> gGodBackups;
     uintptr_t gHumanPawn = 0;
     int32_t gHumanIndex = -1;
+    uintptr_t gHumanInputController=0;
+    bool gHumanInputDisabled=false, gHumanIgnoreMovement=false, gHumanIgnoreLook=false;
     bool gPossessedCryptid = false;
     std::atomic_bool gWildlife{true}, gContainers{true}, gQuest{true}, gLoot{true};
     
@@ -97,6 +99,8 @@ namespace {
     uintptr_t gMonsterMovement=0;
     float gMonsterOriginalWalkSpeed=0.f, gMonsterOriginalFlySpeed=0.f;
     bool gMonsterSpeedsSaved=false;
+    bool gMonsterModeSaved=false;
+    uint8_t gMonsterPriorMovement=1;
     uintptr_t gHumanHUD=0;
     int32_t gHumanHUDIndex=-1;
     uint8_t gPriorHumanHudVisibility=0;
@@ -394,7 +398,12 @@ namespace {
             gKinds.clear();gClassNames.clear();gFunctionCache.clear();
             gKnown.clear();
             gPhysicsBackups.clear();gFallBackups.clear();gGodBackups.clear();
+            // Level transition invalidates actor pointers. Never restore input to
+            // a destroyed body; clear references and capture state instead.
             gHumanPawn=0;gHumanIndex=-1;gPossessedCryptid=false;
+            gHumanInputController=0;gHumanInputDisabled=false;
+            gHumanIgnoreMovement=false;gHumanIgnoreLook=false;
+            gMonsterModeSaved=false;
             gMonsterActive.store(false);gMonsterPawn=0;gChaseCamera=0;
             gCameraAutoManageSaved=false;
             gMonsterIndex=-1;gCameraIndex=-1;gLastMotionTick=0;
@@ -1200,9 +1209,57 @@ namespace {
         if(fn && Invoke(widget,fn,&current) && current!=1)
             SetHUDVisibility(widget,1); // ESlateVisibility::Collapsed
     }
+    void RestoreHumanControls() {
+        if(!gHumanInputController)return;
+        int32_t live=-1;
+        if(gHumanPawn && Read(gHumanPawn+0x0C,live) && live==gHumanIndex &&
+           gHumanInputDisabled) {
+            const auto fn=FindFunction(L"Actor",L"EnableInput");
+            if(fn)Invoke(gHumanPawn,fn,&gHumanInputController);
+        }
+        if(gHumanIgnoreMovement) {
+            const auto fn=FindFunction(L"Controller",L"SetIgnoreMoveInput");
+            if(fn) {bool ignored=false;Invoke(gHumanInputController,fn,&ignored);}
+        }
+        if(gHumanIgnoreLook) {
+            const auto fn=FindFunction(L"Controller",L"SetIgnoreLookInput");
+            if(fn) {bool ignored=false;Invoke(gHumanInputController,fn,&ignored);}
+        }
+        gHumanInputController=0;gHumanInputDisabled=false;
+        gHumanIgnoreMovement=false;gHumanIgnoreLook=false;
+        FHJDiag::Log(L"Monster Mode: human input bindings and controller movement restored.");
+    }
+    void SuspendHumanControls(uintptr_t pc) {
+        if(!pc || !gHumanPawn || gHumanInputController)return;
+        gHumanInputController=pc;
+        // Disable the *human pawn's* gameplay InputComponent without destroying
+        // or unpossessing it; the avatar remains in the expedition.
+        const auto disable=FindFunction(L"Actor",L"DisableInput");
+        if(disable)gHumanInputDisabled=Invoke(gHumanPawn,disable,&pc);
+        const auto ignoreMove=FindFunction(L"Controller",L"SetIgnoreMoveInput");
+        if(ignoreMove) {
+            bool ignored=true;
+            gHumanIgnoreMovement=Invoke(pc,ignoreMove,&ignored);
+        }
+        const auto ignoreLook=FindFunction(L"Controller",L"SetIgnoreLookInput");
+        if(ignoreLook) {
+            bool ignored=true;
+            gHumanIgnoreLook=Invoke(pc,ignoreLook,&ignored);
+        }
+        FHJDiag::Log(gHumanInputDisabled ?
+            L"Monster Mode: human pawn input disabled; controller motion/look blocked.":
+            L"Monster Mode: WARNING pawn DisableInput failed; weapon input may remain active.");
+    }
     void StopMonsterAI() {
         const auto ai=ReadPtr(gMonsterPawn+0x2D8); // APawn.Controller
         if(!ai)return;
+        // Stop active path following as well as the behavior tree. Stopping
+        // BrainComponent alone leaves the last MoveTo request running.
+        const auto stopPath=FindFunction(L"AIController",L"StopMovement");
+        if(stopPath)Invoke(ai,stopPath,nullptr);
+        const auto movement=ReadPtr(gMonsterPawn+0x330);
+        const auto stopVelocity=FindFunction(L"MovementComponent",L"StopMovementImmediately");
+        if(movement && stopVelocity)Invoke(movement,stopVelocity,nullptr);
         const auto brain=ReadPtr(ai+0x388); // SDK AIModule.AAIController.BrainComponent
         if(!brain)return;
         const auto state=FindFunction(L"BrainComponent",L"IsRunning");
@@ -1226,8 +1283,15 @@ namespace {
             TryWrite(gMonsterMovement+0x268,gMonsterOriginalWalkSpeed);
             TryWrite(gMonsterMovement+0x274,gMonsterOriginalFlySpeed);
         }
+        if(gMonsterMovement && gMonsterModeSaved) {
+            const auto setMode=FindFunction(L"CharacterMovementComponent",L"SetMovementMode");
+            if(setMode) {
+                uint8_t args[2]{gMonsterPriorMovement,0};
+                Invoke(gMonsterMovement,setMode,args);
+            }
+        }
         gMonsterMovement=0;
-        gMonsterSpeedsSaved=false;
+        gMonsterSpeedsSaved=false;gMonsterModeSaved=false;
         if(gMonsterBrain && gMonsterBrainWasRunning) {
             const auto restart=FindFunction(L"BrainComponent",L"RestartLogic");
             if(restart)Invoke(gMonsterBrain,restart,nullptr);
@@ -1238,10 +1302,19 @@ namespace {
     void ConfigureMonsterMovement() {
         gMonsterMovement=ReadPtr(gMonsterPawn+0x330); // ACharacter.CharacterMovement
         if(!gMonsterMovement)return;
+        const int species=gMonsterHUD.species;
+        gMonsterModeSaved=Read(gMonsterMovement+0x221,gMonsterPriorMovement);
+        const auto setMode=FindFunction(L"CharacterMovementComponent",L"SetMovementMode");
+        if(setMode) {
+            // Native physics & AnimBP stay active. Mothman flies; ground
+            // cryptids walk (the AI's previous mode is restored on exit).
+            const uint8_t args[2]{static_cast<uint8_t>(species==1?5:1),0};
+            if(!Invoke(gMonsterMovement,setMode,const_cast<uint8_t*>(args)))
+                FHJDiag::Log(L"Monster Mode: could not set native movement mode.");
+        }
         gMonsterSpeedsSaved=Read(gMonsterMovement+0x268,gMonsterOriginalWalkSpeed) &&
             Read(gMonsterMovement+0x274,gMonsterOriginalFlySpeed);
         if(!gMonsterSpeedsSaved)return;
-        const int species=gMonsterHUD.species;
         const float walk=species==2?610.f:species==3?540.f:700.f;
         const float fly=species==1?1200.f:850.f;
         TryWrite(gMonsterMovement+0x268,walk);
@@ -1307,8 +1380,14 @@ namespace {
         if(!Read(pawn+0x0C,index) || (monster && index!=gMonsterIndex)) {
             if(monster) {
                 gMonsterActive.store(false);
+                const auto local=ReadPtr(ReadPtr(world+0x1D8)+0x38);
+                const auto pc=ReadPtr(ReadPtr(local)+0x30);
+                RestoreHumanControls();
                 RestoreHumanHUD();
-                FHJDiag::Log(L"Monster actor invalidated; removed monster overlay.");
+                ReleaseMonsterCamera(pc,gHumanPawn);
+                RestoreMonsterAI();
+                gMonsterPawn=0;gMonsterIndex=-1;
+                FHJDiag::Log(L"Monster actor invalidated; human controls and camera restored.");
             }
             return;
         }
@@ -1376,8 +1455,12 @@ namespace {
         const auto pc=ReadPtr(local+0x30);
         if(!pc || ReadPtr(pc+0x350)!=gHumanPawn) {
             gMonsterActive.store(false);
+            RestoreHumanControls();
             RestoreHumanHUD();
-            FHJDiag::Log(L"Monster control stopped: original player pawn changed externally.");
+            ReleaseMonsterCamera(pc,ReadPtr(pc+0x350));
+            RestoreMonsterAI();
+            gMonsterPawn=0;gMonsterIndex=-1;
+            FHJDiag::Log(L"Monster control stopped: human controls restored after pawn replacement.");
             return;
         }
         static ULONGLONG hudTick=0;
@@ -1796,6 +1879,7 @@ namespace {
         // Instead the controller stays on the human and its ViewTarget
         // switches to a camera chasing the independently driven cryptid.
         if(restore) {
+            RestoreHumanControls();
             RestoreHumanHUD();
             ReleaseMonsterCamera(pc,gHumanPawn?gHumanPawn:ReadPtr(pc+0x350));
             RestoreMonsterAI();
@@ -1825,6 +1909,7 @@ namespace {
         }
         if(gMonsterActive.load()) {
             if(selected==gMonsterPawn)return;
+            RestoreHumanControls();
             RestoreHumanHUD();
             ReleaseMonsterCamera(pc,gHumanPawn);
             RestoreMonsterAI();
@@ -1853,6 +1938,7 @@ namespace {
         UpdateMonsterHUD();
         StopMonsterAI();
         ConfigureMonsterMovement();
+        SuspendHumanControls(pc);
         HideHumanHUD();
         FHJDiag::Log(L"Monster puppet mode: human controller remains possessed. WASD native movement, Q/E/R ability, F11 restore.");
     }
