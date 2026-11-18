@@ -82,6 +82,9 @@ namespace HunterNative {
     bool RequestRestoreHuman();
     // Only abilities exposed by the matching creature's reflected class are invoked.
     bool RequestMonsterAbility(int slot);
+    // -1 uses automatic native sound matching; otherwise a loaded USoundBase
+    // GUObject index chosen from the Journal's sound catalog.
+    void SetMonsterAttackSound(int soundObjectIndex);
     bool RequestNoclip(bool enabled);
     bool RequestTargetHealth(int targetObjectIndex, double value);
     bool RequestTargetItem(int targetObjectIndex, const std::string& itemClass, int amount);
