@@ -8,6 +8,7 @@
 #include <imgui.h>
 #include <Windows.h>
 #include <atomic>
+#include <array>
 #include <mutex>
 #include <vector>
 #include <unordered_map>
@@ -130,6 +131,8 @@ namespace {
     bool gHumanHudHidden=false;
     bool gHudRestorePending=false;
     int gVampireStance=0;
+    bool gVampireInvisible=false;
+    std::array<ULONGLONG,5> gAbilityTicks{};
     ULONGLONG gLastAbilityTick=0;
     Vec3 gChaseSmoothedPos{};
     bool gChaseSmoothedValid=false;
@@ -1747,6 +1750,22 @@ namespace {
         swprintf_s(msg,L"CRYPTID: indexed %u reflected functions from creature class hierarchy.",
             static_cast<unsigned>(gMonsterFunctions.size()));
         FHJDiag::Log(msg);
+        // A method name alone does not prove a callable signature. Log the
+        // actual reflected ParmSize for attacks, invisibility and stance.
+        for(const auto& [name,method]:gMonsterFunctions) {
+            const auto lower=Lower(name);
+            if(lower.find(L"attack")==std::wstring::npos &&
+               lower.find(L"melee")==std::wstring::npos &&
+               lower.find(L"sound")==std::wstring::npos &&
+               lower.find(L"invis")==std::wstring::npos &&
+               lower.find(L"stance")==std::wstring::npos &&
+               lower.find(L"scream")==std::wstring::npos)continue;
+            uint16_t params=0;
+            if(!Read(method+0xB6,params))continue;
+            wchar_t detail[240]{};
+            swprintf_s(detail,L"CRYPTID SDK METHOD: %s / ParmSize=%u",name.c_str(),params);
+            FHJDiag::Log(detail);
+        }
     }
     uintptr_t NoArgCryptidAction(std::initializer_list<const wchar_t*> candidates) {
         for(const wchar_t* name:candidates) {
@@ -1804,12 +1823,60 @@ namespace {
         TryWrite(gMonsterMovement+0x274,fly);
         FHJDiag::Log(L"Monster Mode: native CharacterMovement speed profile enabled.");
     }
+    void PlayControlledMeleeAudio() {
+        // Prefer the creature's original Blueprint sound event when present.
+        // This keeps native spatial audio and animation timing if the event
+        // is independently callable with no parameters.
+        const auto event=NoArgCryptidAction({L"All_AttackSound",
+            L"AUTH_AttackSound",L"PlayAttackSound",L"AttackSound",
+            L"PlayMeleeSound",L"MeleeSound",L"PlayClawSound"});
+        if(event && Invoke(gMonsterPawn,event,nullptr))return;
+
+        // For classes without an exposed melee sound event, use a loaded
+        // cooked USoundBase through the local owning PlayerController RPC.
+        const auto play=FindFunction(L"PlayerController",L"ClientPlaySound");
+        const auto pc=gHumanInputController;
+        if(!pc || !play)return;
+        int total=0;uintptr_t chunks=0;
+        if(!GetObjects(total,chunks))return;
+        int best=-1,scoreBest=0;
+        for(const auto& info:gSoundCandidates) {
+            const auto asset=ObjectAt(info.objectIndex,chunks);
+            if(!asset || !IsSoundAssetClass(ReadPtr(asset+0x10)))continue;
+            const auto label=Lower(std::wstring(info.displayName.begin(),info.displayName.end()));
+            int score=0;
+            if(Matches(label,{L"attack",L"melee",L"slash",L"claw",
+                              L"bite",L"swipe",L"swing",L"strike"}))score+=10;
+            if(Matches(label,{L"vamp",L"wendigo",L"mothman",L"cryptid"}))score+=3;
+            if(score>scoreBest){scoreBest=score;best=info.objectIndex;}
+        }
+        if(best<0) {
+            static ULONGLONG lastWarn=0;
+            const auto now=GetTickCount64();
+            if(now-lastWarn>10000) {
+                lastWarn=now;
+                FHJDiag::Log(L"CRYPTID ATTACK AUDIO: no loaded melee USoundBase or native attack-sound event; capture class-specific audio event from SDK.");
+            }
+            return;
+        }
+        const auto asset=ObjectAt(best,chunks);
+        alignas(8) uint8_t args[0x10]{};
+        constexpr float volume=1.f,pitch=1.f;
+        std::memcpy(args,&asset,8);
+        std::memcpy(args+8,&volume,4);
+        std::memcpy(args+12,&pitch,4);
+        if(!Invoke(pc,play,args))
+            FHJDiag::Log(L"CRYPTID ATTACK AUDIO: local ClientPlaySound dispatch failed.");
+    }
     void ExecuteMonsterAbility(int slot) {
-        if(!gMonsterActive.load() || !ReadPtr(World()+0x158))return;
+        if(slot<0 || slot>=static_cast<int>(gAbilityTicks.size()) ||
+           !gMonsterActive.load() || !ReadPtr(World()+0x158) ||
+           gControlledRespawnStart>=0.0)return;
         int32_t index=-1;
         if(!Read(gMonsterPawn+0x0C,index) || index!=gMonsterIndex)return;
         const auto now=GetTickCount64();
-        if(now-gLastAbilityTick<650)return; // bound ability spam
+        const auto minInterval=slot==0?430ULL:280ULL;
+        if(now-gAbilityTicks[static_cast<size_t>(slot)]<minInterval)return;
         bool vampire=false;
         for(auto parent=ReadPtr(gMonsterPawn+0x10),depth=0ULL;
             parent && depth<25; ++depth) {
@@ -1821,10 +1888,8 @@ namespace {
         if(gMonsterFunctions.empty())CacheCryptidActions();
         uintptr_t fn=0;
         alignas(8) uint8_t args[0x20]{};
+        bool toggleInvisibility=false,advanceStance=false;
         if(slot==0) {
-            // Server attack entry point first: the prior implementation chose
-            // Melee unconditionally and never reached Server_Attack if Melee
-            // happened to be present but required gameplay state/parameters.
             fn=NoArgCryptidAction({L"Server_Attack",L"AUTH_Attack",
                 L"Attack",L"PerformAttack",L"StartAttack",L"Melee",
                 L"PrimaryAttack",L"DoMeleeAttack"});
@@ -1833,18 +1898,31 @@ namespace {
                 L"Scream",L"Roar",L"DoScream",L"PlayRoar"});
         } else if(slot==2 && vampire) {
             fn=NoArgCryptidAction({L"Invisible",L"AUTH_Invisible",
-                L"GoInvisible",L"ToggleInvisible",L"SetInvisible"});
+                L"GoInvisible",L"ToggleInvisible",L"ActivateInvisibility"});
+            if(!fn)for(const wchar_t* name:{L"SetInvisible",L"SetInvisibility",
+                                             L"AUTH_SetInvisible",L"SetIsInvisible"}) {
+                const auto it=gMonsterFunctions.find(name);
+                uint16_t size=0;
+                if(it!=gMonsterFunctions.end() && Read(it->second+0xB6,size) &&
+                   (size==1 || size==2)) {
+                    fn=it->second;
+                    args[0]=gVampireInvisible?0:1;
+                    toggleInvisibility=true;
+                    break;
+                }
+            }
         } else if(slot==3 && vampire) {
             fn=NoArgCryptidAction({L"CycleStance",L"ChangeStance",L"SwitchStance"});
-            if(!fn) {
-                const auto it=gMonsterFunctions.find(L"SetStance");
-                if(it!=gMonsterFunctions.end()) {
-                    uint16_t size=0;
-                    if(Read(it->second+0xB6,size) && size==4) {
-                        fn=it->second;
-                        gVampireStance=(gVampireStance+1)%3;
-                        std::memcpy(args,&gVampireStance,4);
-                    }
+            if(!fn)for(const wchar_t* name:{L"SetStance",L"AUTH_SetStance"}) {
+                const auto it=gMonsterFunctions.find(name);
+                uint16_t size=0;
+                if(it!=gMonsterFunctions.end() && Read(it->second+0xB6,size) &&
+                   (size==1 || size==4 || size==8)) {
+                    fn=it->second;
+                    const int stance=(gVampireStance+1)%3;
+                    std::memcpy(args,&stance,4);
+                    advanceStance=true;
+                    break;
                 }
             }
         } else if(slot==4 && vampire) {
@@ -1852,19 +1930,22 @@ namespace {
                 L"PlayScreamSound",L"PlayScream"});
         }
         if(!fn) {
-            if(now-gLastCreatureMethodWarning>4000) {
+            if(now-gLastCreatureMethodWarning>3200) {
                 gLastCreatureMethodWarning=now;
                 wchar_t msg[192]{};
-                swprintf_s(msg,L"CRYPTID ABILITY slot %d: no matching zero-argument method in selected creature hierarchy. Method list and SDK signature need verification.",slot);
+                swprintf_s(msg,L"CRYPTID ABILITY slot %d: no compatible reflected method; inspect CRYPTID SDK METHOD ParmSize logs.",slot);
                 FHJDiag::Log(msg);
             }
             return;
         }
         const auto name=ObjectName(fn);
         if(Invoke(gMonsterPawn,fn,args)) {
-            gLastAbilityTick=now;
+            gAbilityTicks[static_cast<size_t>(slot)]=now;
+            if(slot==0)PlayControlledMeleeAudio();
+            if(slot==2)gVampireInvisible=!gVampireInvisible;
+            if(advanceStance)gVampireStance=(gVampireStance+1)%3;
             wchar_t msg[220]{};
-            swprintf_s(msg,L"CRYPTID ABILITY slot %d: invoked native %s on host; check animation and damage/effect in-game.",slot,name.c_str());
+            swprintf_s(msg,L"CRYPTID ABILITY slot %d: invoked native %s; effects must be verified on the host.",slot,name.c_str());
             FHJDiag::Log(msg);
         } else {
             wchar_t msg[160]{};
@@ -1872,7 +1953,6 @@ namespace {
             FHJDiag::Log(msg);
         }
     }
-
     void ResetControlledRespawnSession() {
         gControlledCryptidClass=0;
         gControlledRespawnSpawner=0;gControlledRespawnSpawnerIndex=-1;
@@ -2777,8 +2857,8 @@ namespace {
         gMonsterYaw=std::isfinite(previous.rot.yaw)?previous.rot.yaw:0.;
         gMonsterPitch=std::clamp(std::isfinite(previous.rot.pitch)?previous.rot.pitch:0.,-80.,80.);
         gLastMotionTick=0;
-        gLastAbilityTick=0;
-        gVampireStance=0;
+        gLastAbilityTick=0;gAbilityTicks.fill(0);
+        gVampireStance=0;gVampireInvisible=false;
         Vec3 pos{};
         if(!Position(selected,pos) || !CreateMonsterCamera(pc,pos)) {
             gMonsterPawn=0;gMonsterIndex=-1;
