@@ -3373,9 +3373,13 @@ void HunterNative::DrawMonsterHUD(ImVec2 screen) {
         static_cast<float>(snap.health/snap.maxHealth),0.f,1.f):0.f;
     draw->AddRectFilled(ImVec2(28,70),ImVec2(tr.x-20,83),IM_COL32(44,53,48,245),3.f);
     draw->AddRectFilled(ImVec2(28,70),ImVec2(28+(tr.x-48)*pct,83),mainColor,3.f);
-    char health[110]{};
-    snprintf(health,sizeof(health),"HEALTH %.0f / %.0f  |  CAMERA %s",
-        snap.health,snap.maxHealth,snap.cameraReady?"CHASE":"FALLBACK");
+    char health[140]{};
+    if(snap.respawning)
+        snprintf(health,sizeof(health),"RESPAWN IN %.1fs  |  CAMERA %s",
+            snap.respawnSeconds,snap.cameraReady?"ATTACHED":"NOT READY");
+    else
+        snprintf(health,sizeof(health),"HEALTH %.0f / %.0f  |  CAMERA %s",
+            snap.health,snap.maxHealth,snap.cameraReady?"CHASE":"FALLBACK");
     draw->AddText(ImVec2(28,88),IM_COL32(223,209,180,255),health);
     const float x=screen.x*.5f,y=screen.y*.5f;
     draw->AddCircle({x,y},9.f,mainColor,20,1.3f);
@@ -3389,8 +3393,12 @@ void HunterNative::DrawMonsterHUD(ImVec2 screen) {
         IM_COL32(10,14,13,223),6.f);
     draw->AddRect(bottom,ImVec2(bottom.x+panelWidth,bottom.y+55),mainColor,6.f,0,1.f);
     draw->AddText(ImVec2(bottom.x+14,bottom.y+10),IM_COL32(232,215,177,255),
+        snap.respawning ?
+        "CRYPTID RESPAWNING / RETAINING HUMAN CONTROLLER AND CHASE CAMERA" :
         "WASD MOVE   |   MOUSE LOOK   |   SPACE UP   |   CTRL DOWN   |   SHIFT BOOST");
     draw->AddText(ImVec2(bottom.x+14,bottom.y+29),mainColor,
+        snap.respawning ?
+        "WAITING FOR NATIVE MAP SPAWN / F11 RETURNS TO HUMAN" :
         "LMB ATTACK   |   Q SCREAM   |   E INVISIBILITY   |   R STANCE   |   F11 HUMAN");
 }
 
