@@ -170,11 +170,11 @@ namespace {
         // normal game input pipeline active so walking keys are not starved.
         if(!gShowMenu.load(std::memory_order_acquire) &&
            HunterNative::MonsterModeActive()) {
-            if(HunterNative::MonsterModeActive() &&
-               msg==WM_KEYUP && (wparam=='Q'||wparam=='E'||wparam=='R')) {
-                HunterNative::RequestMonsterAbility(wparam=='Q'?1:wparam=='E'?2:3);
+            // Q/E/R ability presses are polled as key-down edges by the
+            // native cryptid tick. Do not dispatch again on WM_KEYUP: holding
+            // E used to activate and then deactivate invisibility on release.
+            if(msg==WM_KEYUP && (wparam=='Q'||wparam=='E'||wparam=='R'))
                 return 0;
-            }
             if(HunterNative::MonsterModeActive() &&
                 (msg==WM_LBUTTONDOWN || msg==WM_LBUTTONUP))return 0;
             if((msg==WM_KEYDOWN || msg==WM_KEYUP) &&
