@@ -295,8 +295,8 @@ namespace FHJ
             static bool noclip = false;
             if(ImGui::Checkbox("Local noclip / free-fly (experimental)", &noclip))
                 HunterNative::RequestNoclip(noclip);
-            ImGui::TextDisabled("Noclip: WASD moves horizontally relative to camera yaw, Space up, Ctrl down.");
-            ImGui::TextDisabled("Hold Shift to boost. Uses direct actor movement; test while hosting.");
+            ImGui::TextDisabled("Minecraft-style noclip: WASD horizontal, Space up, Ctrl down, Shift boost.");
+            ImGui::TextDisabled("Releasing the keys holds exact position; game movement input is suspended.");
             ImGui::TextDisabled("ESP health values/bars only appear on PLAYERS and CRYPTIDS.");
             Notice("MULTIPLAYER AUTHORITY", status.host ? "Authoritative GameMode detected; host actions available." : "Client-only session: host actions are disabled.", !status.host);
         }
@@ -426,8 +426,10 @@ namespace FHJ
                 HunterNative::RequestRestoreHuman();
             if(!state.host)ImGui::EndDisabled();
             ImGui::TextDisabled("Remote cryptid control preserves the human pawn in the expedition.");
-            ImGui::TextDisabled("WASD uses native AI navigation (swept fallback); Shift sprint.");
-            ImGui::TextDisabled("Chase camera uses collision sweep to pull in near walls.");
+            ImGui::TextDisabled("WASD uses native AI navigation; Shift sprint. Space/Ctrl enable free-flight.");
+            ImGui::TextDisabled("Farther chase camera with wall traces and reduced motion blur.");
+            ImGui::TextDisabled("On death: 15s world-time countdown, then one native map-spawner request.");
+            ImGui::TextDisabled("Replacement cryptid keeps the camera, ability HUD and human control suspension.");
             if(HunterNative::MonsterModeActive()) {
                 ImGui::Separator();
                 ImGui::TextColored(Palette::col_gold,"MONSTER ABILITIES");
@@ -444,8 +446,9 @@ namespace FHJ
                 if(ImGui::Button("VAMPIRE SCREAM AUDIO",ImVec2(-1,29)))
                     HunterNative::RequestMonsterAbility(4);
                 if(!vampire)ImGui::EndDisabled();
-                ImGui::TextDisabled("Abilities are selected from the cryptid's reflected UFunctions.");
-                ImGui::TextDisabled("Unavailable methods and rejected signatures are logged in F9.");
+                ImGui::TextDisabled("Q/E/R fire on key-down (not key release). E toggles supported invisibility.");
+                ImGui::TextDisabled("The selected cryptid's method names/ParmSize are logged for F9 review.");
+                ImGui::TextDisabled("LMB attempts the native creature sound event, then loaded melee audio assets.");
             }
             ImGui::TextDisabled("F8 journal, F11 safe Return Human; hunter HUD hidden in monster mode.");
             Notice("SDK VALIDATION",
