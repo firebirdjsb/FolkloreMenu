@@ -1107,14 +1107,28 @@ namespace {
                 }
             }
         } else if(gNoclipPawn!=pawn) {
-            FHJDiag::Log(L"Noclip restore skipped: pawn changed. Base movement applies.");return;
+            // Do not touch a stale actor after respawn.
+            gNoclipEnabled=false;gNoclipPawn=0;
+            gFlySpeedSaved=false;gOriginalFlyMovement=0;
+            FHJDiag::Log(L"Noclip: original pawn was replaced; cleared stale free-fly state.");return;
         }
         alignas(8) unsigned char moveArgs[0x8]{};
         moveArgs[0]= enabled?5:gPriorMovement; // UE MOVE_Flying=5; restore prior mode
         moveArgs[1]=0;
         bool canCollide=enabled?false:gPriorCollision;
-        Invoke(movement,moveFunc,moveArgs);
-        Invoke(pawn,collisionFunc,&canCollide);
+        const bool modeInvoked=Invoke(movement,moveFunc,moveArgs);
+        const bool collisionInvoked=Invoke(pawn,collisionFunc,&canCollide);
+        if(enabled && (!modeInvoked || !collisionInvoked)) {
+            uint8_t restore[2]{gPriorMovement,0};
+            Invoke(movement,moveFunc,restore);
+            bool previousCollision=gPriorCollision;
+            Invoke(pawn,collisionFunc,&previousCollision);
+            if(gFlySpeedSaved)TryWrite(movement+0x274,gOriginalFlySpeed);
+            gNoclipEnabled=false;gNoclipPawn=0;
+            gFlySpeedSaved=false;gOriginalFlyMovement=0;
+            FHJDiag::Log(L"Noclip: native movement/collision setup failed; original values restored.");
+            return;
+        }
         if(!enabled) {
             if(gFlySpeedSaved && gOriginalFlyMovement==movement)
                 TryWrite(movement+0x274,gOriginalFlySpeed);
@@ -1556,6 +1570,16 @@ namespace {
         }
         const auto movement=ReadPtr(pawn+0x330);
         if(movement) {
+            if(!monster && gNoclipEnabled) {
+                uint8_t mode=0;
+                if(Read(movement+0x221,mode) && mode!=5) {
+                    const auto setMode=FindFunction(L"CharacterMovementComponent",L"SetMovementMode");
+                    if(setMode) {
+                        uint8_t flight[2]{5,0};
+                        Invoke(movement,setMode,flight);
+                    }
+                }
+            }
             if(monster && gMonsterSpeedsSaved) {
                 const float speed=boost?1.7f:1.f;
                 const float walk=(species==2?610.f:species==3?540.f:700.f)*speed;
