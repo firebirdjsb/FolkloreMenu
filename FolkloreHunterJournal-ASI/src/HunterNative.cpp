@@ -2180,9 +2180,11 @@ namespace {
             std::lock_guard<std::mutex> guard(gMonsterStatusMutex);
             species=gMonsterHUD.species;
         }
-        const bool flying=!monster || species==1; // Mothman uses flight; ground cryptids run.
-        const double ascend=flying?
-            static_cast<double>(down(VK_SPACE))-static_cast<double>(down(VK_CONTROL)):0.0;
+        // Read Space/Ctrl for every cryptid, including vampires and
+        // wendigos: the first vertical key switches ground species to flight.
+        const bool flying=!monster || gMonsterFlightActive || species==1;
+        const double ascend=static_cast<double>(down(VK_SPACE))-
+                            static_cast<double>(down(VK_CONTROL));
         Vec3 input{cy*front-sy*strafe,sy*front+cy*strafe,ascend};
         if(monster && flying) {
             // Mothman follows camera pitch. Noclip intentionally stays on the
