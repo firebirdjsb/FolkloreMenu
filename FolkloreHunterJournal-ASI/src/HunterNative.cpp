@@ -2357,6 +2357,18 @@ namespace {
                     }
                 }
             }
+            if(monster && species!=1) {
+                // If the game or a previous build left a ground cryptid in
+                // MOVE_Flying, force it back into normal ground physics.
+                uint8_t mode=0;
+                if(Read(movement+0x221,mode) && mode==5) {
+                    const auto set=FindFunction(L"CharacterMovementComponent",L"SetMovementMode");
+                    if(set) {
+                        uint8_t walking[2]{1,0};
+                        Invoke(movement,set,walking);
+                    }
+                }
+            }
             if(monster && gMonsterSpeedsSaved) {
                 const float speed=boost?1.7f:1.f;
                 const float walk=(species==2?610.f:species==3?540.f:700.f)*speed;
@@ -3475,19 +3487,42 @@ void HunterNative::DrawMonsterHUD(ImVec2 screen) {
     draw->AddLine({x+7,y},{x+16,y},mainColor,1.3f);
     draw->AddLine({x,y-16},{x,y-7},mainColor,1.3f);
     draw->AddLine({x,y+7},{x,y+16},mainColor,1.3f);
-    const float panelWidth=std::min(screen.x-30.f,745.f);
-    const ImVec2 bottom{(screen.x-panelWidth)*.5f,screen.y-73.f};
-    draw->AddRectFilled(bottom,ImVec2(bottom.x+panelWidth,bottom.y+55),
-        IM_COL32(10,14,13,223),6.f);
-    draw->AddRect(bottom,ImVec2(bottom.x+panelWidth,bottom.y+55),mainColor,6.f,0,1.f);
-    draw->AddText(ImVec2(bottom.x+14,bottom.y+10),IM_COL32(232,215,177,255),
-        snap.respawning ?
-        "CRYPTID RESPAWNING / RETAINING HUMAN CONTROLLER AND CHASE CAMERA" :
-        "WASD MOVE   |   MOUSE LOOK   |   SPACE UP   |   CTRL DOWN   |   SHIFT BOOST");
-    draw->AddText(ImVec2(bottom.x+14,bottom.y+29),mainColor,
-        snap.respawning ?
-        "WAITING FOR NATIVE MAP SPAWN / F11 RETURNS TO HUMAN" :
-        "LMB ATTACK   |   Q SCREAM   |   E INVISIBILITY   |   R STANCE   |   F11 HUMAN");
+    const float panelWidth=std::min(screen.x-30.f,790.f);
+    const ImVec2 bottom{(screen.x-panelWidth)*.5f,screen.y-146.f};
+    const ImVec2 endPanel{bottom.x+panelWidth,bottom.y+128.f};
+    draw->AddRectFilled(bottom,endPanel,IM_COL32(10,14,13,232),6.f);
+    draw->AddRect(bottom,endPanel,mainColor,6.f,0,1.f);
+    const char* moveHint=snap.species==1 ?
+        "MOTHMAN  |  WASD FLY  |  SPACE ASCEND  |  CTRL DESCEND  |  SHIFT BOOST" :
+        snap.species==3 ?
+        "WENDIGO  |  WASD WALK  |  SPACE JUMP  |  SHIFT SPRINT  |  NO FLIGHT" :
+        snap.species==2 ?
+        "VAMPIRE  |  WASD WALK  |  SPACE JUMP  |  SHIFT SPRINT  |  NO FLIGHT" :
+        "CRYPTID  |  WASD WALK  |  SPACE JUMP  |  SHIFT SPRINT";
+    draw->AddText(ImVec2(bottom.x+14,bottom.y+10),
+        IM_COL32(232,215,177,255),snap.respawning?
+        "RESPAWNING: CAMERA AND HUD WILL FOLLOW NEW CREATURE":moveHint);
+    draw->AddText(ImVec2(bottom.x+14,bottom.y+32),mainColor,
+        "ACTIVE NATIVE SKILLS (ONLY THIS CRYPTID)  |  F11 RETURN HUMAN");
+    int shown=0;
+    for(int slot=0;slot<4;++slot) {
+        if(!snap.available[static_cast<size_t>(slot)] ||
+           snap.skills[static_cast<size_t>(slot)].empty())continue;
+        const auto& skill=snap.skills[static_cast<size_t>(slot)];
+        const int column=shown%2,row=shown/2;
+        draw->AddText(ImVec2(bottom.x+14+column*(panelWidth*.5f),
+                             bottom.y+57+row*22),
+                      IM_COL32(223,230,209,255),skill.c_str());
+        ++shown;
+    }
+    if(shown==0)
+        draw->AddText(ImVec2(bottom.x+14,bottom.y+63),
+            IM_COL32(179,187,181,255),
+            "No compatible native attack/skill methods loaded for this creature");
+    if(snap.respawning)
+        draw->AddText(ImVec2(bottom.x+14,bottom.y+108),
+            IM_COL32(227,179,109,255),"Skill actions paused while respawning");
+
 }
 
 bool HunterNative::RequestMonsterAbility(int slot) {
