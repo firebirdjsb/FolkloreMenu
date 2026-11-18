@@ -1,7 +1,7 @@
-name: Build Folklore Hunter Journal input fix + native gameplay bridge
+name: Build Folklore Hunter Journal
 on:
   push:
-    branches: [builds/folklore-hunter-journal-asi-diagnostics, features/hunter-journal-input-theme, features/hunter-journal-item-catalog-pranks, features/hunter-journal-horror-scares, features/hunter-journal-esp-player-targeting, features/hunter-journal-physics-creatures-esp, features/hunter-journal-v10-flight-esp-monster, features/hunter-journal-v11-damage-protection, features/hunter-journal-v12-smooth-monster-control]
+    branches: [main]
   workflow_dispatch:
 permissions:
   contents: read
