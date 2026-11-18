@@ -110,6 +110,7 @@ namespace HunterNative {
     bool RequestSmoreMode();
     bool RequestRain(double intensity);
     bool RequestSnow(double intensity);
+    bool RequestClearWeather();
     bool RequestVampireScream();
     bool RequestFlickerLights(bool cancel);
 }
