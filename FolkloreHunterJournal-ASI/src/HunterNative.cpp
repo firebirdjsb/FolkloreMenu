@@ -1310,6 +1310,13 @@ namespace {
             if(!defaultSystem)
                 defaultSystem=FindObjectByName(L"Default__KismetSystemLibrary");
         }
+        bool lineFallback=false;
+        if(!fn) {
+            static uintptr_t line=0;
+            if(!line)line=FindFunction(L"KismetSystemLibrary",L"LineTraceSingle");
+            fn=line;
+            lineFallback=(line!=0);
+        }
         if(!fn || !defaultSystem)return false;
         uint16_t parmsSize=0,returnOffset=0;
         if(!Read(fn+0xB6,parmsSize) || !Read(fn+0xB8,returnOffset) ||
@@ -1326,10 +1333,15 @@ namespace {
         std::memcpy(args,&ctx,8);
         std::memcpy(args+0x08,&pivot,sizeof(pivot));
         std::memcpy(args+0x20,&wanted,sizeof(wanted));
-        const float radius=27.f;
-        std::memcpy(args+0x38,&radius,sizeof(radius));
-        args[0x3C]=1; // TraceTypeQuery2; default Engine Camera collision channel
-        args[0x3D]=0; // non-complex collision
+        if(lineFallback) {
+            args[0x38]=1; // TraceTypeQuery2: camera collision
+            args[0x39]=0;
+        } else {
+            const float radius=22.f;
+            std::memcpy(args+0x38,&radius,sizeof(radius));
+            args[0x3C]=1; // TraceTypeQuery2: camera collision
+            args[0x3D]=0;
+        }
         uintptr_t ignored[1]{gMonsterPawn};
         struct ActorArray{uintptr_t data;int32_t num,max;};
         const ActorArray ignore{reinterpret_cast<uintptr_t>(ignored),1,1};
@@ -1353,6 +1365,37 @@ namespace {
             clipped={pivot.x+dx*alpha,pivot.y+dy*alpha,pivot.z+dz*alpha};
         }
         return true;
+    }
+    // Motion blur can be inherited from game-wide postprocess volumes even
+    // when the dedicated CameraActor does not define any postprocess settings.
+    // UE's own console-command API changes only local rendering, not gameplay.
+    void DisableChaseMotionBlur(uintptr_t pc,uintptr_t cameraComponent) {
+        const auto cameraWeight=FindFunction(L"CameraComponent",L"SetPostProcessBlendWeight");
+        if(cameraComponent && cameraWeight) {
+            const float zero=0.f;
+            Invoke(cameraComponent,cameraWeight,const_cast<float*>(&zero));
+        }
+        const auto console=FindFunction(L"KismetSystemLibrary",L"ExecuteConsoleCommand");
+        const auto system=FindObjectByName(L"Default__KismetSystemLibrary");
+        uint16_t bytes=0;
+        if(!console || !system || !Read(console+0xB6,bytes) || bytes!=0x20) {
+            FHJDiag::Log(L"CHASE CAMERA: local render console command unavailable; motion-blur disable not verified.");
+            return;
+        }
+        for(const wchar_t* setting:{L"r.MotionBlurQuality 0",L"r.DefaultFeature.MotionBlur 0"}) {
+            wchar_t command[60]{};
+            wcscpy_s(command,setting);
+            const FStringView text{command,
+                static_cast<int32_t>(wcslen(command)+1),
+                static_cast<int32_t>(wcslen(command)+1)};
+            alignas(8) uint8_t args[0x20]{};
+            const auto world=World();
+            std::memcpy(args,&world,8);
+            std::memcpy(args+8,&text,sizeof(text));
+            std::memcpy(args+0x18,&pc,8);
+            Invoke(system,console,args);
+        }
+        FHJDiag::Log(L"CHASE CAMERA: requested local Unreal motion-blur disable for clearer cryptid movement.");
     }
     bool CreateMonsterCamera(uintptr_t pc,const Vec3& position) {
         const auto world=World();
@@ -1414,6 +1457,7 @@ namespace {
             float angle=86.0f;
             Invoke(comp,fov,&angle);
         }
+        DisableChaseMotionBlur(pc,comp);
         FHJDiag::Log(L"Created camera actor and switched view target for monster mode.");
         return true;
     }
@@ -1980,10 +2024,10 @@ namespace {
         if(gChaseCamera) {
             Vec3 location{};
             if(Position(pawn,location)) {
-                double distance=340.0,height=175.0;
-                if(species==1){distance=540; height=260;}
-                else if(species==2){distance=315;height=170;}
-                else if(species==3){distance=410;height=235;}
+                double distance=650.0,height=245.0;
+                if(species==1){distance=810; height=340;}
+                else if(species==2){distance=625;height=225;}
+                else if(species==3){distance=735;height=290;}
                 const Vec3 pivot{location.x,location.y,location.z+height};
                 const Vec3 goal{
                     pivot.x-cy*distance,
@@ -1992,9 +2036,9 @@ namespace {
                 };
                 Vec3 safeGoal{};
                 if(!ConstrainChaseCamera(pivot,goal,safeGoal)) {
-                    // If the trace is unavailable, don't put a blind camera
-                    // several meters through unknown map geometry.
-                    const double close=72.0;
+                    // Trace unavailable: avoid burying the camera in the
+                    // creature. Collision is not guaranteed in this fallback.
+                    const double close=420.0;
                     safeGoal={pivot.x-cy*close,pivot.y-sy*close,
                               pivot.z-std::sin(pitch)*close*.18};
                 }
@@ -2002,7 +2046,9 @@ namespace {
                     gChaseSmoothedPos=safeGoal;
                     gChaseSmoothedValid=true;
                 } else {
-                    const double alpha=1.-std::exp(-12.*dt);
+                    // Shorter interpolation tail reduces perceived ghosting
+                    // and the camera visibly lagging behind moving cryptids.
+                    const double alpha=1.-std::exp(-28.*dt);
                     gChaseSmoothedPos.x+=(safeGoal.x-gChaseSmoothedPos.x)*alpha;
                     gChaseSmoothedPos.y+=(safeGoal.y-gChaseSmoothedPos.y)*alpha;
                     gChaseSmoothedPos.z+=(safeGoal.z-gChaseSmoothedPos.z)*alpha;
