@@ -2756,11 +2756,11 @@ namespace {
         }
         if(gMonsterFunctions.empty())CacheCryptidActions();
 #ifdef FCH_STANDALONE
-        if(species==2 && slot==0 && NativeHuntNightState()==0) {
+        if(species==2 && (slot==0 || slot==1) && NativeHuntNightState()==0) {
             static ULONGLONG lastWarning=0;
             if(now-lastWarning>2200) {
                 lastWarning=now;
-                FHJDiag::Log(L"CRYPTID HUNT DAYTIME: Vampire basic attacks are disabled until Director.IsNight becomes true.");
+                FHJDiag::Log(L"CRYPTID HUNT DAYTIME: Vampire basic attacks and scream are disabled until native Director.IsNight becomes true.");
             }
             return;
         }
