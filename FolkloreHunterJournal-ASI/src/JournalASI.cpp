@@ -420,6 +420,7 @@ namespace {
         if (gRenderReady.load(std::memory_order_acquire) && chain == gCurrentSwapChain && gContext) {
             // Always progress the frame, including when the journal is hidden.
             FHJDiag::SetStage("rendering ImGui DX11 frame");
+            TryConnectCompanion();
             ConsumeQueuedInput();
             ImGui_ImplDX11_NewFrame();
             ImGui_ImplWin32_NewFrame();
@@ -434,9 +435,13 @@ namespace {
             HunterNative::RequestTick();
             HunterNative::DrawESP(ImGui::GetIO().DisplaySize);
 #ifdef FCH_STANDALONE
+            FHJ::DrawCryptidHuntLoadBanner();
             HunterNative::DrawCryptidHuntDaylightVision(ImGui::GetIO().DisplaySize);
 #endif
             HunterNative::DrawMonsterHUD(ImGui::GetIO().DisplaySize);
+            if(gBridgeReady.load(std::memory_order_acquire) && gBridgeFrame)
+                gBridgeFrame(static_cast<void*>(ImGui::GetCurrentContext()),
+                             editingJournal);
             FHJDiag::PollGameLog();
             if (gShowMenu.load(std::memory_order_relaxed)) FHJ::DrawJournal();
             if (HunterScares::ConsumeHideJournal() &&
@@ -448,7 +453,12 @@ namespace {
             // World ESP and custom monster HUD must be presented without the journal open.
             if (gShowMenu.load(std::memory_order_relaxed) || FHJDiag::OverlayVisible() ||
                 HunterNative::ESPEnabled() || HunterNative::MonsterModeActive() ||
-                HunterScares::IsScareActive()) {
+                HunterScares::IsScareActive() ||
+                gBridgeReady.load(std::memory_order_acquire)
+#ifdef FCH_STANDALONE
+                || true // standalone mode badge on original main menu
+#endif
+                ) {
                 if (!gIsDX12 && !gRenderTarget) CreateRenderTarget(chain);
                 if (gIsDX12) {
                     IDXGISwapChain3* chain3=nullptr;
@@ -630,13 +640,13 @@ namespace {
             return 0;
         }
         Log(L"Folklore Hunter executable confirmed. Native ASI loaded successfully.");
-        // Two independent DLLs currently share MinHook/DXGI hook targets.
-        // Until a shared render dispatcher exists, never permit both to
-        // install the hooks in one process. The first loaded ASI owns them.
+        // Only the first loaded plugin owns MinHook/DXGI. The second
+        // registers UI/engine callbacks with that first module, using
+        // a different module API rather than patching Present twice.
         gOverlayOwnerMutex=CreateMutexW(nullptr,TRUE,
                               L"Local\\FolkloreHunter_Journal_CryptidHunt_OneOverlay_v1");
         if(!gOverlayOwnerMutex || GetLastError()==ERROR_ALREADY_EXISTS) {
-            Log(L"Another Folklore Journal/Cryptid Hunt ASI owns the graphics hooks. This plugin will stay inactive; install only one mod at a time.");
+            Log(L"Companion ASI mode: skipping duplicate graphics/window hooks. Existing DXGI owner will discover and render this module through independent callbacks.");
             if(gOverlayOwnerMutex) {
                 CloseHandle(gOverlayOwnerMutex);
                 gOverlayOwnerMutex=nullptr;
