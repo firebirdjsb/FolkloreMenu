@@ -345,7 +345,13 @@ namespace {
             if(meta!=L"BlueprintGeneratedClass" && meta!=L"Class")continue;
             if(ClassKind(klass)!=2 || !IsPawnClass(klass))continue;
             const auto name=ObjectName(klass);
-            if(name.size()<3 || name.substr(name.size()-2)!=L"_C")continue;
+            // Full three-map SDK comparison: BP_Cryptid_Base_C and
+            // BP_VampireBase_C are inherited base classes, not the
+            // complete gameplay actors. Offering them for spawning caused
+            // empty models / missing AI on foreign maps. Only concrete
+            // species encountered as actual PersistentLevel actors qualify.
+            if(name!=L"BP_FlyingPawnTest_C" &&
+               name!=L"BP_Wendigo_C" && name!=L"BP_Vampire_C")continue;
             int32_t liveId=-1;
             if(!Read(klass+0x0C,liveId) || liveId!=id)continue;
             const bool already=std::any_of(gSpawnClassCandidates.begin(),
@@ -833,6 +839,23 @@ namespace {
             gRoster=std::move(playersOut);
             gCreatures=std::move(creaturesOut);
             gSpawnClassCatalog=gSpawnClassCandidates;
+            // A loaded UClass alone isn't a playable actor. Mark whether
+            // that exact species is represented by a live ULevel actor in
+            // this map. A foreign-class spawn remains experimental.
+            for(auto& spawnType:gSpawnClassCatalog) {
+                spawnType.presentAsLiveActor=false;
+                int count=0;uintptr_t chunks=0;
+                if(!GetObjects(count,chunks) ||
+                   spawnType.objectIndex>=count)continue;
+                const auto wanted=ObjectAt(spawnType.objectIndex,chunks);
+                for(const auto& actor:gKnown) {
+                    if(actor.kind==2 &&
+                       ReadPtr(actor.address+0x10)==wanted) {
+                        spawnType.presentAsLiveActor=true;
+                        break;
+                    }
+                }
+            }
             gSpawnPointCatalog=std::move(spawnPointsOut);
             gVanityChoices=std::move(vanity);
             gSounds=gSoundCandidates;
@@ -3352,8 +3375,11 @@ namespace {
         if(!GetObjects(total,chunks) || classObjectIndex>=total)return;
         const auto klass=ObjectAt(classObjectIndex,chunks);
         int32_t id=-1;
+        const auto speciesName=ObjectName(klass);
+        const bool concrete=speciesName==L"BP_FlyingPawnTest_C" ||
+            speciesName==L"BP_Vampire_C" || speciesName==L"BP_Wendigo_C";
         if(!klass || !Read(klass+0xC,id) || id!=classObjectIndex ||
-           ClassKind(klass)!=2 || !IsPawnClass(klass)) {
+           !concrete || ClassKind(klass)!=2 || !IsPawnClass(klass)) {
             FHJDiag::Log(L"CRYPTID SPAWN: rejected object that isn't a currently loaded cryptid UClass.");
             return;
         }
