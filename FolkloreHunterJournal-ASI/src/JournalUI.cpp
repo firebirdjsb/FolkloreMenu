@@ -398,13 +398,19 @@ namespace FHJ
             static int selectedSpawnClass=-1,selectedSpawnPoint=-1;
             static bool controlFirstSpawn=false;
             std::string spawnLabel="Choose a loaded cryptid class";
+            bool selectedMapNative=false;
             for(const auto& type:spawnTypes)
-                if(type.objectIndex==selectedSpawnClass)
-                    spawnLabel=type.displayName;
+                if(type.objectIndex==selectedSpawnClass) {
+                    selectedMapNative=type.presentAsLiveActor;
+                    spawnLabel=type.displayName+
+                        (type.presentAsLiveActor?" [MAP NATIVE]":" [CROSS-MAP EXPERIMENTAL]");
+                }
             if(ImGui::BeginCombo("Cryptid species to create",spawnLabel.c_str())) {
                 for(const auto& type:spawnTypes) {
+                    const std::string label=type.displayName+
+                        (type.presentAsLiveActor?" [MAP NATIVE]":" [CROSS-MAP EXPERIMENTAL]");
                     ImGui::PushID(type.objectIndex);
-                    if(ImGui::Selectable(type.displayName.c_str(),
+                    if(ImGui::Selectable(label.c_str(),
                                         type.objectIndex==selectedSpawnClass))
                         selectedSpawnClass=type.objectIndex;
                     ImGui::PopID();
@@ -448,6 +454,10 @@ namespace FHJ
                                                        selectedSpawnPoint,controlFirstSpawn);
             if(!state.host || selectedSpawnClass<0)ImGui::EndDisabled();
             ImGui::TextDisabled("Mothman loads as BP_FlyingPawnTest_C, not BP_Cryptid_Base_C.");
+            if(selectedSpawnClass>=0 && !selectedMapNative)
+                ImGui::TextColored(Palette::col_gold,
+                    "FOREIGN CREATURE: class exists but no live actor of that class on this map.");
+            ImGui::TextDisabled("Only complete Wendigo, Vampire and Mothman actor classes are listed.");
             ImGui::TextDisabled("Cross-map species require loaded mesh, AnimBlueprint and AI controller.");
             ImGui::TextDisabled("Incomplete direct spawns are rejected to avoid invisible, motionless actors.");
             ImGui::TextDisabled("A direct spawn is verified by model+animation+AI; TriggerSpawn calls are not actor proof.");
