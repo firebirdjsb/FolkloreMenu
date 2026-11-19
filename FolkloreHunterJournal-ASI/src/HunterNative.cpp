@@ -1674,9 +1674,15 @@ namespace {
         // Capture the original values BEFORE changing any render state.
         // Render CVars are local to this game's process; remote clients
         // retain their own view and any cinematic effects.
-        for(size_t i=0;i<3;++i)
+        for(size_t i=0;i<3;++i) {
             saved.cvarsSaved[i]=ReadLocalRenderCVar(
                 kLocalClarityCVars[i],saved.originalCvars[i]);
+            // Unknown/missing CVars may report sentinel values. Never
+            // overwrite or later restore a setting we cannot validate.
+            const int32_t v=saved.originalCvars[i];
+            if(v<0 || v>8 || (i==1 && v>1))
+                saved.cvarsSaved[i]=false;
+        }
         gPossessionClarity=saved;
         SetCameraBlurOverrides(cameraComponent);
         bool dispatched=false;
@@ -1700,10 +1706,10 @@ namespace {
             const auto weight=FindFunction(L"CameraComponent",
                                           L"SetPostProcessBlendWeight");
             uint16_t size=0;
+            float originalWeight=saved.previousWeight;
             if(weight && Read(weight+0xB6,size) && size==4)
-                Invoke(saved.camera,weight,
-                       const_cast<float*>(&saved.previousWeight));
-            else TryWrite(saved.camera+0x2D0,saved.previousWeight);
+                Invoke(saved.camera,weight,&originalWeight);
+            else TryWrite(saved.camera+0x2D0,originalWeight);
         }
         for(size_t i=0;i<3;++i)
             if(saved.cvarsSaved[i])
