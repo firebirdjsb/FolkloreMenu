@@ -606,6 +606,15 @@ namespace {
         gLastScanTick=scanTime;
         const uintptr_t world=World();
         if (gPrevWorld!=world) {
+            // A previous possession can end during level travel. Once a
+            // valid new world/player exists, restore the old local CVars.
+            if(gPossessionClarity.active && world) {
+                const auto gi=ReadPtr(world+0x1D8);
+                const auto locals=ReadPtr(gi+0x38);
+                const auto local=ReadPtr(locals);
+                const auto pc=ReadPtr(local+0x30);
+                if(pc)RestorePossessionClarity(pc);
+            }
             gPrevWorld=world;
             gScanIndex=0;
             gKinds.clear();gClassNames.clear();gFunctionCache.clear();
@@ -1584,36 +1593,152 @@ namespace {
         }
         return true;
     }
-    // Motion blur can be inherited from game-wide postprocess volumes even
-    // when the dedicated CameraActor does not define any postprocess settings.
-    // UE's own console-command API changes only local rendering, not gameplay.
-    void DisableChaseMotionBlur(uintptr_t pc,uintptr_t cameraComponent) {
-        const auto cameraWeight=FindFunction(L"CameraComponent",L"SetPostProcessBlendWeight");
-        if(cameraComponent && cameraWeight) {
-            const float zero=0.f;
-            Invoke(cameraComponent,cameraWeight,const_cast<float*>(&zero));
-        }
-        const auto console=FindFunction(L"KismetSystemLibrary",L"ExecuteConsoleCommand");
+    // SDK verified: KismetSystemLibrary.GetConsoleVariableIntValue has
+    // FString(0x10) + int return(0x10), ParmsSize=0x18. Console-command
+    // params are WorldContext 8 / FString 16 / PlayerController 8.
+    constexpr const wchar_t* kLocalClarityCVars[3]{
+        L"r.MotionBlurQuality",
+        L"r.DefaultFeature.MotionBlur",
+        L"r.DepthOfFieldQuality"
+    };
+    bool ReadLocalRenderCVar(const wchar_t* name,int32_t& result) {
         const auto system=FindObjectByName(L"Default__KismetSystemLibrary");
-        uint16_t bytes=0;
-        if(!console || !system || !Read(console+0xB6,bytes) || bytes!=0x20) {
-            FHJDiag::Log(L"CHASE CAMERA: local render console command unavailable; motion-blur disable not verified.");
+        const auto getter=FindFunction(L"KismetSystemLibrary",
+                                      L"GetConsoleVariableIntValue");
+        uint16_t size=0,ret=0;
+        if(!name || !system || !getter ||
+           !Read(getter+0xB6,size) || size!=0x18 ||
+           !Read(getter+0xB8,ret) || ret!=0x10)return false;
+        wchar_t variable[64]{};
+        wcscpy_s(variable,name);
+        FStringView view{variable,static_cast<int32_t>(wcslen(variable)+1),
+                         static_cast<int32_t>(wcslen(variable)+1)};
+        alignas(8) uint8_t args[0x18]{};
+        std::memcpy(args,&view,sizeof(view));
+        if(!Invoke(system,getter,args))return false;
+        std::memcpy(&result,args+0x10,sizeof(result));
+        return true;
+    }
+    bool SetLocalRenderCVar(uintptr_t pc,const wchar_t* name,int32_t value) {
+        const auto console=FindFunction(L"KismetSystemLibrary",
+                                        L"ExecuteConsoleCommand");
+        const auto system=FindObjectByName(L"Default__KismetSystemLibrary");
+        const auto world=World();
+        uint16_t size=0;
+        if(!pc || !console || !system || !world ||
+           !Read(console+0xB6,size) || size!=0x20)return false;
+        wchar_t command[96]{};
+        swprintf_s(command,L"%ls %d",name,value);
+        FStringView view{command,static_cast<int32_t>(wcslen(command)+1),
+                         static_cast<int32_t>(wcslen(command)+1)};
+        alignas(8) uint8_t args[0x20]{};
+        std::memcpy(args,&world,8);
+        std::memcpy(args+8,&view,sizeof(view));
+        std::memcpy(args+0x18,&pc,8);
+        return Invoke(system,console,args);
+    }
+    // CameraComponent.PostProcessSettings 0x300, blend weight 0x2D0.
+    // FPostProcessSettings.bOverride_MotionBlurAmount is bit 6 at 0x1C;
+    // bOverride_MotionBlurMax is bit 7 at 0x1C. Float values are 0x674
+    // and 0x678 inside the struct. All offsets from the user's exact SDK.
+    void SetCameraBlurOverrides(uintptr_t cameraComponent) {
+        if(!cameraComponent)return;
+        uint8_t flags=0;
+        if(!Read(cameraComponent+0x31C,flags))return;
+        const uint8_t enabled=static_cast<uint8_t>(flags|0xC0);
+        const float zero=0.f;
+        if(!TryWrite(cameraComponent+0x31C,enabled) ||
+           !TryWrite(cameraComponent+0x974,zero) ||
+           !TryWrite(cameraComponent+0x978,zero))return;
+        const auto weightFn=FindFunction(L"CameraComponent",
+                                         L"SetPostProcessBlendWeight");
+        uint16_t size=0;
+        float full=1.f;
+        if(weightFn && Read(weightFn+0xB6,size) && size==4)
+            Invoke(cameraComponent,weightFn,&full);
+        else TryWrite(cameraComponent+0x2D0,full);
+    }
+    void ApplyPossessionClarity(uintptr_t pc,uintptr_t cameraComponent) {
+        if(!gCryptidClearLocalBlur.load() || !pc || !cameraComponent ||
+           gPossessionClarity.active)return;
+        PossessionClarityBackup saved{};
+        saved.active=true;
+        saved.camera=cameraComponent;
+        Read(cameraComponent+0x0C,saved.cameraIndex);
+        saved.cameraSaved=
+            saved.cameraIndex>=0 &&
+            Read(cameraComponent+0x31C,saved.previousOverrides) &&
+            Read(cameraComponent+0x2D0,saved.previousWeight) &&
+            Read(cameraComponent+0x974,saved.previousBlurAmount) &&
+            Read(cameraComponent+0x978,saved.previousBlurMax);
+        // Capture the original values BEFORE changing any render state.
+        // Render CVars are local to this game's process; remote clients
+        // retain their own view and any cinematic effects.
+        for(size_t i=0;i<3;++i)
+            saved.cvarsSaved[i]=ReadLocalRenderCVar(
+                kLocalClarityCVars[i],saved.originalCvars[i]);
+        gPossessionClarity=saved;
+        SetCameraBlurOverrides(cameraComponent);
+        bool dispatched=false;
+        for(size_t i=0;i<3;++i)
+            if(saved.cvarsSaved[i])
+                dispatched|=SetLocalRenderCVar(pc,kLocalClarityCVars[i],0);
+        FHJDiag::Log(saved.cameraSaved && dispatched?
+            L"CRYPTID CAMERA: local motion blur and depth of field suppressed, camera overrides enabled; prior settings saved for restore.":
+            L"CRYPTID CAMERA: blur suppression partial (SDK camera override or console variable not available); check HUD/camera diagnostics.");
+    }
+    void RestorePossessionClarity(uintptr_t pc) {
+        if(!gPossessionClarity.active || !pc || !World())return;
+        const auto saved=gPossessionClarity;
+        // Idempotent and never touch a recycled component on a new level.
+        int32_t index=-1;
+        if(saved.cameraSaved && saved.camera &&
+           Read(saved.camera+0x0C,index) && index==saved.cameraIndex) {
+            TryWrite(saved.camera+0x31C,saved.previousOverrides);
+            TryWrite(saved.camera+0x974,saved.previousBlurAmount);
+            TryWrite(saved.camera+0x978,saved.previousBlurMax);
+            const auto weight=FindFunction(L"CameraComponent",
+                                          L"SetPostProcessBlendWeight");
+            uint16_t size=0;
+            if(weight && Read(weight+0xB6,size) && size==4)
+                Invoke(saved.camera,weight,
+                       const_cast<float*>(&saved.previousWeight));
+            else TryWrite(saved.camera+0x2D0,saved.previousWeight);
+        }
+        for(size_t i=0;i<3;++i)
+            if(saved.cvarsSaved[i])
+                SetLocalRenderCVar(pc,kLocalClarityCVars[i],
+                                   saved.originalCvars[i]);
+        gPossessionClarity=PossessionClarityBackup{};
+        FHJDiag::Log(L"CRYPTID CAMERA: restored original local motion-blur / DOF console values and camera post-process settings.");
+    }
+    void RefreshPossessionClarity(uintptr_t pc) {
+        if(!gCryptidClearLocalBlur.load()) {
+            RestorePossessionClarity(pc);
             return;
         }
-        for(const wchar_t* setting:{L"r.MotionBlurQuality 0",L"r.DefaultFeature.MotionBlur 0"}) {
-            wchar_t command[60]{};
-            wcscpy_s(command,setting);
-            const FStringView text{command,
-                static_cast<int32_t>(wcslen(command)+1),
-                static_cast<int32_t>(wcslen(command)+1)};
-            alignas(8) uint8_t args[0x20]{};
-            const auto world=World();
-            std::memcpy(args,&world,8);
-            std::memcpy(args+8,&text,sizeof(text));
-            std::memcpy(args+0x18,&pc,8);
-            Invoke(system,console,args);
+        if(!gPossessionClarity.active) {
+            if(gChaseCamera) {
+                const auto cameraComponent=ReadPtr(gChaseCamera+0x2B0);
+                ApplyPossessionClarity(pc,cameraComponent);
+            }
+            return;
         }
-        FHJDiag::Log(L"CHASE CAMERA: requested local Unreal motion-blur disable for clearer cryptid movement.");
+        // Check every ~600ms, not every frame. Some camera systems may
+        // reset camera blend weight during chase camera updates.
+        const auto component=gPossessionClarity.camera;
+        int32_t id=-1;
+        if(!component || !Read(component+0x0C,id) ||
+           id!=gPossessionClarity.cameraIndex)return;
+        uint8_t flags=0;
+        float amount=0.f,maxBlur=0.f,weight=0.f;
+        if(Read(component+0x31C,flags) &&
+           Read(component+0x974,amount) &&
+           Read(component+0x978,maxBlur) &&
+           Read(component+0x2D0,weight) &&
+           ((flags&0xC0)!=0xC0 || amount!=0.f ||
+            maxBlur!=0.f || weight<0.99f))
+            SetCameraBlurOverrides(component);
     }
     bool CreateMonsterCamera(uintptr_t pc,const Vec3& position) {
         const auto world=World();
@@ -1675,7 +1800,7 @@ namespace {
             float angle=86.0f;
             Invoke(comp,fov,&angle);
         }
-        DisableChaseMotionBlur(pc,comp);
+        ApplyPossessionClarity(pc,comp);
         FHJDiag::Log(L"Created camera actor and switched view target for monster mode.");
         return true;
     }
@@ -1732,6 +1857,7 @@ namespace {
         FHJDiag::Log(L"MOTHMAN LOCAL SMOKE: hid only the local Smoke Niagara renderer; eyes, moths, wings and remote player visuals are unchanged.");
     }
     void ReleaseMonsterCamera(uintptr_t pc,uintptr_t destination) {
+        RestorePossessionClarity(pc);
         RestoreLocalMothmanSmoke();
         if(pc && gCameraAutoManageSaved) {
             TryWrite(pc+0x370,gOriginalCameraAutoManage);
@@ -2561,6 +2687,19 @@ namespace {
         if(gMonsterActive.load() && !MonitorControlledRespawn(world,now))return;
         if(gMonsterActive.load() || gLocalMothmanSmoke.component)
             SyncLocalMothmanSmoke();
+        if(now-gLastPossessionClarityRefresh>=600) {
+            gLastPossessionClarityRefresh=now;
+            if(gMonsterActive.load() || gPossessionClarity.active) {
+                const auto instance=ReadPtr(world+0x1D8);
+                const auto locals=ReadPtr(instance+0x38);
+                const auto local=ReadPtr(locals);
+                const auto pc=ReadPtr(local+0x30);
+                if(pc) {
+                    if(gMonsterActive.load())RefreshPossessionClarity(pc);
+                    else RestorePossessionClarity(pc);
+                }
+            }
+        }
         if(!gWindow || gJournalOpen.load() || GetForegroundWindow()!=gWindow)return;
         const bool monster=gMonsterActive.load();
         const auto pawn=monster?gMonsterPawn:LocalPawn();
