@@ -363,7 +363,7 @@ namespace FHJ
 
         void DrawCryptids()
         {
-            Heading("CRYPTIDS, NPCS & WORLD OBJECTS", "REAL-TIME ESP / SPAWNED HUNTS / BECOME A CREATURE");
+            Heading("CRYPTIDS, NPCS & WORLD OBJECTS", "REAL-TIME ESP / NATIVE HOST SPAWNING");
             const auto state=HunterNative::GetStatus();
             ImGui::Text("Cryptids: %d  Wildlife/NPCs: %d  Players: %d",state.activeCryptids,
                 state.activeWildlife,state.activePlayers);
@@ -398,7 +398,7 @@ namespace FHJ
             const auto spawnTypes=HunterNative::GetSpawnableCryptidClasses();
             const auto spawnPoints=HunterNative::GetActiveMapSpawners();
             static int selectedSpawnClass=-1,selectedSpawnPoint=-1;
-            static bool controlFirstSpawn=false;
+            
             std::string spawnLabel="Choose a loaded cryptid class";
             bool selectedMapNative=false;
             for(const auto& type:spawnTypes)
@@ -446,14 +446,13 @@ namespace FHJ
                 if(!state.host)ImGui::EndDisabled();
                 ImGui::TextDisabled("Uses BP_MobSpawner_C.SetSpawningEnabled; restores map rules on level change.");
             }
-            ImGui::Checkbox("Immediately control first verified spawn",&controlFirstSpawn);
             ImGui::Text("Loaded cryptid classes: %d  |  Map spawners: %d",
                         static_cast<int>(spawnTypes.size()),
                         static_cast<int>(spawnPoints.size()));
             if(!state.host || selectedSpawnClass<0)ImGui::BeginDisabled();
             if(ImGui::Button("SPAWN SELECTED CRYPTID",ImVec2(-1,35)))
                 HunterNative::RequestSpawnCryptidClass(selectedSpawnClass,wave,
-                                                       selectedSpawnPoint,controlFirstSpawn);
+                                                       selectedSpawnPoint,false);
             if(!state.host || selectedSpawnClass<0)ImGui::EndDisabled();
             ImGui::TextDisabled("Mothman loads as BP_FlyingPawnTest_C, not BP_Cryptid_Base_C.");
             if(selectedSpawnClass>=0 && !selectedMapNative)
@@ -463,107 +462,10 @@ namespace FHJ
             ImGui::TextDisabled("Cross-map species require loaded mesh, AnimBlueprint and AI controller.");
             ImGui::TextDisabled("Incomplete direct spawns are rejected to avoid invisible, motionless actors.");
             ImGui::TextDisabled("A direct spawn is verified by model+animation+AI; TriggerSpawn calls are not actor proof.");
-            const auto creatures=HunterNative::GetCreatures();
-            ImGui::TextColored(Palette::col_gold,"BECOME A LIVE CRYPTID [EXPERIMENTAL]");
-            std::string selectedLabel="Select a live cryptid";
-            bool isPawn=false;
-            double cryptidHP=-1.0, cryptidMaxHP=-1.0;
-            for(const auto& creature:creatures) if(creature.objectIndex==selectedCreature) {
-                selectedLabel=creature.displayName+" #"+std::to_string(creature.objectIndex);
-                isPawn=creature.isPawn;
-                cryptidHP=creature.health;cryptidMaxHP=creature.maxHealth;
-            }
-            if(ImGui::BeginCombo("Cryptid",selectedLabel.c_str())) {
-                for(const auto& creature:creatures) {
-                    const auto name=creature.displayName+" #"+std::to_string(creature.objectIndex);
-                    ImGui::PushID(creature.objectIndex);
-                    if(ImGui::Selectable(name.c_str(),creature.objectIndex==selectedCreature))
-                        selectedCreature=creature.objectIndex;
-                    ImGui::PopID();
-                }
-                ImGui::EndCombo();
-            }
-            if(cryptidHP>=0) {
-                if(cryptidMaxHP>0) {
-                    ImGui::Text("CRYPTID HEALTH: %.0f / %.0f",cryptidHP,cryptidMaxHP);
-                    ImGui::ProgressBar(std::clamp(
-                        static_cast<float>(cryptidHP/cryptidMaxHP),0.f,1.f),
-                        ImVec2(-1,10));
-                } else ImGui::Text("CRYPTID HEALTH: %.0f / ?",cryptidHP);
-            } else if(selectedCreature>=0 && selectedLabel.find("Mothman")!=std::string::npos)
-                ImGui::TextDisabled("Mothman is a playable APawn; this SDK has no Mothman HP property.");
-            else ImGui::TextDisabled("Cryptid HP: select a live cryptid to inspect");
-            if(!state.host || selectedCreature<0 || !isPawn)ImGui::BeginDisabled();
-            if(ImGui::Button("CONTROL CRYPTID [PUPPET MODE]",ImVec2(-1,32)))
-                HunterNative::RequestPossessCryptid(selectedCreature);
-            if(!state.host || selectedCreature<0 || !isPawn)ImGui::EndDisabled();
-            if(!state.host)ImGui::BeginDisabled();
-            if(ImGui::Button("RESTORE HUMAN CHARACTER",ImVec2(-1,30)))
-                HunterNative::RequestRestoreHuman();
-            if(!state.host)ImGui::EndDisabled();
-            ImGui::TextDisabled("Remote cryptid control preserves the human pawn in the expedition.");
             ImGui::Separator();
-            ImGui::TextColored(Palette::col_gold,"POSSESSION CAMERA / CONTROLS");
-            auto camSettings=HunterNative::GetCryptidCameraSettings();
-            bool camChanged=false;
-            camChanged|=ImGui::SliderFloat("Horizontal look sensitivity",
-                &camSettings.yawSensitivity,.015f,.60f,"%.3f");
-            camChanged|=ImGui::SliderFloat("Vertical look sensitivity",
-                &camSettings.pitchSensitivity,.015f,.60f,"%.3f");
-            camChanged|=ImGui::SliderFloat("Camera follow responsiveness",
-                &camSettings.followRate,8.f,72.f,"%.0f");
-            camChanged|=ImGui::Checkbox("Invert vertical look",&camSettings.invertPitch);
-            camChanged|=ImGui::Checkbox("DISABLE motion blur & focus blur while possessing",
-                &camSettings.clearBlurDuringPossession);
-            if(camChanged)HunterNative::SetCryptidCameraSettings(camSettings);
-            ImGui::TextDisabled("Blur option is local-view only; original render settings return on F11.");
-            ImGui::TextDisabled("Higher follow rate = less camera trailing; settings persist in journal.ini.");
-            bool reduceMothSmoke=HunterNative::MothmanLocalSmokeReduction();
-            if(ImGui::Checkbox("Reduce Mothman smoke ONLY for my possession camera",
-                               &reduceMothSmoke))
-                HunterNative::SetMothmanLocalSmokeReduction(reduceMothSmoke);
-            ImGui::TextDisabled("Local-only Mothman vision: shadowing post-process off,");
-            ImGui::TextDisabled("body/wings kept visible. Other players' stealth and effects stay normal.");
-            ImGui::TextDisabled("Mist toggle affects Smoke only; everything restores on F11.");
-            ImGui::TextDisabled("Mothman: native FlightTarget steering and wing AnimBlueprint (experimental).");
-            ImGui::TextDisabled("Mothman: aerial movement (Space up / Ctrl down).");
-            ImGui::TextDisabled("Wendigo and Vampire: ground movement only (Space jump, no noclip).");
-            ImGui::TextDisabled("Creature-specific native skill keybinds appear ONLY on the possession HUD.");
-            ImGui::TextDisabled("Unsupported abilities are hidden, not assigned from another cryptid.");
-            ImGui::TextDisabled("On death: 15s world-time countdown and native map respawn tracking.");
-            if(HunterNative::MonsterModeActive()) {
-                ImGui::Separator();
-                ImGui::TextColored(Palette::col_gold,"NATIVE CREATURE ATTACK AUDIO");
-                ImGui::TextDisabled("Wendigo / Vampire: LMB native Server_Attack and game-owned animation/audio.");
-                ImGui::TextDisabled("Mothman: LMB has no SDK-confirmed basic melee; R is DarknessAttack.");
-                ImGui::TextDisabled("Vampire E invisibility checks real IsInvisible, with native multicast fallback.");
-                ImGui::TextDisabled("Automatic loaded-sound guesses are disabled: no random thunder.");
-                ImGui::TextDisabled("Optional manual sound override is for diagnostics only.");
-                const auto audio=HunterNative::GetSounds();
-                static int meleeSound=-1;
-                std::string meleeLabel="NATIVE ATTACK AUDIO (NO EXTRA SOUND)";
-                for(const auto& sound:audio)
-                    if(sound.objectIndex==meleeSound)meleeLabel=sound.displayName;
-                if(ImGui::BeginCombo("Extra attack sound (optional)",meleeLabel.c_str())) {
-                    if(ImGui::Selectable("NATIVE ONLY (NO EXTRA SOUND)",meleeSound<0)) {
-                        meleeSound=-1;HunterNative::SetMonsterAttackSound(-1);
-                    }
-                    for(const auto& sound:audio) {
-                        ImGui::PushID(sound.objectIndex);
-                        if(ImGui::Selectable(sound.displayName.c_str(),
-                                             sound.objectIndex==meleeSound)) {
-                            meleeSound=sound.objectIndex;
-                            HunterNative::SetMonsterAttackSound(meleeSound);
-                        }
-                        ImGui::PopID();
-                    }
-                    ImGui::EndCombo();
-                }
-                ImGui::TextDisabled("Only choose extra audio intentionally; the game provides native melee sound.");
-            }
-            ImGui::TextDisabled("F8 journal, F11 safe Return Human; hunter HUD hidden in monster mode.");
-            Notice("SDK VALIDATION",
-                "ESP animal/box/mission categories use class-name heuristics, not a verified complete object list. Native spawning and possession are untested in multiplayer.",true);
+            ImGui::TextColored(Palette::col_gold,"POSSESSION HAS MOVED");
+            ImGui::TextWrapped("Cryptid possession, survivor-vs-cryptid rounds, creature abilities and night rules now belong to the separate FolkloreCryptidHunt.asi game mode.");
+            ImGui::TextWrapped("This Journal keeps world ESP and host creature spawning only. Use ONE of the two ASI modules until a shared rendering hook is implemented.");
         }
 
         void DrawPhysics()
