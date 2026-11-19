@@ -37,6 +37,7 @@ namespace HunterNative {
         float pitchSensitivity = .12f;
         float followRate = 32.f;
         bool invertPitch = false;
+        bool clearBlurDuringPossession = true;
     };
     struct VanityItem {
         std::string label;
