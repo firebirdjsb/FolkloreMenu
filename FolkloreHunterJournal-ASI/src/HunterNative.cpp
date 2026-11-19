@@ -1685,13 +1685,20 @@ namespace {
         }
         gPossessionClarity=saved;
         SetCameraBlurOverrides(cameraComponent);
-        bool dispatched=false;
-        for(size_t i=0;i<3;++i)
-            if(saved.cvarsSaved[i])
-                dispatched|=SetLocalRenderCVar(pc,kLocalClarityCVars[i],0);
-        FHJDiag::Log(saved.cameraSaved && dispatched?
-            L"CRYPTID CAMERA: local motion blur and depth of field suppressed, camera overrides enabled; prior settings saved for restore.":
-            L"CRYPTID CAMERA: blur suppression partial (SDK camera override or console variable not available); check HUD/camera diagnostics.");
+        int requested=0,verified=0;
+        for(size_t i=0;i<3;++i) {
+            if(!saved.cvarsSaved[i])continue;
+            if(SetLocalRenderCVar(pc,kLocalClarityCVars[i],0)) {
+                ++requested;
+                int32_t readback=-1;
+                if(ReadLocalRenderCVar(kLocalClarityCVars[i],readback) &&
+                   readback==0)++verified;
+            }
+        }
+        wchar_t result[260]{};
+        swprintf_s(result,L"CRYPTID CAMERA: local blur clarity enabled; camera snapshot=%s, CVars dispatched=%d/3, immediate zero readback=%d/3. Originals are restored when possession ends; actual rendering must be checked in game.",
+            saved.cameraSaved?L"YES":L"NO",requested,verified);
+        FHJDiag::Log(result);
     }
     void RestorePossessionClarity(uintptr_t pc) {
         if(!gPossessionClarity.active || !pc || !World())return;
