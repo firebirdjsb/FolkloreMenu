@@ -140,6 +140,12 @@ namespace {
     std::atomic<float> gCryptidPitchSensitivity{0.12f};
     std::atomic<float> gCryptidCameraFollow{32.0f};
     std::atomic_bool gCryptidInvertPitch{false};
+    std::atomic_bool gMothmanReduceLocalSmoke{true};
+    struct LocalMothmanSmoke {
+        uintptr_t pawn=0,component=0;
+        int32_t pawnIndex=-1,componentIndex=-1;
+        bool previouslyHidden=false;
+    } gLocalMothmanSmoke;
     std::unordered_map<std::wstring,uintptr_t> gMonsterFunctions;
     ULONGLONG gLastCreatureMethodWarning=0;
     uint8_t gMonsterPriorMovement=1;
@@ -214,6 +220,8 @@ namespace {
     void MaintainGodProtection();
     void ForceActorNetUpdate(uintptr_t pawn);
     void FreeflightTick();
+    void RestoreLocalMothmanSmoke();
+    void SyncLocalMothmanSmoke();
     uintptr_t CreatureSkillFunction(int species,int slot);
     std::string CreatureSkillLabel(int species,int slot,uintptr_t fn);
     void AdvanceSpawnWave();
@@ -463,6 +471,8 @@ namespace {
                 8.f,72.f));
             gCryptidInvertPitch.store(
                 GetPrivateProfileIntW(L"CryptidCamera",L"InvertPitch",0,f.c_str())!=0);
+            gMothmanReduceLocalSmoke.store(
+                GetPrivateProfileIntW(L"Mothman",L"ReduceLocalSmoke",1,f.c_str())!=0);
         });
     }
     void SavePreferences() {
@@ -576,6 +586,9 @@ namespace {
             gHumanIgnoreMovement=false;gHumanIgnoreLook=false;
             gMonsterModeSaved=false;
             gMonsterActive.store(false);gMonsterPawn=0;gChaseCamera=0;
+            // Old UObjects are invalid after level transition. Do not call
+            // render functions on them; the scene is destroyed by the engine.
+            gLocalMothmanSmoke=LocalMothmanSmoke{};
             gCameraAutoManageSaved=false;
             gMonsterIndex=-1;gCameraIndex=-1;gLastMotionTick=0;
             gMonsterAIController=0;gMonsterBrain=0;gMonsterBrainWasRunning=false;
@@ -1612,7 +1625,60 @@ namespace {
         FHJDiag::Log(L"Created camera actor and switched view target for monster mode.");
         return true;
     }
+    // Mothman's BP_FlyingPawnTest_C::Smoke is the Niagara component at
+    // +0x3A8. SceneComponent::bHiddenInGame (+0x189 bit 3) is NOT a Net
+    // property in the supplied SDK. Its bVisible flag (+0x188 bit 5)
+    // IS replicated, so NEVER use SceneComponent.SetVisibility here.
+    // This suppresses only the host's local Smoke rendering while they
+    // pilot Mothman. Other players retain the usual effect.
+    bool SetLocalSmokeHidden(uintptr_t component,bool hidden) {
+        const auto fn=FindFunction(L"SceneComponent",L"SetHiddenInGame");
+        uint16_t params=0;
+        if(!component || !fn || !Read(fn+0xB6,params) || params!=2)
+            return false;
+        uint8_t args[2]{static_cast<uint8_t>(hidden?1:0),0};
+        return Invoke(component,fn,args);
+    }
+    void RestoreLocalMothmanSmoke() {
+        const auto saved=gLocalMothmanSmoke;
+        gLocalMothmanSmoke=LocalMothmanSmoke{};
+        if(!saved.pawn || !saved.component)return;
+        int32_t pawnId=-1,componentId=-1;
+        if(!Read(saved.pawn+0x0C,pawnId) || pawnId!=saved.pawnIndex ||
+           !Read(saved.component+0x0C,componentId) ||
+           componentId!=saved.componentIndex ||
+           ReadPtr(saved.pawn+0x3A8)!=saved.component)return;
+        if(!SetLocalSmokeHidden(saved.component,saved.previouslyHidden))
+            FHJDiag::Log(L"MOTHMAN LOCAL SMOKE: could not restore original visibility.");
+    }
+    void SyncLocalMothmanSmoke() {
+        const bool controllingMothman=gMonsterActive.load() &&
+            ClassName(ReadPtr(gMonsterPawn+0x10))==L"BP_FlyingPawnTest_C";
+        if(!controllingMothman || !gMothmanReduceLocalSmoke.load()) {
+            if(gLocalMothmanSmoke.component)RestoreLocalMothmanSmoke();
+            return;
+        }
+        const auto smoke=ReadPtr(gMonsterPawn+0x3A8);
+        if(!smoke)return;
+        int32_t pawnId=-1,smokeId=-1;
+        if(!Read(gMonsterPawn+0x0C,pawnId) || pawnId!=gMonsterIndex ||
+           !Read(smoke+0x0C,smokeId) || smokeId<0)return;
+        if(gLocalMothmanSmoke.pawn==gMonsterPawn &&
+           gLocalMothmanSmoke.component==smoke &&
+           gLocalMothmanSmoke.componentIndex==smokeId)return;
+        if(gLocalMothmanSmoke.component)RestoreLocalMothmanSmoke();
+        uint8_t componentFlags=0;
+        if(!Read(smoke+0x189,componentFlags))return;
+        const bool wasHidden=(componentFlags&0x08)!=0;
+        if(!SetLocalSmokeHidden(smoke,true)) {
+            FHJDiag::Log(L"MOTHMAN LOCAL SMOKE: native nonreplicated SetHiddenInGame unavailable.");
+            return;
+        }
+        gLocalMothmanSmoke={gMonsterPawn,smoke,pawnId,smokeId,wasHidden};
+        FHJDiag::Log(L"MOTHMAN LOCAL SMOKE: hid only the local Smoke Niagara renderer; eyes, moths, wings and remote player visuals are unchanged.");
+    }
     void ReleaseMonsterCamera(uintptr_t pc,uintptr_t destination) {
+        RestoreLocalMothmanSmoke();
         if(pc && gCameraAutoManageSaved) {
             TryWrite(pc+0x370,gOriginalCameraAutoManage);
             gCameraAutoManageSaved=false;
@@ -2244,6 +2310,7 @@ namespace {
             L"CRYPTID RESPAWN: no native map spawner found; will follow an existing game respawn only.");
     }
     bool RebindControlledCryptid(uintptr_t newPawn) {
+        RestoreLocalMothmanSmoke(); // restore the old actor before reassignment
         int32_t id=-1;
         if(!newPawn || ReadPtr(newPawn+0x10)!=gControlledCryptidClass ||
            !Read(newPawn+0xC,id) || id<0)return false;
@@ -2364,6 +2431,8 @@ namespace {
         if(!world || world!=gPrevWorld)return;
         // Respawn must keep progressing even with the journal open.
         if(gMonsterActive.load() && !MonitorControlledRespawn(world,now))return;
+        if(gMonsterActive.load() || gLocalMothmanSmoke.component)
+            SyncLocalMothmanSmoke();
         if(!gWindow || gJournalOpen.load() || GetForegroundWindow()!=gWindow)return;
         const bool monster=gMonsterActive.load();
         const auto pawn=monster?gMonsterPawn:LocalPawn();
