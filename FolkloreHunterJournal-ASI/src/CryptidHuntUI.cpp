@@ -226,7 +226,7 @@ void DrawJournal() {
     }
     ImGui::Separator();
     ImGui::TextDisabled("F8 game-mode panel | F11 emergency return | F9 diagnostics");
-    ImGui::TextDisabled("Local test build: do not install with FolkloreHunterJournal.asi");
+    ImGui::TextDisabled("Separate ASI: may coexist with the Journal through one shared DXGI hook-owner bridge.");
     ImGui::End();
 }
 }
