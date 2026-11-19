@@ -222,6 +222,8 @@ namespace {
     };
     std::vector<WendigoWatchCamera> gWendigoWatchCameras;
     std::atomic_int gWendigoWatchCount{0};
+    std::atomic_int gHuntNightCached{-1};
+    ULONGLONG gHuntNightLastRead=0;
     int gWendigoViewIndex=-1;
     bool gWendigoPlaceKey=false,gWendigoCycleKey=false;
     std::atomic_int gMonsterAttackSoundIndex{-1};
@@ -706,6 +708,7 @@ namespace {
             gMonsterPathActive=false;gMonsterLastMoveRequest=0;
             gMonsterFunctions.clear();
             gWendigoWatchCameras.clear();gWendigoWatchCount.store(0);
+            gHuntNightCached.store(-1);gHuntNightLastRead=0;
             gWendigoViewIndex=-1;gWendigoPlaceKey=false;gWendigoCycleKey=false;
             gVampireVerify=VampireInvisibilityVerification{};
             gControlledCryptidClass=0;
@@ -3147,6 +3150,12 @@ namespace {
     }
     void FreeflightTick() {
         const ULONGLONG now=GetTickCount64();
+#ifdef FCH_STANDALONE
+        if(now-gHuntNightLastRead>450) {
+            gHuntNightLastRead=now;
+            gHuntNightCached.store(NativeHuntNightState());
+        }
+#endif
         VerifyVampireInvisibility(now);
         const ULONGLONG elapsed=gLastMotionTick?now-gLastMotionTick:16;
         gLastMotionTick=now;
@@ -4732,11 +4741,11 @@ void HunterNative::DrawMonsterHUD(ImVec2 screen) {
 }
 
 int HunterNative::GetCryptidHuntNightState() {
-    return NativeHuntNightState();
+    return gHuntNightCached.load(); // render thread: no unordered_map/UE reads
 }
 void HunterNative::DrawCryptidHuntDaylightVision(ImVec2 screen) {
 #ifdef FCH_STANDALONE
-    if(!gMonsterActive.load() || NativeHuntNightState()!=0)return;
+    if(!gMonsterActive.load() || gHuntNightCached.load()!=0)return;
     const auto species=MonsterSpecies();
     if(species!=2 && species!=3)return;
     // A local possession-camera rendering rule, NOT a replicated
