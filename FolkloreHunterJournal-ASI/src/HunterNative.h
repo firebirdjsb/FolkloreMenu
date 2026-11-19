@@ -112,6 +112,18 @@ namespace HunterNative {
     bool RequestSetMapSpawnerEnabled(int mapSpawnerIndex, bool enabled);
     bool RequestPossessCryptid(int objectIndex);
     bool RequestRestoreHuman();
+    // Experimental authoritative network role handoff. Only the host may
+    // swap a remote PlayerController to a live cryptid; its former human
+    // pawn and AI controller are retained for rollback on the same world.
+    // A participating remote player must install this ASI and opt into
+    // Cryptid Hunt; a controller swap alone cannot guarantee usable input.
+    bool RequestAssignRemoteCryptid(int playerPawnIndex, int cryptidPawnIndex);
+    bool RequestRestoreRemoteHuman();
+    int ActiveRemoteRolePlayerIndex(); // -1 if no confirmed host handoff
+    int ActiveRemoteRoleCryptidIndex();
+    bool LocalNetworkCryptidRoleActive();
+    bool LocalNetworkCryptidRolePaused();
+    bool ResumeLocalNetworkCryptidControl();
     // Separate game-mode controls. Day state is authoritative when the
     // live FL_Gamemode_C.Director component is accessible; -1 = unknown.
     int GetCryptidHuntNightState();
