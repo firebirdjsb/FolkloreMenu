@@ -286,6 +286,8 @@ namespace {
     void RestorePossessionClarity(uintptr_t pc);
     void RefreshPossessionClarity(uintptr_t pc);
     void VerifyVampireInvisibility(ULONGLONG now);
+    void StopCryptidPath();
+    bool MoveCryptidWithAI(const Vec3& input,ULONGLONG now);
     void TickNativeMothmanFlight(uintptr_t pawn,const Vec3& desiredInput,
                                   bool boosting,double dt,ULONGLONG now);
     uintptr_t CreatureSkillFunction(int species,int slot);
@@ -2636,6 +2638,10 @@ namespace {
             }
         }
         if(!fn) {
+            // Mothman has no ordinary APawn melee function in any of the
+            // three dumps. A click must not fire DarknessAttack or any
+            // other skill (the R key owns DarknessAttack now).
+            if(species==1 && slot==0)return;
             if(now-gLastCreatureMethodWarning>3200) {
                 gLastCreatureMethodWarning=now;
                 wchar_t msg[192]{};
@@ -3255,7 +3261,7 @@ namespace {
             }
         }
         UpdateMonsterHUD();
-        if(down(VK_LBUTTON) && now-gLastAttackTick>=700) {
+        if(species!=1 && down(VK_LBUTTON) && now-gLastAttackTick>=700) {
             gLastAttackTick=now;
             ExecuteMonsterAbility(0);
         }
@@ -4534,7 +4540,11 @@ void HunterNative::DrawMonsterHUD(ImVec2 screen) {
                       IM_COL32(223,230,209,255),skill.c_str());
         ++shown;
     }
-    if(shown==0)
+    if(snap.species==1)
+        draw->AddText(ImVec2(bottom.x+14,bottom.y+110),
+            IM_COL32(213,186,148,255),
+            "LMB: no verified basic melee  |  R: DarknessAttack power (NOT melee)");
+    else if(shown==0)
         draw->AddText(ImVec2(bottom.x+14,bottom.y+63),
             IM_COL32(179,187,181,255),
             "No compatible native attack/skill methods loaded for this creature");
