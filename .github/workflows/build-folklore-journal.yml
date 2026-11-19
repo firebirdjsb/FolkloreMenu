@@ -70,9 +70,18 @@ jobs:
           4 active max, and briefly hides when placing a camera.
           Vampire other skill effects and remote player role handoff need testing.
           C deploy Wendigo watchpoint, V cycle (includes chase view).
-          Host can randomly draw a selected participating player in local UI,
-          but remote-client join/ready messaging and remote possession
-          are NOT networked. Do not misrepresent this as a ready PvP mode.
+          Host draws a participating player in host-local UI and may
+          explicitly hand off a live map cryptid to a remote controller
+          through native authority-side Controller.Possess(APawn*).
+          On the remote modded client, owning-pawn detection and guarded
+          ground movement/Server_Attack dispatch are experimental.
+          Mothman remote flight, Q/E/R, join/ready RPC, round scoring,
+          native camera and full remote gameplay remain UNVERIFIED.
+          Host restores remote human; remote F11 pauses INPUT ONLY.
+          See docs/CRYPTID_HUNT_V0_3_NATIVE_ROLES_SAVE_ISOLATION.md.
+          For optional separate LOCAL SaveGames profile (not cloud/
+          achievements), use tools/Start-CryptidHunt-Isolated.ps1
+          BEFORE game start. Do not call this a completed PvP mode.
           Install FolkloreCryptidHunt.asi via the existing ASI loader.
           May coexist with FolkloreHunterJournal.asi: only the first
           ASI hooks DXGI/Win32, second uses exported bridge callbacks.
