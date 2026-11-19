@@ -110,7 +110,7 @@ void DrawJournal() {
     }
     if(selectedPlayer>=0) {
         const auto live=std::find_if(players.begin(),players.end(),
-            [selectedPlayer](const HunterNative::PlayerInfo& p) {
+            [](const HunterNative::PlayerInfo& p) {
                 return p.objectIndex==selectedPlayer && p.alive;
             });
         if(live==players.end()) {
