@@ -2264,11 +2264,21 @@ namespace {
             Read(gMonsterPawn+0xC,liveId) && liveId==gMonsterIndex &&
             ReadPtr(gMonsterPawn+0x10)==gControlledCryptidClass;
         const bool isMothman=ClassName(gControlledCryptidClass)==L"BP_FlyingPawnTest_C";
-        // BP_FlyingPawnTest_C derives from APawn, without the cryptid
-        // Health property. Its live UObject identity is evidence of presence;
-        // SDK does not establish a Mothman health/death contract.
-        const bool alive=valid && (isMothman ||
-            (Read(gMonsterPawn+0x710,hp) && std::isfinite(hp) && hp>0));
+        // Engine.Actor.IsActorBeingDestroyed is native and returns a bool;
+        // it provides a safer Mothman liveness signal than reading invalid
+        // base-cryptid health bytes from this unrelated APawn subtype.
+        bool beingDestroyed=false;
+        if(valid) {
+            static uintptr_t isDestroying=0;
+            if(!isDestroying)
+                isDestroying=FindFunction(L"Actor",L"IsActorBeingDestroyed");
+            uint16_t size=0;
+            if(isDestroying && Read(isDestroying+0xB6,size) && size==1)
+                Invoke(gMonsterPawn,isDestroying,&beingDestroyed);
+        }
+        const bool alive=valid && !beingDestroyed &&
+            (isMothman || (Read(gMonsterPawn+0x710,hp) &&
+                           std::isfinite(hp) && hp>0));
         if(alive) {
             if(gControlledRespawnStart>=0.0)RebindControlledCryptid(gMonsterPawn);
             else Position(gMonsterPawn,gControlledLastPosition);
