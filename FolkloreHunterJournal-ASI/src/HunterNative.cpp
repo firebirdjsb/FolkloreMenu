@@ -233,7 +233,7 @@ namespace {
     int gWendigoLastNightNum=-1,gWendigoPriorPhase=-1;
     uintptr_t gWendigoDayWorld=0;
     struct WendigoPlacingStealth {
-        uintptr_t pawn=0;
+        uintptr_t pawn=0,world=0;
         int32_t id=-1;
         bool wasHidden=false;
         ULONGLONG restoreAt=0;
@@ -2108,7 +2108,7 @@ namespace {
     void RestoreWendigoPlacementStealth() {
         const auto old=gWendigoPlacingStealth;
         gWendigoPlacingStealth=WendigoPlacingStealth{};
-        if(!old.pawn)return;
+        if(!old.pawn || old.world!=World())return;
         int32_t id=-1;
         if(!Read(old.pawn+0xC,id) || id!=old.id)return;
         if(!SetWendigoActorHidden(old.pawn,old.wasHidden))
@@ -2134,7 +2134,7 @@ namespace {
         const bool original=(flags&0x80)!=0;
         if(!SetWendigoActorHidden(gMonsterPawn,true))return;
         gWendigoPlacingStealth={
-            gMonsterPawn,id,original,now+1600
+            gMonsterPawn,World(),id,original,now+1600
         };
         const auto net=FindFunction(L"Actor",L"ForceNetUpdate");
         if(net)Invoke(gMonsterPawn,net,nullptr);
@@ -2164,7 +2164,9 @@ namespace {
     }
     bool CycleWendigoWatchCamera(bool returnToChase) {
 #ifdef FCH_STANDALONE
-        if(!IsControllingWendigo() || !gHumanInputController ||
+        if(!gCryptidHuntOptedIn.load() ||
+           gCryptidHuntMapSpecies.load()!=3 ||
+           !IsControllingWendigo() || !gHumanInputController ||
            !gChaseCamera)return false;
         const int count=static_cast<int>(gWendigoWatchCameras.size());
         if(returnToChase || count==0 || gWendigoViewIndex+1>=count) {
