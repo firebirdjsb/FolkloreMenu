@@ -1,6 +1,7 @@
 // Cryptid Hunt — separate possession/versus-mode UI.
-// Host-only role-draft foundation: remote client role handoff is NOT yet implemented.
-// Live possession uses only the host's native creature-control bridge.
+// Host draw + experimental authority-side AController.Possess handoff.
+// Remote client input uses its own replicated pawn; do not equate native
+// handoff with an end-to-end verified multiplayer round.
 #include "JournalUI.h"
 #include "HunterNative.h"
 #include <imgui.h>
@@ -49,6 +50,10 @@ void DrawJournal() {
     }
     const auto status=HunterNative::GetStatus();
     const bool controlling=HunterNative::MonsterModeActive();
+    const bool clientNativeRole=HunterNative::LocalNetworkCryptidRoleActive();
+    const bool clientPaused=HunterNative::LocalNetworkCryptidRolePaused();
+    const int serverRolePlayer=HunterNative::ActiveRemoteRolePlayerIndex();
+    const int serverRoleCryptid=HunterNative::ActiveRemoteRoleCryptidIndex();
     const int phase=HunterNative::GetCryptidHuntNightState();
     ImGui::TextColored(ImVec4(.76f,.65f,.42f,1.f),
         "CRYPTID HUNT // SURVIVORS AGAINST THE NIGHT");
@@ -65,6 +70,7 @@ void DrawJournal() {
     ImGui::TextDisabled("Mode choice is in memory only; resets OFF at every game launch.");
     ImGui::TextDisabled("This ASI never changes selected contracts or calls SaveGame APIs.");
     ImGui::TextDisabled("The base game may still write its normal save/progression data.");
+    ImGui::TextDisabled("For save separation, use the optional isolated-launch helper BEFORE starting the game.");
     ImGui::SeparatorText("STOCK LOBBY / MAP-LOCKED CREATURE");
     ImGui::Text("Host: %s | State: %s",status.host?"YES":"CLIENT / UNKNOWN",
         status.isGameLobby?"IN NORMAL LOBBY":
@@ -82,18 +88,43 @@ void DrawJournal() {
         "DIRECTOR TIME: %s",phase==1?"NIGHT":phase==0?"DAY":"UNKNOWN (NO HOST DIRECTOR)");
     ImGui::Separator();
 
-    // Actual player inventory from Unreal. These checkboxes are host-local
-    // draft eligibility, not networked client consent/ready messages yet.
+    // Live player roster; checkboxes are host-local draft eligibility, not
+    // a networked ready/consent protocol. The remote owner must separately
+    // install the ASI and opt in before the host initiates a possession.
     static std::unordered_set<int> eligible;
     static int selectedPlayer=-1;
     static std::string selectedPlayerName;
     static bool selectedIsLocal=false;
+    static std::string roundKey;
+    static bool hostConfirmedRemoteReady=false;
     const auto players=HunterNative::GetPlayers();
+    const std::string currentRound=status.activeHuntName+"|"+
+        status.selectedLobbyMap+"|"+(status.isGameLobby?"lobby":"hunt");
+    if(currentRound!=roundKey) {
+        roundKey=currentRound;
+        eligible.clear();
+        selectedPlayer=-1;
+        selectedPlayerName.clear();
+        selectedIsLocal=false;
+        hostConfirmedRemoteReady=false;
+    }
+    if(selectedPlayer>=0) {
+        const auto live=std::find_if(players.begin(),players.end(),
+            [selectedPlayer](const HunterNative::PlayerInfo& p) {
+                return p.objectIndex==selectedPlayer && p.alive;
+            });
+        if(live==players.end()) {
+            selectedPlayer=-1;
+            selectedPlayerName.clear();
+            selectedIsLocal=false;
+            hostConfirmedRemoteReady=false;
+        }
+    }
     if(ImGui::CollapsingHeader("ROUND LOBBY / RANDOM CRYPTID ROLE",
                              ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::TextDisabled("Stage 1: select connected survivors eligible for the host role draw.");
-        ImGui::TextDisabled("Host roster selection is local only; networked join/ready and");
-        ImGui::TextDisabled("remote owner possession need a client companion + server RPC.");
+        ImGui::TextDisabled("The draw is host-local. The optional native handoff below uses");
+        ImGui::TextDisabled("authoritative Controller.Possess; it is not a ready/consent RPC.");
         for(const auto& player:players) {
             if(!player.alive)continue;
             bool ready=eligible.count(player.objectIndex)!=0;
@@ -122,6 +153,7 @@ void DrawJournal() {
                 selectedPlayer=winner.objectIndex;
                 selectedPlayerName=winner.displayName;
                 selectedIsLocal=winner.local;
+                hostConfirmedRemoteReady=false;
             }
         }
         if(!status.host || !custom || status.mapCryptid==0)ImGui::EndDisabled();
@@ -130,13 +162,14 @@ void DrawJournal() {
                 "SELECTED CRYPTID PLAYER: %s",selectedPlayerName.c_str());
             ImGui::TextDisabled(selectedIsLocal?
                 "Host-local winner: manual native control can be activated below.":
-                "Remote winner: selected only. Role assignment/possess RPC is not yet implemented.");
+                "Remote winner: handoff is available below only with explicit host confirmation.");
         } else ImGui::TextDisabled("No random role drawn in this session.");
         if(ImGui::Button("RESET ROUND DRAFT")) {
             selectedPlayer=-1;
             selectedPlayerName.clear();
             selectedIsLocal=false;
             eligible.clear();
+            hostConfirmedRemoteReady=false;
         }
     }
     ImGui::Separator();
@@ -172,6 +205,46 @@ void DrawJournal() {
         }
         ImGui::EndCombo();
     }
+    if(ImGui::CollapsingHeader("MULTIPLAYER / NATIVE REMOTE ROLE HANDOFF",
+                             ImGuiTreeNodeFlags_DefaultOpen)) {
+        if(clientNativeRole) {
+            ImGui::TextColored(ImVec4(.45f,.86f,.69f,1.f),
+                "SERVER POSSESSION RECEIVED: YOU ARE THE CRYPTID");
+            ImGui::TextWrapped("The host's native PlayerController possession reached your client. This ASI drives owning-client WASD and native ground CharacterMovement; supported server melee RPC is checked at runtime. Remote abilities and Mothman flight are not yet validated.");
+            if(clientPaused) {
+                ImGui::TextColored(ImVec4(1.f,.73f,.35f,1.f),
+                    "LOCAL INPUT PAUSED (host has not restored your human).");
+                if(ImGui::Button("RESUME MY CRYPTID INPUT"))
+                    HunterNative::ResumeLocalNetworkCryptidControl();
+            } else
+                ImGui::TextDisabled("F11 PAUSES YOUR INPUT ONLY. Ask host to restore original human.");
+        } else {
+            ImGui::TextDisabled("Remote client must install Cryptid Hunt and select CUSTOM GAME MODE first.");
+            ImGui::TextDisabled("The host cannot detect remote mod readiness or consent yet.");
+        }
+        if(serverRolePlayer>=0) {
+            ImGui::TextColored(ImVec4(.92f,.71f,.38f,1.f),
+                "HOST HANDOFF ACTIVE: human #%d -> cryptid #%d",
+                serverRolePlayer,serverRoleCryptid);
+            if(ImGui::Button("HOST: RESTORE REMOTE HUMAN",ImVec2(-1,36)))
+                HunterNative::RequestRestoreRemoteHuman();
+        } else {
+            const bool canHandoff=status.host && custom && !status.isGameLobby &&
+                status.mapCryptid>0 && !controlling &&
+                selectedPlayer>=0 && !selectedIsLocal && playable;
+            if(!canHandoff)ImGui::BeginDisabled();
+            ImGui::Checkbox("I have permission from the remote player; their ASI is active and mode ON",
+                            &hostConfirmedRemoteReady);
+            if(!hostConfirmedRemoteReady)ImGui::BeginDisabled();
+            if(ImGui::Button("HOST: GIVE DRAWN REMOTE PLAYER THIS CRYPTID",ImVec2(-1,36))) {
+                HunterNative::RequestAssignRemoteCryptid(selectedPlayer,selectedCreature);
+                hostConfirmedRemoteReady=false;
+            }
+            if(!hostConfirmedRemoteReady)ImGui::EndDisabled();
+            if(!canHandoff)ImGui::EndDisabled();
+            ImGui::TextWrapped("EXPERIMENTAL: uses Unreal's native authority-side Controller.Possess. This changes the remote player's actual pawn, unlike local puppet mode. The original human is retained for host rollback, but game-specific unpossession, input and camera behavior still require two-client testing.");
+        }
+    }
     if(!status.host || !custom || status.isGameLobby ||
        status.mapCryptid==0 || !playable || controlling)ImGui::BeginDisabled();
     if(ImGui::Button("HOST TEST: CONTROL SELECTED LIVE CRYPTID",ImVec2(-1,38)))
@@ -179,10 +252,10 @@ void DrawJournal() {
     if(!status.host || !custom || status.isGameLobby ||
        status.mapCryptid==0 || !playable || controlling)ImGui::EndDisabled();
     ImGui::SameLine();
-    if(!controlling)ImGui::BeginDisabled();
-    if(ImGui::Button("RETURN HUMAN (F11)"))
+    if(!controlling || clientNativeRole)ImGui::BeginDisabled();
+    if(ImGui::Button("RETURN HOST HUMAN (F11)"))
         HunterNative::RequestRestoreHuman();
-    if(!controlling)ImGui::EndDisabled();
+    if(!controlling || clientNativeRole)ImGui::EndDisabled();
 
     if(ImGui::CollapsingHeader("WENDIGO // PRIVATE WATCH CAMERAS",
                              ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -228,7 +301,7 @@ void DrawJournal() {
             HunterNative::SetMothmanLocalSmokeReduction(smoke);
     }
     ImGui::Separator();
-    ImGui::TextDisabled("F8 game-mode panel | F11 emergency return | F9 diagnostics");
+    ImGui::TextDisabled("F8 mode panel | F11: host puppet return / client input pause | F9 diagnostics");
     ImGui::TextDisabled("Separate ASI: may coexist with the Journal through one shared DXGI hook-owner bridge.");
     ImGui::End();
 }
