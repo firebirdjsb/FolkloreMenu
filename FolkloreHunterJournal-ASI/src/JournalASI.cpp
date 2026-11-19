@@ -116,7 +116,7 @@ namespace {
         gBridgeRestoreHuman=restore;
         attach(static_cast<void*>(ImGui::GetCurrentContext()),gGameWindow);
         gBridgeReady.store(true,std::memory_order_release);
-        Log(L"Shared hook bridge: companion ASI registered independent UI/engine callbacks; no second DXGI or WndProc patch.");
+        FHJDiag::Log(L"Shared hook bridge: companion ASI registered independent UI/engine callbacks; no second DXGI or WndProc patch.");
     }
     bool CompanionMonsterActive() {
         return gBridgeReady.load(std::memory_order_acquire) &&
