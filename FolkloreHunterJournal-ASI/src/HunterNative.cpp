@@ -43,7 +43,7 @@ namespace {
     struct Camera { Vec3 pos{}; Rot rot{}; float fov{}; };
     struct ActorEntry { uintptr_t address{}; int index{}; int kind{}; };
     struct LevelView { uintptr_t data{}; int32_t count{}; int32_t start{}; };
-    enum class ActionType { GiveItem, CatalogItem, GodMode, AddXP, AddLevels, Time, TimeScale, AddSilver, InfiniteDamage, BeanMode, RangerMode, SmoreMode, Rain, Snow, ClearWeather, VampireScream, FlickerLights, CancelFlicker, TargetHealth, TargetItem, TargetNoise, TargetRevive, TargetKill, TargetKick, TargetGodMode, TargetSound, TargetCameraShake, NoclipOn, NoclipOff, FallProtection, SpeedChange, JumpBoost, GravityChange, SpawnMob, SpawnSpecies, SpawnerToggle, PossessCryptid, RestoreHuman, MonsterAbility, EquipVanity };
+    enum class ActionType { GiveItem, CatalogItem, GodMode, AddXP, AddLevels, Time, TimeScale, AddSilver, InfiniteDamage, BeanMode, RangerMode, SmoreMode, Rain, Snow, ClearWeather, VampireScream, FlickerLights, CancelFlicker, TargetHealth, TargetItem, TargetNoise, TargetRevive, TargetKill, TargetKick, TargetGodMode, TargetSound, TargetCameraShake, NoclipOn, NoclipOff, FallProtection, SpeedChange, JumpBoost, GravityChange, SpawnMob, SpawnSpecies, SpawnerToggle, PossessCryptid, RestoreHuman, MonsterAbility, EquipVanity, WendigoPlaceCamera, WendigoCycleCamera, WendigoCloseCamera };
     struct Action { ActionType type{}; std::string item; int amount{}; float value{}; int target{-1}; double precise{}; };
     std::mutex gMutex;
     std::mutex gActionsMutex;
@@ -216,6 +216,14 @@ namespace {
     } gVampireVerify;
     std::array<ULONGLONG,5> gAbilityTicks{};
     std::array<bool,3> gAbilityKeyDown{};
+    struct WendigoWatchCamera {
+        uintptr_t object=0,world=0;
+        int32_t objectId=-1;
+    };
+    std::vector<WendigoWatchCamera> gWendigoWatchCameras;
+    std::atomic_int gWendigoWatchCount{0};
+    int gWendigoViewIndex=-1;
+    bool gWendigoPlaceKey=false,gWendigoCycleKey=false;
     std::atomic_int gMonsterAttackSoundIndex{-1};
     ULONGLONG gLastAbilityTick=0;
     Vec3 gChaseSmoothedPos{};
@@ -288,6 +296,10 @@ namespace {
     void RestorePossessionClarity(uintptr_t pc);
     void RefreshPossessionClarity(uintptr_t pc);
     void VerifyVampireInvisibility(ULONGLONG now);
+    int NativeHuntNightState();
+    void ClearWendigoWatchCameras();
+    bool PlaceWendigoWatchCamera();
+    bool CycleWendigoWatchCamera(bool returnToChase);
     void StopCryptidPath();
     bool MoveCryptidWithAI(const Vec3& input,ULONGLONG now);
     void TickNativeMothmanFlight(uintptr_t pawn,const Vec3& desiredInput,
@@ -686,6 +698,8 @@ namespace {
             gGroundDrive=GroundMovementDrive{};
             gMonsterPathActive=false;gMonsterLastMoveRequest=0;
             gMonsterFunctions.clear();
+            gWendigoWatchCameras.clear();gWendigoWatchCount.store(0);
+            gWendigoViewIndex=-1;gWendigoPlaceKey=false;gWendigoCycleKey=false;
             gVampireVerify=VampireInvisibilityVerification{};
             gControlledCryptidClass=0;
             gControlledRespawnSpawner=0;gControlledRespawnSpawnerIndex=-1;
@@ -2019,6 +2033,7 @@ namespace {
             gCameraAutoManageSaved=false;
         }
         if(pc && destination)SetCameraViewTarget(pc,destination);
+        ClearWendigoWatchCameras();
         if(gChaseCamera) {
             int32_t live=-1;
             if(Read(gChaseCamera+0x0C,live) && live==gCameraIndex) {
@@ -2601,6 +2616,22 @@ namespace {
         if(!Invoke(pc,play,args))
             FHJDiag::Log(L"CRYPTID AUDIO: user-selected diagnostic sound failed; native attack remains unchanged.");
     }
+    int NativeHuntNightState() {
+#ifdef FCH_STANDALONE
+        // Original SDK: World.AuthorityGameMode (+0x158), FL_Gamemode_C
+        // Director (+0x348), Director_C.IsNight (+0xB0). Director.IsNight
+        // is not replicated, so clients MUST NOT infer daylight from it.
+        const auto world=World();
+        const auto gm=ReadPtr(world+0x158);
+        const auto director=ReadPtr(gm+0x348);
+        if(!director || ClassName(ReadPtr(director+0x10))!=L"Director_C")
+            return -1;
+        bool night=false;
+        return Read(director+0xB0,night)?(night?1:0):-1;
+#else
+        return -1;
+#endif
+    }
     void ExecuteMonsterAbility(int slot) {
         if(slot<0 || slot>=static_cast<int>(gAbilityTicks.size()) ||
            !gMonsterActive.load() || !ReadPtr(World()+0x158) ||
@@ -2616,6 +2647,16 @@ namespace {
             species=gMonsterHUD.species;
         }
         if(gMonsterFunctions.empty())CacheCryptidActions();
+#ifdef FCH_STANDALONE
+        if(species==2 && slot==0 && NativeHuntNightState()==0) {
+            static ULONGLONG lastWarning=0;
+            if(now-lastWarning>2200) {
+                lastWarning=now;
+                FHJDiag::Log(L"CRYPTID HUNT DAYTIME: Vampire basic attacks are disabled until Director.IsNight becomes true.");
+            }
+            return;
+        }
+#endif
         const auto fn=CreatureSkillFunction(species,slot);
         alignas(8) uint8_t args[0x20]{};
         bool advanceStance=false;
@@ -3070,6 +3111,18 @@ namespace {
             std::lock_guard<std::mutex> guard(gMonsterStatusMutex);
             species=gMonsterHUD.species;
         }
+#ifdef FCH_STANDALONE
+        if(monster && species==3) {
+            const bool placeKey=down('C'),cycleKey=down('V');
+            if(placeKey && !gWendigoPlaceKey)PlaceWendigoWatchCamera();
+            if(cycleKey && !gWendigoCycleKey)
+                CycleWendigoWatchCamera(false);
+            gWendigoPlaceKey=placeKey;
+            gWendigoCycleKey=cycleKey;
+        } else {
+            gWendigoPlaceKey=false;gWendigoCycleKey=false;
+        }
+#endif
         // Only the human's independent noclip and Mothman's verified
         // winged-control profile may ascend/descend. Wendigo must stay grounded.
         const bool flying=!monster || species==1;
@@ -3997,6 +4050,9 @@ namespace {
     void ExecuteAction(const Action& a) {
         if(a.type==ActionType::EquipVanity) {EquipVanity(a);return;}
         if(a.type==ActionType::MonsterAbility) {ExecuteMonsterAbility(a.amount);return;}
+        if(a.type==ActionType::WendigoPlaceCamera) {PlaceWendigoWatchCamera();return;}
+        if(a.type==ActionType::WendigoCycleCamera) {CycleWendigoWatchCamera(false);return;}
+        if(a.type==ActionType::WendigoCloseCamera) {CycleWendigoWatchCamera(true);return;}
         if (a.type==ActionType::FallProtection ||
             a.type==ActionType::SpeedChange ||
             a.type==ActionType::JumpBoost ||
@@ -4082,6 +4138,9 @@ namespace {
             case ActionType::PossessCryptid:
             case ActionType::RestoreHuman:
             case ActionType::MonsterAbility:
+            case ActionType::WendigoPlaceCamera:
+            case ActionType::WendigoCycleCamera:
+            case ActionType::WendigoCloseCamera:
             case ActionType::EquipVanity: return;
         }
         // FL_Gamemode_C overrides GiveItem/SetTime/SetTimeScale in this SDK.
