@@ -3606,6 +3606,17 @@ void HunterNative::SetCryptidCameraSettings(const CryptidCameraSettings& value) 
     WritePrivateProfileStringW(L"CryptidCamera",L"InvertPitch",
         value.invertPitch?L"1":L"0",file.c_str());
 }
+bool HunterNative::MothmanLocalSmokeReduction() {
+    LoadPreferences();
+    return gMothmanReduceLocalSmoke.load();
+}
+void HunterNative::SetMothmanLocalSmokeReduction(bool enabled) {
+    gMothmanReduceLocalSmoke.store(enabled);
+    const auto file=SettingsPath();
+    if(!file.empty())
+        WritePrivateProfileStringW(L"Mothman",L"ReduceLocalSmoke",
+            enabled?L"1":L"0",file.c_str());
+}
 std::vector<HunterNative::VanityItem> HunterNative::GetVanityItems() {
     std::lock_guard<std::mutex> lock(gMutex);
     std::vector<VanityItem> result;
