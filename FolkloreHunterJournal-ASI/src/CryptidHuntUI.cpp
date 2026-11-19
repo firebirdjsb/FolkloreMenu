@@ -139,7 +139,7 @@ void DrawJournal() {
     if(ImGui::CollapsingHeader("DAYLIGHT / SPECIES RULES",
                              ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::TextWrapped("Wendigo: mildly impaired vision during Director daytime; full sight at night.");
-        ImGui::TextWrapped("Vampire: severely reduced daytime vision, normal vision at night; native basic melee is blocked during day.");
+        ImGui::TextWrapped("Vampire: nearly blinded in sunlight; both LMB melee and Q scream are disabled during day, restored at night.");
         ImGui::TextDisabled("Rules require the host's live Director.IsNight field.");
         ImGui::TextDisabled("Missing Director state = no invented day/night state.");
     }
