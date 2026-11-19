@@ -522,8 +522,9 @@ namespace FHJ
             if(ImGui::Checkbox("Reduce Mothman smoke ONLY for my possession camera",
                                &reduceMothSmoke))
                 HunterNative::SetMothmanLocalSmokeReduction(reduceMothSmoke);
-            ImGui::TextDisabled("Hides local non-replicated Smoke component during possession;");
-            ImGui::TextDisabled("restores it afterward. Other players retain normal effects and particles.");
+            ImGui::TextDisabled("Local-only Mothman vision: shadowing post-process off,");
+            ImGui::TextDisabled("body/wings kept visible. Other players' stealth and effects stay normal.");
+            ImGui::TextDisabled("Mist toggle affects Smoke only; everything restores on F11.");
             ImGui::TextDisabled("Mothman: native FlightTarget steering and wing AnimBlueprint (experimental).");
             ImGui::TextDisabled("Mothman: aerial movement (Space up / Ctrl down).");
             ImGui::TextDisabled("Wendigo and Vampire: ground movement only (Space jump, no noclip).");
@@ -533,8 +534,10 @@ namespace FHJ
             if(HunterNative::MonsterModeActive()) {
                 ImGui::Separator();
                 ImGui::TextColored(Palette::col_gold,"NATIVE CREATURE ATTACK AUDIO");
-                ImGui::TextDisabled("LMB triggers each creature's own native attack/animation sound.");
-                ImGui::TextDisabled("Automatic loaded-sound guesses are disabled: no random thunder on melee.");
+                ImGui::TextDisabled("Wendigo / Vampire: LMB native Server_Attack and game-owned animation/audio.");
+                ImGui::TextDisabled("Mothman: LMB has no SDK-confirmed basic melee; R is DarknessAttack.");
+                ImGui::TextDisabled("Vampire E invisibility checks real IsInvisible, with native multicast fallback.");
+                ImGui::TextDisabled("Automatic loaded-sound guesses are disabled: no random thunder.");
                 ImGui::TextDisabled("Optional manual sound override is for diagnostics only.");
                 const auto audio=HunterNative::GetSounds();
                 static int meleeSound=-1;
