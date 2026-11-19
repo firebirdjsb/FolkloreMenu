@@ -389,6 +389,55 @@ namespace FHJ
             ImGui::TextDisabled("other classes fall back to the map's TriggerSpawn rules.");
             ImGui::TextDisabled("Select a live cryptid below to override spawner MobClass for one trigger,");
             ImGui::TextDisabled("or leave it unselected for each map spawner's default species.");
+            ImGui::Separator();
+            ImGui::TextColored(Palette::col_gold,"SPAWN A SPECIFIC CRYPTID IN THIS MAP");
+            const auto spawnTypes=HunterNative::GetSpawnableCryptidClasses();
+            const auto spawnPoints=HunterNative::GetActiveMapSpawners();
+            static int selectedSpawnClass=-1,selectedSpawnPoint=-1;
+            static bool controlFirstSpawn=false;
+            std::string spawnLabel="Choose a loaded cryptid class";
+            for(const auto& type:spawnTypes)
+                if(type.objectIndex==selectedSpawnClass)
+                    spawnLabel=type.displayName;
+            if(ImGui::BeginCombo("Cryptid species to create",spawnLabel.c_str())) {
+                for(const auto& type:spawnTypes) {
+                    ImGui::PushID(type.objectIndex);
+                    if(ImGui::Selectable(type.displayName.c_str(),
+                                        type.objectIndex==selectedSpawnClass))
+                        selectedSpawnClass=type.objectIndex;
+                    ImGui::PopID();
+                }
+                ImGui::EndCombo();
+            }
+            std::string spawnPointLabel="Automatic / host location if map has no spawner";
+            for(const auto& point:spawnPoints)
+                if(point.objectIndex==selectedSpawnPoint)
+                    spawnPointLabel=point.displayName;
+            if(ImGui::BeginCombo("Spawn point on current map",spawnPointLabel.c_str())) {
+                if(ImGui::Selectable("Automatic / host location if no spawner",
+                                      selectedSpawnPoint<0))
+                    selectedSpawnPoint=-1;
+                for(const auto& point:spawnPoints) {
+                    ImGui::PushID(point.objectIndex);
+                    if(ImGui::Selectable(point.displayName.c_str(),
+                                        point.objectIndex==selectedSpawnPoint))
+                        selectedSpawnPoint=point.objectIndex;
+                    ImGui::PopID();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::Checkbox("Immediately control first verified spawn",&controlFirstSpawn);
+            ImGui::Text("Loaded cryptid classes: %d  |  Map spawners: %d",
+                        static_cast<int>(spawnTypes.size()),
+                        static_cast<int>(spawnPoints.size()));
+            if(!state.host || selectedSpawnClass<0)ImGui::BeginDisabled();
+            if(ImGui::Button("SPAWN SELECTED CRYPTID",ImVec2(-1,35)))
+                HunterNative::RequestSpawnCryptidClass(selectedSpawnClass,wave,
+                                                       selectedSpawnPoint,controlFirstSpawn);
+            if(!state.host || selectedSpawnClass<0)ImGui::EndDisabled();
+            ImGui::TextDisabled("Mothman loads as BP_FlyingPawnTest_C, not BP_Cryptid_Base_C.");
+            ImGui::TextDisabled("Only currently loaded SDK classes can spawn; map assets may be absent.");
+            ImGui::TextDisabled("A direct native spawn is verified by actor ID; a TriggerSpawn call is not.");
             const auto creatures=HunterNative::GetCreatures();
             ImGui::TextColored(Palette::col_gold,"BECOME A LIVE CRYPTID [EXPERIMENTAL]");
             std::string selectedLabel="Select a live cryptid";
@@ -416,7 +465,9 @@ namespace FHJ
                         static_cast<float>(cryptidHP/cryptidMaxHP),0.f,1.f),
                         ImVec2(-1,10));
                 } else ImGui::Text("CRYPTID HEALTH: %.0f / ?",cryptidHP);
-            } else ImGui::TextDisabled("Cryptid HP: select a live cryptid to inspect");
+            } else if(selectedCreature>=0 && selectedLabel.find("Mothman")!=std::string::npos)
+                ImGui::TextDisabled("Mothman is a playable APawn; this SDK has no Mothman HP property.");
+            else ImGui::TextDisabled("Cryptid HP: select a live cryptid to inspect");
             if(!state.host || selectedCreature<0 || !isPawn)ImGui::BeginDisabled();
             if(ImGui::Button("CONTROL CRYPTID [PUPPET MODE]",ImVec2(-1,32)))
                 HunterNative::RequestPossessCryptid(selectedCreature);
@@ -426,6 +477,19 @@ namespace FHJ
                 HunterNative::RequestRestoreHuman();
             if(!state.host)ImGui::EndDisabled();
             ImGui::TextDisabled("Remote cryptid control preserves the human pawn in the expedition.");
+            ImGui::Separator();
+            ImGui::TextColored(Palette::col_gold,"POSSESSION CAMERA / CONTROLS");
+            auto camSettings=HunterNative::GetCryptidCameraSettings();
+            bool camChanged=false;
+            camChanged|=ImGui::SliderFloat("Horizontal look sensitivity",
+                &camSettings.yawSensitivity,.015f,.60f,"%.3f");
+            camChanged|=ImGui::SliderFloat("Vertical look sensitivity",
+                &camSettings.pitchSensitivity,.015f,.60f,"%.3f");
+            camChanged|=ImGui::SliderFloat("Camera follow responsiveness",
+                &camSettings.followRate,8.f,72.f,"%.0f");
+            camChanged|=ImGui::Checkbox("Invert vertical look",&camSettings.invertPitch);
+            if(camChanged)HunterNative::SetCryptidCameraSettings(camSettings);
+            ImGui::TextDisabled("Higher follow rate = less trailing blur; sensitivity persists in journal.ini.");
             ImGui::TextDisabled("Mothman: aerial movement (Space up / Ctrl down).");
             ImGui::TextDisabled("Wendigo and Vampire: ground movement only (Space jump, no noclip).");
             ImGui::TextDisabled("Creature-specific native skill keybinds appear ONLY on the possession HUD.");
