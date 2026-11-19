@@ -513,8 +513,11 @@ namespace FHJ
             camChanged|=ImGui::SliderFloat("Camera follow responsiveness",
                 &camSettings.followRate,8.f,72.f,"%.0f");
             camChanged|=ImGui::Checkbox("Invert vertical look",&camSettings.invertPitch);
+            camChanged|=ImGui::Checkbox("DISABLE motion blur & focus blur while possessing",
+                &camSettings.clearBlurDuringPossession);
             if(camChanged)HunterNative::SetCryptidCameraSettings(camSettings);
-            ImGui::TextDisabled("Higher follow rate = less trailing blur; sensitivity persists in journal.ini.");
+            ImGui::TextDisabled("Blur option is local-view only; original render settings return on F11.");
+            ImGui::TextDisabled("Higher follow rate = less camera trailing; settings persist in journal.ini.");
             bool reduceMothSmoke=HunterNative::MothmanLocalSmokeReduction();
             if(ImGui::Checkbox("Reduce Mothman smoke ONLY for my possession camera",
                                &reduceMothSmoke))
@@ -529,15 +532,17 @@ namespace FHJ
             ImGui::TextDisabled("On death: 15s world-time countdown and native map respawn tracking.");
             if(HunterNative::MonsterModeActive()) {
                 ImGui::Separator();
-                ImGui::TextColored(Palette::col_gold,"ATTACK AUDIO CONFIGURATION");
-                ImGui::TextDisabled("Use LMB in-game to attack. Only supported skills appear in the HUD.");
+                ImGui::TextColored(Palette::col_gold,"NATIVE CREATURE ATTACK AUDIO");
+                ImGui::TextDisabled("LMB triggers each creature's own native attack/animation sound.");
+                ImGui::TextDisabled("Automatic loaded-sound guesses are disabled: no random thunder on melee.");
+                ImGui::TextDisabled("Optional manual sound override is for diagnostics only.");
                 const auto audio=HunterNative::GetSounds();
                 static int meleeSound=-1;
-                std::string meleeLabel="AUTO / MATCH CRYPTID MELEE";
+                std::string meleeLabel="NATIVE ATTACK AUDIO (NO EXTRA SOUND)";
                 for(const auto& sound:audio)
                     if(sound.objectIndex==meleeSound)meleeLabel=sound.displayName;
-                if(ImGui::BeginCombo("LMB attack sound",meleeLabel.c_str())) {
-                    if(ImGui::Selectable("AUTO / MATCH CRYPTID MELEE",meleeSound<0)) {
+                if(ImGui::BeginCombo("Extra attack sound (optional)",meleeLabel.c_str())) {
+                    if(ImGui::Selectable("NATIVE ONLY (NO EXTRA SOUND)",meleeSound<0)) {
                         meleeSound=-1;HunterNative::SetMonsterAttackSound(-1);
                     }
                     for(const auto& sound:audio) {
@@ -551,7 +556,7 @@ namespace FHJ
                     }
                     ImGui::EndCombo();
                 }
-                ImGui::TextDisabled("Pick a loaded native game sound if AUTO is silent (no external audio files).");
+                ImGui::TextDisabled("Only choose extra audio intentionally; the game provides native melee sound.");
             }
             ImGui::TextDisabled("F8 journal, F11 safe Return Human; hunter HUD hidden in monster mode.");
             Notice("SDK VALIDATION",
