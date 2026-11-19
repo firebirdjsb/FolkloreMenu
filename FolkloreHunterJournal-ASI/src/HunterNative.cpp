@@ -1674,9 +1674,13 @@ namespace {
         // BrainComponent alone leaves the last MoveTo request running.
         const auto stopPath=FindFunction(L"AIController",L"StopMovement");
         if(stopPath)Invoke(ai,stopPath,nullptr);
-        const auto movement=ReadPtr(gMonsterPawn+0x330);
-        const auto stopVelocity=FindFunction(L"MovementComponent",L"StopMovementImmediately");
-        if(movement && stopVelocity)Invoke(movement,stopVelocity,nullptr);
+        // For Mothman, 0x330 is BP_StuckDetector, NOT CharacterMovement.
+        const auto creatureClass=ClassName(ReadPtr(gMonsterPawn+0x10));
+        if(creatureClass!=L"BP_FlyingPawnTest_C") {
+            const auto movement=ReadPtr(gMonsterPawn+0x330);
+            const auto stopVelocity=FindFunction(L"MovementComponent",L"StopMovementImmediately");
+            if(movement && stopVelocity)Invoke(movement,stopVelocity,nullptr);
+        }
         const auto brain=ReadPtr(ai+0x388); // SDK AIModule.AAIController.BrainComponent
         if(!brain)return;
         const auto state=FindFunction(L"BrainComponent",L"IsRunning");
@@ -1808,13 +1812,17 @@ namespace {
     // parameter layout. No generic vampire skills are assigned to Wendigo.
     uintptr_t CreatureSkillFunction(int species,int slot) {
         switch(slot) {
-            case 0: return NoArgCryptidAction({
+            case 0: 
+                // BP_FlyingPawnTest_C is the SDK's Mothman APawn:
+                // DarknessAttack is its actual exposed attack event.
+                if(species==1)return NoArgCryptidAction({
+                    L"DarknessAttack",L"Multicast_All_DarknessAttack"});
+                return NoArgCryptidAction({
                 L"Server_Attack",L"AUTH_Attack",L"Attack",L"PerformAttack",
                 L"StartAttack",L"Melee",L"PrimaryAttack",L"DoMeleeAttack"});
             case 1:
                 if(species==1) return NoArgCryptidAction({
-                    L"Screech",L"AUTH_Screech",L"Shriek",L"AUTH_Shriek",
-                    L"All_ScreamSound",L"Scream",L"Roar"});
+                    L"ForceScreech",L"RetriggerScreech"});
                 if(species==3) return NoArgCryptidAction({
                     L"AUTH_Scream",L"Howl",L"AUTH_Howl",L"Roar",
                     L"Server_Scream",L"Scream"});
@@ -1823,8 +1831,7 @@ namespace {
                     L"Roar",L"DoScream",L"PlayRoar"});
             case 2:
                 if(species==1) return NoArgCryptidAction({
-                    L"Dive",L"DiveAttack",L"AUTH_Dive",L"BeginDive",
-                    L"Swoop",L"SwoopAttack"});
+                    L"RetriggerScreech"});
                 if(species==3) return NoArgCryptidAction({
                     L"Lunge",L"AUTH_Lunge",L"Charge",
                     L"AUTH_Charge",L"Pounce",L"LeapAttack"});
@@ -1841,8 +1848,7 @@ namespace {
                 }
                 return 0;
             case 3:
-                if(species==1)return NoArgCryptidAction({
-                    L"Flap",L"AUTH_Flap",L"FlapWings",L"WindBlast"});
+                if(species==1)return 0; // no SDK-confirmed R ability
                 if(species==3)return NoArgCryptidAction({
                     L"Rage",L"AUTH_Rage",L"Enrage",L"AUTH_Enrage",
                     L"Frenzy",L"FeralRoar"});
@@ -1906,6 +1912,14 @@ namespace {
         gMonsterBrain=0;gMonsterAIController=0;gMonsterBrainWasRunning=false;
     }
     void ConfigureMonsterMovement() {
+        if(ClassName(ReadPtr(gMonsterPawn+0x10))==L"BP_FlyingPawnTest_C") {
+            // The exact SDK says Mothman is APawn; its 0x330 is a
+            // StuckDetector component. Never treat it as CharacterMovement.
+            gMonsterMovement=0;gMonsterSpeedsSaved=false;gMonsterModeSaved=false;
+            gMonsterFlightActive=true;
+            FHJDiag::Log(L"MOTHMAN: native flying APawn recognized; skipping ACharacter movement offsets.");
+            return;
+        }
         gMonsterMovement=ReadPtr(gMonsterPawn+0x330); // ACharacter.CharacterMovement
         if(!gMonsterMovement)return;
         const int species=gMonsterHUD.species;
@@ -2326,17 +2340,41 @@ namespace {
             gMonsterFlightActive=(species==1);
             if(gMonsterFlightActive) {
                 StopCryptidPath();
-                const auto movement=ReadPtr(pawn+0x330);
-                const auto stop=FindFunction(L"MovementComponent",L"StopMovementImmediately");
-                if(movement && stop)Invoke(movement,stop,nullptr);
+                // BP_FlyingPawnTest_C uses FlightTarget (0x400) and
+                // FlightSpeed (0x420) instead of CharacterMovement.
+                // Prefer its native flight-target steering and keep a swept
+                // fallback when its AI/Blueprint tick doesn't consume it.
                 if(length>1e-3) {
                     Vec3 current{};
                     if(Position(pawn,current)) {
                         const double speed=boost?1100.0:690.0;
-                        const Vec3 dest{current.x+input.x*speed*dt,
-                                        current.y+input.y*speed*dt,
-                                        current.z+input.z*speed*dt};
-                        SetActorLocationSafe(pawn,dest,true,false);
+                        const Vec3 goal{current.x+input.x*speed*.25,
+                                        current.y+input.y*speed*.25,
+                                        current.z+input.z*speed*.25};
+                        const bool targetWritten=TryWrite(pawn+0x400,goal);
+                        double configured=0.0;
+                        if(!Read(pawn+0x420,configured) ||
+                           !std::isfinite(configured)||configured<1.0) {
+                            const double nativeSpeed=boost?1100.0:690.0;
+                            TryWrite(pawn+0x420,nativeSpeed);
+                        }
+                        // Keep the pawn responsive even when its original
+                        // controller's flight-target logic was paused.
+                        static Vec3 observed{};
+                        static int32_t observedId=-1;
+                        static ULONGLONG observedAt=0;
+                        if(observedId!=gMonsterIndex || now-observedAt>120) {
+                            observed=current;observedId=gMonsterIndex;observedAt=now;
+                        }
+                        const double progressed=std::hypot(std::hypot(
+                            current.x-observed.x,current.y-observed.y),
+                            current.z-observed.z);
+                        if(!targetWritten || (now-observedAt>75 && progressed<1.0)) {
+                            const Vec3 dest{current.x+input.x*speed*dt,
+                                            current.y+input.y*speed*dt,
+                                            current.z+input.z*speed*dt};
+                            SetActorLocationSafe(pawn,dest,true,false);
+                        }
                     }
                 }
             } else {
@@ -2366,7 +2404,7 @@ namespace {
                 } else StopCryptidPath();
             }
         }
-        const auto movement=ReadPtr(pawn+0x330);
+        const auto movement=monster && species==1 ? 0 : ReadPtr(pawn+0x330);
         if(movement) {
             if(!monster && gNoclipEnabled) {
                 uint8_t mode=0;
