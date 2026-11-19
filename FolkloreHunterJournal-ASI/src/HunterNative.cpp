@@ -2905,7 +2905,12 @@ namespace {
         }
         if(gMonsterFunctions.empty())CacheCryptidActions();
 #ifdef FCH_STANDALONE
-        if((species==2 || species==3) &&
+        if(!gCryptidHuntOptedIn.load() ||
+           gCryptidHuntMapSpecies.load()!=species) {
+            FHJDiag::Log(L"CRYPTID HUNT: rejected ability outside opt-in custom mode or matching live map.");
+            return;
+        }
+        if((species==3 || (species==2 && (slot==0 || slot==1))) &&
            NativeHuntNightState()==0) {
             static ULONGLONG lastWarning=0;
             if(now-lastWarning>2200) {
@@ -4177,6 +4182,13 @@ namespace {
         const auto local=ReadPtr(players);
         const auto pc=ReadPtr(local+0x30);
         if(!pc)return;
+#ifdef FCH_STANDALONE
+        if(!restore && (!gCryptidHuntOptedIn.load() ||
+                        gCryptidHuntMapSpecies.load()==0)) {
+            FHJDiag::Log(L"CRYPTID HUNT: select custom mode first and enter a supported hunt through the normal lobby.");
+            return;
+        }
+#endif
         // No possession swaps: PlayerCharacter_C.ReceiveUnpossessed and
         // GameMode's singleplayer restart logic may destroy/restart the hunt.
         // Instead the controller stays on the human and its ViewTarget
@@ -4205,6 +4217,13 @@ namespace {
             FHJDiag::Log(L"Monster Mode: selected cryptid not a live APawn/ACharacter.");
             return;
         }
+#ifdef FCH_STANDALONE
+        const auto clsName=ClassName(ReadPtr(selected+0x10));
+        if(HuntSpeciesFromName(clsName)!=gCryptidHuntMapSpecies.load()) {
+            FHJDiag::Log(L"CRYPTID HUNT: selected pawn does not match the cryptid assigned by the stock lobby's chosen map.");
+            return;
+        }
+#endif
         const auto human=ReadPtr(pc+0x350);
         int32_t humanIndex=-1;
         if(!human || !Read(human+0x0C,humanIndex)) {
@@ -4754,6 +4773,10 @@ bool HunterNative::RequestSetMapSpawnerEnabled(int mapSpawnerIndex,bool enabled)
         Enqueue({ActionType::SpawnerToggle,"",enabled?1:0,0.f,mapSpawnerIndex,0}):false;
 }
 bool HunterNative::RequestPossessCryptid(int index) {
+#ifdef FCH_STANDALONE
+    if(!gCryptidHuntOptedIn.load() ||
+       gCryptidHuntMapSpecies.load()==0)return false;
+#endif
     return index>=0?Enqueue({ActionType::PossessCryptid,"",0,0,index,0}):false;
 }
 bool HunterNative::RequestRestoreHuman() {
@@ -4892,6 +4915,40 @@ void HunterNative::DrawMonsterHUD(ImVec2 screen) {
 
 int HunterNative::GetCryptidHuntNightState() {
     return gHuntNightCached.load(); // render thread: no unordered_map/UE reads
+}
+bool HunterNative::CryptidHuntOptedIn() {
+#ifdef FCH_STANDALONE
+    return gCryptidHuntOptedIn.load();
+#else
+    return false;
+#endif
+}
+void HunterNative::SetCryptidHuntOptedIn(bool enabled) {
+#ifdef FCH_STANDALONE
+    const bool was=gCryptidHuntOptedIn.exchange(enabled);
+    if(was && !enabled && gMonsterActive.load())
+        RequestRestoreHuman(); // native game-thread cleanup
+    if(was!=enabled)
+        FHJDiag::Log(enabled?
+            L"CRYPTID HUNT: opted into custom mode for this running session only. Normal lobby contract and save system untouched.":
+            L"CRYPTID HUNT: custom mode disabled. Next launch defaults OFF; no SaveGame writes.");
+#else
+    (void)enabled;
+#endif
+}
+int HunterNative::CryptidHuntMapSpecies() {
+    return gCryptidHuntMapSpecies.load();
+}
+const char* HunterNative::CryptidHuntSpeciesName(int species) {
+    switch(species) {
+        case 1:return "MOTHMAN";
+        case 2:return "VAMPIRE";
+        case 3:return "WENDIGO";
+        default:return "UNSUPPORTED / UNKNOWN";
+    }
+}
+int HunterNative::WendigoCameraDayRemaining() {
+    return gWendigoCameraDayRemaining.load();
 }
 void HunterNative::DrawCryptidHuntDaylightVision(ImVec2 screen) {
 #ifdef FCH_STANDALONE
