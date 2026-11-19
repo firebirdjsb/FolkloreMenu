@@ -2937,7 +2937,8 @@ namespace {
                 L"World gravity changed locally; remote players not targeted.");
         } else FHJDiag::Log(L"WorldGravityZ update failed.");
     }
-    bool SpawnNativeCryptid(uintptr_t spawner,uintptr_t species,int ordinal) {
+    bool SpawnNativeCryptid(uintptr_t spawner,uintptr_t species,int ordinal,
+                             int* createdObjectId=nullptr) {
         if(!spawner || !species || ClassKind(species)!=2 || !IsPawnClass(species))
             return false;
         const auto context=FindObjectByName(L"Default__GameplayStatics");
@@ -2973,6 +2974,11 @@ namespace {
         int32_t id=-1;
         if(returned && Read(returned+0x0C,id) && id>=0 &&
            ClassKind(ReadPtr(returned+0x10))==2) {
+            if(gKnown.size()<400 &&
+               std::none_of(gKnown.begin(),gKnown.end(),
+                   [returned](const ActorEntry& e){return e.address==returned;}))
+                gKnown.push_back({returned,id,2});
+            if(createdObjectId)*createdObjectId=id;
             ForceActorNetUpdate(returned);
             return true;
         }
@@ -2984,12 +2990,7 @@ namespace {
         if(now<gSpawnWave.nextTick)return;
         const auto world=World();
         if(!world || !ReadPtr(world+0x158)) {
-            FHJDiag::Log(L"CRYPTID SPAWN: wave cancelled because host authority was lost.");
-            gSpawnWave=SpawnWave{};return;
-        }
-        const auto trigger=FindFunction(L"BP_MobSpawner_C",L"TriggerSpawn");
-        if(!trigger) {
-            FHJDiag::Log(L"CRYPTID SPAWN: native BP_MobSpawner_C.TriggerSpawn missing.");
+            FHJDiag::Log(L"CRYPTID SPAWN: host authority lost; cancelled.");
             gSpawnWave=SpawnWave{};return;
         }
         std::vector<uintptr_t> spawners;
@@ -2997,53 +2998,115 @@ namespace {
         for(const auto& level:GetWorldLevels(world,total))
             for(int i=0;i<level.count;++i) {
                 const auto actor=ReadPtr(level.data+static_cast<size_t>(i)*8);
-                if(actor && ClassName(ReadPtr(actor+0x10))==L"BP_MobSpawner_C")
+                if(!actor || ClassName(ReadPtr(actor+0x10))!=L"BP_MobSpawner_C")
+                    continue;
+                int32_t id=-1;
+                if(!Read(actor+0x0C,id))continue;
+                if(gSpawnWave.spawnerObjectIndex<0 ||
+                   id==gSpawnWave.spawnerObjectIndex)
                     spawners.push_back(actor);
             }
-        if(spawners.empty()) {
-            FHJDiag::Log(L"CRYPTID SPAWN: no live native mob spawners in this hunt.");
+        if(gSpawnWave.spawnerObjectIndex>=0 && spawners.empty()) {
+            FHJDiag::Log(L"CRYPTID SPAWN: requested map spawner isn't present in this loaded hunt; cancelled.");
             gSpawnWave=SpawnWave{};return;
         }
-        const auto actor=spawners[static_cast<size_t>(gSpawnWave.dispatched)%spawners.size()];
-        uintptr_t species=0;
-        for(const auto& found:gKnown)
-            if(found.kind==2 && found.index==gSpawnWave.speciesIndex) {
-                int32_t live=-1;
-                if(Read(found.address+0xC,live) && live==found.index)
-                    species=ReadPtr(found.address+0x10);
-                break;
-            }
-        uintptr_t originalClass=0;
-        Read(actor+0x2B8,originalClass);
-        // The existing native GameplayStatics deferred actor path (used for
-        // chase cameras) returns an actor pointer we can actually validate.
-        // Prefer this for cryptid-derived classes so a map with one spawner
-        // can create multiple independent actors without TriggerSpawn cooldown.
-        const uintptr_t spawnClass=species?species:originalClass;
-        const bool created=SpawnNativeCryptid(actor,spawnClass,gSpawnWave.dispatched);
-        bool invoked=created;
-        if(!created) {
-            const bool overridden=species && originalClass &&
-                TryWrite(actor+0x2B8,species);
-            alignas(8) uint8_t args[0xA0]{};
-            invoked=Invoke(actor,trigger,args);
-            if(overridden && !TryWrite(actor+0x2B8,originalClass))
-                FHJDiag::Log(L"CRYPTID SPAWN: failed to restore original MobClass.");
+        // Only an explicitly selected loaded class may fall back to the
+        // host's position when a map has no native BP_MobSpawner_C actor.
+        const auto anchor=spawners.empty() ?
+            (gSpawnWave.classObjectIndex>=0?LocalPawn():0) :
+            spawners[static_cast<size_t>(gSpawnWave.dispatched)%spawners.size()];
+        if(!anchor) {
+            FHJDiag::Log(L"CRYPTID SPAWN: no usable spawner or host pawn.");
+            gSpawnWave=SpawnWave{};return;
         }
-        if(!invoked) {
-            FHJDiag::Log(L"CRYPTID SPAWN: direct actor spawn and map TriggerSpawn both failed.");
+        uintptr_t species=0;
+        if(gSpawnWave.classObjectIndex>=0) {
+            int objectCount=0;uintptr_t chunks=0;
+            if(GetObjects(objectCount,chunks) &&
+               gSpawnWave.classObjectIndex<objectCount) {
+                const auto klass=ObjectAt(gSpawnWave.classObjectIndex,chunks);
+                int32_t id=-1;
+                const auto meta=ClassName(ReadPtr(klass+0x10));
+                if(klass && Read(klass+0x0C,id) &&
+                   id==gSpawnWave.classObjectIndex &&
+                   (meta==L"Class" || meta==L"BlueprintGeneratedClass") &&
+                   ClassKind(klass)==2 && IsPawnClass(klass))
+                    species=klass;
+            }
+            if(!species) {
+                FHJDiag::Log(L"CRYPTID SPAWN: selected cryptid UClass unloaded or changed; no spawn attempted.");
+                gSpawnWave=SpawnWave{};return;
+            }
+        } else {
+            for(const auto& found:gKnown)
+                if(found.kind==2 && found.index==gSpawnWave.speciesIndex) {
+                    int32_t id=-1;
+                    if(Read(found.address+0xC,id) && id==found.index)
+                        species=ReadPtr(found.address+0x10);
+                    break;
+                }
+            if(!species && !spawners.empty())
+                species=ReadPtr(anchor+0x2B8); // map's own MobClass
+        }
+        if(!species || ClassKind(species)!=2) {
+            FHJDiag::Log(L"CRYPTID SPAWN: no loaded cryptid class selected by map or user.");
+            gSpawnWave=SpawnWave{};return;
+        }
+        int createdId=-1;
+        const bool created=SpawnNativeCryptid(anchor,species,gSpawnWave.dispatched,
+                                               &createdId);
+        bool dispatched=created;
+        if(!created && !spawners.empty()) {
+            // Fall back to the map spawner only if we can ensure it is
+            // configured to spawn exactly the requested species.
+            const auto trigger=FindFunction(L"BP_MobSpawner_C",L"TriggerSpawn");
+            const auto original=ReadPtr(anchor+0x2B8);
+            const bool needsSwap=original!=species;
+            const bool canSwap=!needsSwap || TryWrite(anchor+0x2B8,species);
+            if(trigger && canSwap) {
+                alignas(8) uint8_t args[0xA0]{};
+                dispatched=Invoke(anchor,trigger,args);
+            }
+            if(needsSwap && canSwap && !TryWrite(anchor+0x2B8,original))
+                FHJDiag::Log(L"CRYPTID SPAWN WARNING: original map spawner MobClass could not be restored.");
+        }
+        if(!dispatched) {
+            FHJDiag::Log(L"CRYPTID SPAWN: native deferred spawn and map spawner dispatch failed; stopping wave.");
             gSpawnWave=SpawnWave{};return;
         }
         ++gSpawnWave.dispatched;
         if(created)++gSpawnWave.created;
         --gSpawnWave.remaining;
         gSpawnWave.nextTick=now+550;
-        wchar_t msg[220]{};
-        swprintf_s(msg,L"CRYPTID SPAWN: request %d/%d; %d actor(s) directly created and verified, %d pending. Map spawner fallback may apply its own rules.",
-            gSpawnWave.dispatched,gSpawnWave.requested,gSpawnWave.created,gSpawnWave.remaining);
+        wchar_t msg[224]{};
+        swprintf_s(msg,L"CRYPTID SPAWN: requested %d/%d, verified direct actors %d, pending %d. Spawner dispatch alone is not a verified actor.",
+            gSpawnWave.dispatched,gSpawnWave.requested,
+            gSpawnWave.created,gSpawnWave.remaining);
         FHJDiag::Log(msg);
-        if(gSpawnWave.remaining==0)
-            FHJDiag::Log(L"CRYPTID SPAWN: queued wave complete. Check active cryptid count and remote replication.");
+        if(created && createdId>=0 && gSpawnWave.controlFirst) {
+            gSpawnWave.controlFirst=false;
+            PossessCreature(createdId,false);
+        }
+    }
+    void SpawnSelectedClassWave(int count,int classObjectIndex,
+                                 int mapSpawnerIndex,bool autoControl) {
+        if(!ReadPtr(World()+0x158) || count<1 || count>10 || classObjectIndex<0)
+            return;
+        int total=0;uintptr_t chunks=0;
+        if(!GetObjects(total,chunks) || classObjectIndex>=total)return;
+        const auto klass=ObjectAt(classObjectIndex,chunks);
+        int32_t id=-1;
+        if(!klass || !Read(klass+0xC,id) || id!=classObjectIndex ||
+           ClassKind(klass)!=2 || !IsPawnClass(klass)) {
+            FHJDiag::Log(L"CRYPTID SPAWN: rejected object that isn't a currently loaded cryptid UClass.");
+            return;
+        }
+        gSpawnWave=SpawnWave{};
+        gSpawnWave.remaining=count;gSpawnWave.requested=count;
+        gSpawnWave.classObjectIndex=classObjectIndex;
+        gSpawnWave.spawnerObjectIndex=mapSpawnerIndex;
+        gSpawnWave.controlFirst=autoControl;
+        FHJDiag::Log(L"CRYPTID SPAWN: queued selected species in active hunt; will verify each direct actor.");
     }
     void SpawnCreatureWave(int count,int liveCryptidIndex) {
         const auto world=World();
@@ -3157,6 +3220,9 @@ namespace {
             ApplyWorldGravity(a.value,a.amount!=0);
         else if(a.type==ActionType::SpawnMob)
             SpawnCreatureWave(a.amount,a.target);
+        else if(a.type==ActionType::SpawnSpecies)
+            SpawnSelectedClassWave(a.amount,a.target,
+                static_cast<int>(a.precise),a.value>0.5f);
         else if(a.type==ActionType::PossessCryptid || a.type==ActionType::RestoreHuman)
             PossessCreature(a.target,a.type==ActionType::RestoreHuman);
     }
@@ -3207,6 +3273,7 @@ namespace {
             a.type==ActionType::JumpBoost ||
             a.type==ActionType::GravityChange ||
             a.type==ActionType::SpawnMob ||
+            a.type==ActionType::SpawnSpecies ||
             a.type==ActionType::PossessCryptid ||
             a.type==ActionType::RestoreHuman) {
             ExecutePhysics(a); return;
@@ -3279,6 +3346,7 @@ namespace {
             case ActionType::JumpBoost:
             case ActionType::GravityChange:
             case ActionType::SpawnMob:
+            case ActionType::SpawnSpecies:
             case ActionType::PossessCryptid:
             case ActionType::RestoreHuman:
             case ActionType::MonsterAbility:
@@ -3558,6 +3626,13 @@ bool HunterNative::RequestGravity(float scale,bool lobby) {
 bool HunterNative::RequestSpawnMobWave(int amount,int selectedLiveCryptidIndex) {
     return amount>=1&&amount<=10 ?
         Enqueue({ActionType::SpawnMob,"",amount,0,selectedLiveCryptidIndex,0}):false;
+}
+bool HunterNative::RequestSpawnCryptidClass(int classObjectIndex,int count,
+                                            int mapSpawnerIndex,bool autoControl) {
+    if(classObjectIndex<0 || count<1 || count>10 || mapSpawnerIndex< -1)
+        return false;
+    return Enqueue({ActionType::SpawnSpecies,"",count,autoControl?1.f:0.f,
+                    classObjectIndex,static_cast<double>(mapSpawnerIndex)});
 }
 bool HunterNative::RequestPossessCryptid(int index) {
     return index>=0?Enqueue({ActionType::PossessCryptid,"",0,0,index,0}):false;
