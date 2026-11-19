@@ -309,7 +309,16 @@ namespace {
         // UObjects in one 16ms frame.
         int count=0;uintptr_t chunks=0;
         if(!GetObjects(count,chunks))return;
-        for(int n=0;n<600 && gSpawnClassScanCursor<count;++n,++gSpawnClassScanCursor) {
+        static ULONGLONG lastCatalogCycle=0;
+        const auto now=GetTickCount64();
+        if(gSpawnClassScanCursor>=count &&
+           now-lastCatalogCycle>12000) {
+            lastCatalogCycle=now;
+            gSpawnClassScanCursor=0;
+            // Already-discovered classes remain in the catalog, but their
+            // indices are checked again before a spawn is accepted.
+        }
+        for(int n=0;n<350 && gSpawnClassScanCursor<count;++n,++gSpawnClassScanCursor) {
             const int id=gSpawnClassScanCursor;
             const auto klass=ObjectAt(id,chunks);
             if(!klass)continue;
@@ -374,8 +383,10 @@ namespace {
             const auto name=Lower(ClassName(cls));
             // Class-name categories are heuristics. This supplements actual inheritance checks.
             // Exclude level-only trigger/volume components to reduce false markers.
-            if(Matches(name,{L"collision",L"trigger",L"volume",L"widget",L"component",L"preview"}))
+            if(Matches(name,{L"collision",L"trigger",L"volume",L"widget",L"component",L"preview"})) {
+                if(!name.empty())gKinds.emplace(cls,0);
                 return 0;
+            }
             if(Matches(name,{L"wolf",L"deer",L"bear",L"boar",L"animal",L"wildlife",L"npc",L"mob_",L"creature"}))
                 result=3;
             else if(Matches(name,{L"chest",L"crate",L"container",L"lootbox",L"loot_box",L"box_"}))
@@ -385,8 +396,11 @@ namespace {
             else if(Matches(name,{L"droppeditem",L"pickup",L"loot_",L"itemdrop",L"placeable",L"supply"}))
                 result=6;
         }
-        // Don't cache negative names. FNames may be unavailable while streaming new maps.
-        if(result) gKinds.emplace(cls,result);
+        // Once a UClass name resolves, its inherited class and heuristic
+        // category are stable until the world cache is invalidated. Caching
+        // non-cryptid classes too avoids repeated ancestry walks on every
+        // streamed-level scan and improves possession frame pacing.
+        if(result || !ClassName(cls).empty())gKinds.emplace(cls,result);
         return result;
     }
     bool GetObjects(int& count,uintptr_t& chunks) {
