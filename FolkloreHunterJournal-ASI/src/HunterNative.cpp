@@ -3441,6 +3441,39 @@ std::vector<HunterNative::CameraShakeInfo> HunterNative::GetCameraShakes() {
     std::lock_guard<std::mutex> lock(gMutex);
     return gCameraShakes;
 }
+std::vector<HunterNative::CryptidSpawnClass> HunterNative::GetSpawnableCryptidClasses() {
+    std::lock_guard<std::mutex> lock(gMutex);
+    return gSpawnClassCatalog;
+}
+std::vector<HunterNative::CryptidSpawnPoint> HunterNative::GetActiveMapSpawners() {
+    std::lock_guard<std::mutex> lock(gMutex);
+    return gSpawnPointCatalog;
+}
+HunterNative::CryptidCameraSettings HunterNative::GetCryptidCameraSettings() {
+    LoadPreferences();
+    return {gCryptidYawSensitivity.load(),gCryptidPitchSensitivity.load(),
+            gCryptidCameraFollow.load(),gCryptidInvertPitch.load()};
+}
+void HunterNative::SetCryptidCameraSettings(const CryptidCameraSettings& value) {
+    if(!std::isfinite(value.yawSensitivity) ||
+       !std::isfinite(value.pitchSensitivity) ||
+       !std::isfinite(value.followRate))return;
+    gCryptidYawSensitivity.store(std::clamp(value.yawSensitivity,.015f,.60f));
+    gCryptidPitchSensitivity.store(std::clamp(value.pitchSensitivity,.015f,.60f));
+    gCryptidCameraFollow.store(std::clamp(value.followRate,8.f,72.f));
+    gCryptidInvertPitch.store(value.invertPitch);
+    auto file=SettingsPath();
+    if(file.empty())return;
+    wchar_t buf[32]{};
+    swprintf_s(buf,L"%d",static_cast<int>(gCryptidYawSensitivity.load()*1000.f+.5f));
+    WritePrivateProfileStringW(L"CryptidCamera",L"YawMilli",buf,file.c_str());
+    swprintf_s(buf,L"%d",static_cast<int>(gCryptidPitchSensitivity.load()*1000.f+.5f));
+    WritePrivateProfileStringW(L"CryptidCamera",L"PitchMilli",buf,file.c_str());
+    swprintf_s(buf,L"%d",static_cast<int>(gCryptidCameraFollow.load()+.5f));
+    WritePrivateProfileStringW(L"CryptidCamera",L"FollowRate",buf,file.c_str());
+    WritePrivateProfileStringW(L"CryptidCamera",L"InvertPitch",
+        value.invertPitch?L"1":L"0",file.c_str());
+}
 std::vector<HunterNative::VanityItem> HunterNative::GetVanityItems() {
     std::lock_guard<std::mutex> lock(gMutex);
     std::vector<VanityItem> result;
