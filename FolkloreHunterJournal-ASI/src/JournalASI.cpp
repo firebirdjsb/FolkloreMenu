@@ -675,6 +675,44 @@ namespace {
     }
 }
 
+// Companion ABI: both DLLs export these routines. Exactly one module
+// owns Win32/DXGI hooks; the other accepts the shared ImGui context and
+// HWND without hooking either. The native engines stay module-private.
+extern "C" __declspec(dllexport) void FHJ_ModuleBridgeAttach(
+    void* context,HWND hwnd) {
+    if(!context || !hwnd)return;
+    ImGui::SetCurrentContext(static_cast<ImGuiContext*>(context));
+    HunterNative::AttachWindow(hwnd);
+}
+extern "C" __declspec(dllexport) void FHJ_ModuleBridgeFrame(
+    void* context,bool menuOpen) {
+    if(!context)return;
+    ImGui::SetCurrentContext(static_cast<ImGuiContext*>(context));
+    HunterNative::SetJournalOpen(menuOpen);
+    HunterNative::RequestTick();
+    HunterNative::DrawESP(ImGui::GetIO().DisplaySize);
+#ifdef FCH_STANDALONE
+    FHJ::DrawCryptidHuntLoadBanner();
+    HunterNative::DrawCryptidHuntDaylightVision(ImGui::GetIO().DisplaySize);
+#endif
+    HunterNative::DrawMonsterHUD(ImGui::GetIO().DisplaySize);
+    if(menuOpen)FHJ::DrawJournal();
+}
+extern "C" __declspec(dllexport) void FHJ_ModuleBridgeMessage(UINT message) {
+    if(message==HunterNative::kGameTick ||
+       message==HunterNative::kGameAction)
+        HunterNative::HandleWindowMessage(message);
+}
+extern "C" __declspec(dllexport) void FHJ_ModuleBridgeMouse(LPARAM input) {
+    HunterNative::FeedRawMouse(input);
+}
+extern "C" __declspec(dllexport) bool FHJ_ModuleBridgeMonsterActive() {
+    return HunterNative::MonsterModeActive();
+}
+extern "C" __declspec(dllexport) void FHJ_ModuleBridgeRestoreHuman() {
+    HunterNative::RequestRestoreHuman();
+}
+
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         gJournalModule = module;
