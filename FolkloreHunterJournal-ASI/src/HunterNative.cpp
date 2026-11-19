@@ -314,7 +314,11 @@ namespace {
         for (int depth=0;depth<24 && current;++depth) {
             const auto name=ClassName(current);
             if (name==L"PlayerCharacter_C") {result=1;break;}
-            if (name==L"BP_Cryptid_Base_C" || name==L"CryptidBase") {result=2;break;}
+            // SDK: Mothman is BP_FlyingPawnTest_C : APawn, not a
+            // BP_Cryptid_Base_C/ACryptidBase descendant. Treat it as a
+            // cryptid for the live roster/ESP/possession selection.
+            if (name==L"BP_Cryptid_Base_C" || name==L"CryptidBase" ||
+                name==L"BP_FlyingPawnTest_C") {result=2;break;}
             const auto parent=ReadPtr(current+0x40);
             if (!parent || parent==current)break;
             current=parent;
@@ -596,15 +600,22 @@ namespace {
                     creature.objectIndex=actor.index;
                     auto cls=ReadPtr(actor.address+0x10);
                     creature.isPawn=IsPawnClass(cls);
-                    // Reflected BP_Cryptid_Base_C::Health / MaxHealth (0x710 / 0x718).
-                    if(!Read(actor.address+0x710,creature.health) ||
-                       !std::isfinite(creature.health) || creature.health<0)
-                        creature.health=-1.0;
-                    if(!Read(actor.address+0x718,creature.maxHealth) ||
-                       !std::isfinite(creature.maxHealth) || creature.maxHealth<=0)
-                        creature.maxHealth=-1.0;
                     const auto name=ClassName(cls);
-                    creature.displayName=std::string(name.begin(),name.end());
+                    if(name==L"BP_FlyingPawnTest_C") {
+                        // This is the Mothman pawn from the exact SDK. Its
+                        // 0x710/0x718 bytes are NOT Health/MaxHealth.
+                        creature.health=-1.0;creature.maxHealth=-1.0;
+                        creature.displayName="Mothman [alive / HP unavailable]";
+                    } else {
+                        // Health only belongs to BP_Cryptid_Base_C-derived actors.
+                        if(!Read(actor.address+0x710,creature.health) ||
+                           !std::isfinite(creature.health) || creature.health<0)
+                            creature.health=-1.0;
+                        if(!Read(actor.address+0x718,creature.maxHealth) ||
+                           !std::isfinite(creature.maxHealth) || creature.maxHealth<=0)
+                            creature.maxHealth=-1.0;
+                        creature.displayName=std::string(name.begin(),name.end());
+                    }
                     creaturesOut.push_back(std::move(creature));
                 } else if(actor.kind==3) ++status.activeWildlife;
                 else if(actor.kind==4) ++status.activeContainers;
@@ -625,10 +636,13 @@ namespace {
                 if(distance>gMaxDistanceMeters.load()*100.0)continue;
                 double actorHealth=-1.0,actorMaxHealth=-1.0;
                 if(actor.kind==2) {
-                    if(!Read(actor.address+0x710,actorHealth) ||
-                       !std::isfinite(actorHealth) || actorHealth<0)actorHealth=-1.0;
-                    if(!Read(actor.address+0x718,actorMaxHealth) ||
-                       !std::isfinite(actorMaxHealth) || actorMaxHealth<=0)actorMaxHealth=-1.0;
+                    // Never read BP_Cryptid_Base health offsets from Mothman.
+                    if(ClassName(ReadPtr(actor.address+0x10))!=L"BP_FlyingPawnTest_C") {
+                        if(!Read(actor.address+0x710,actorHealth) ||
+                           !std::isfinite(actorHealth) || actorHealth<0)actorHealth=-1.0;
+                        if(!Read(actor.address+0x718,actorMaxHealth) ||
+                           !std::isfinite(actorMaxHealth) || actorMaxHealth<=0)actorMaxHealth=-1.0;
+                    }
                 } else if(actor.kind==1) {
                     if(!Read(actor.address+0x8A0,actorHealth) ||
                        !std::isfinite(actorHealth) || actorHealth<0)actorHealth=-1.0;
@@ -1515,7 +1529,6 @@ namespace {
             gMonsterHUD.cameraReady=gChaseCamera!=0;
             return;
         }
-        HunterNative::CreatureInfo dummy;
         std::string name;
         auto cls=ReadPtr(gMonsterPawn+0x10);
         auto wide=ClassName(cls);
@@ -1525,9 +1538,13 @@ namespace {
         if(lower.find(L"moth")!=std::wstring::npos || lower.find(L"flying")!=std::wstring::npos)species=1;
         else if(lower.find(L"vamp")!=std::wstring::npos)species=2;
         else if(lower.find(L"wend")!=std::wstring::npos)species=3;
-        double health=0,maxHealth=0;
-        Read(gMonsterPawn+0x710,health);
-        Read(gMonsterPawn+0x718,maxHealth);
+        double health=-1.0,maxHealth=-1.0;
+        // Mothman does not declare Health/MaxHealth at the base-cryptid
+        // offsets; health remains unknown rather than displaying garbage.
+        if(species!=1) {
+            Read(gMonsterPawn+0x710,health);
+            Read(gMonsterPawn+0x718,maxHealth);
+        }
         std::lock_guard<std::mutex> lock(gMonsterStatusMutex);
         gMonsterHUD.label=name.empty()?"UNKNOWN CRYPTID":name;
         gMonsterHUD.species=species;
@@ -2130,8 +2147,12 @@ namespace {
         const bool valid=gMonsterPawn &&
             Read(gMonsterPawn+0xC,liveId) && liveId==gMonsterIndex &&
             ReadPtr(gMonsterPawn+0x10)==gControlledCryptidClass;
-        const bool alive=valid && Read(gMonsterPawn+0x710,hp) &&
-            std::isfinite(hp) && hp>0;
+        const bool isMothman=ClassName(gControlledCryptidClass)==L"BP_FlyingPawnTest_C";
+        // BP_FlyingPawnTest_C derives from APawn, without the cryptid
+        // Health property. Its live UObject identity is evidence of presence;
+        // SDK does not establish a Mothman health/death contract.
+        const bool alive=valid && (isMothman ||
+            (Read(gMonsterPawn+0x710,hp) && std::isfinite(hp) && hp>0));
         if(alive) {
             if(gControlledRespawnStart>=0.0)RebindControlledCryptid(gMonsterPawn);
             else Position(gMonsterPawn,gControlledLastPosition);
@@ -2161,8 +2182,8 @@ namespace {
                     if(valid && actor==gMonsterPawn)continue;
                     if(gControlledExistingIds.count(id))continue;
                     double candidateHp=0.0;
-                    if(!Read(actor+0x710,candidateHp) ||
-                       !std::isfinite(candidateHp)||candidateHp<=0.0)continue;
+                    if(!isMothman && (!Read(actor+0x710,candidateHp) ||
+                       !std::isfinite(candidateHp)||candidateHp<=0.0))continue;
                     if(RebindControlledCryptid(actor))return true;
                 }
             }
