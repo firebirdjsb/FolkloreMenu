@@ -4724,6 +4724,57 @@ void HunterNative::DrawMonsterHUD(ImVec2 screen) {
 
 }
 
+int HunterNative::GetCryptidHuntNightState() {
+    return NativeHuntNightState();
+}
+void HunterNative::DrawCryptidHuntDaylightVision(ImVec2 screen) {
+#ifdef FCH_STANDALONE
+    if(!gMonsterActive.load() || NativeHuntNightState()!=0)return;
+    const auto species=MonsterSpecies();
+    if(species!=2 && species!=3)return;
+    // A local possession-camera rendering rule, NOT a replicated
+    // material or physics change. Night always restores clear vision.
+    // Vampire is nearly blinded by sunrise; Wendigo only mildly.
+    const int alpha=species==2?235:67;
+    const ImU32 veil=IM_COL32(241,232,190,alpha);
+    const auto viewport=ImGui::GetForegroundDrawList();
+    viewport->AddRectFilled({0,0},{screen.x,screen.y},veil);
+    viewport->AddText({screen.x*.5f-120.f,screen.y*.21f},
+         IM_COL32(52,40,30,255),
+         species==2?"SUNLIGHT: VAMPIRE BLINDED / ATTACKS LOCKED":
+                    "DAYLIGHT: WENDIGO VISION IMPAIRED");
+#else
+    (void)screen;
+#endif
+}
+bool HunterNative::RequestWendigoDeployCamera() {
+#ifdef FCH_STANDALONE
+    return IsControllingWendigo() &&
+        Enqueue({ActionType::WendigoPlaceCamera,"",0,0.f,-1,0.});
+#else
+    return false;
+#endif
+}
+bool HunterNative::RequestWendigoCycleCamera() {
+#ifdef FCH_STANDALONE
+    return IsControllingWendigo() &&
+        Enqueue({ActionType::WendigoCycleCamera,"",0,0.f,-1,0.});
+#else
+    return false;
+#endif
+}
+bool HunterNative::RequestWendigoExitCamera() {
+#ifdef FCH_STANDALONE
+    return IsControllingWendigo() &&
+        Enqueue({ActionType::WendigoCloseCamera,"",0,0.f,-1,0.});
+#else
+    return false;
+#endif
+}
+int HunterNative::WendigoCameraCount() {
+    return gWendigoWatchCount.load();
+}
+
 bool HunterNative::RequestMonsterAbility(int slot) {
     if(slot<0 || slot>5 || !gMonsterActive.load())return false;
     return Enqueue({ActionType::MonsterAbility,"",slot,0,-1,0});
