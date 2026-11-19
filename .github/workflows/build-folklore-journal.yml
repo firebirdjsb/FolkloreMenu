@@ -19,6 +19,9 @@ jobs:
       - name: Show toolchains
         shell: pwsh
         run: cmake --version
+      - name: Validate isolated save profile and rollback
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/Test-CryptidHunt-Isolation.ps1
       - name: Configure x64
         shell: pwsh
         run: cmake -S FolkloreHunterJournal-ASI -B FolkloreHunterJournal-ASI/build -G "Visual Studio 18 2026" -A x64
