@@ -5,12 +5,41 @@
 #include "HunterNative.h"
 #include <imgui.h>
 #include <algorithm>
+#include <cctype>
 #include <random>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
 namespace FHJ {
+void DrawCryptidHuntLoadBanner() {
+    // Always rendered, including the untouched game's MAIN MENU.
+    // This is a native ImGui overlay indicator, not an edit to the
+    // cooked menu UMG Blueprint or persistent SaveGame data.
+    const auto status=HunterNative::GetStatus();
+    const auto viewport=ImGui::GetIO().DisplaySize;
+    if(viewport.x<510 || viewport.y<250)return;
+    const bool selected=HunterNative::CryptidHuntOptedIn();
+    const ImVec2 tl{viewport.x-380.f,16.f};
+    const ImVec2 br{viewport.x-16.f,88.f};
+    auto draw=ImGui::GetForegroundDrawList();
+    draw->AddRectFilled(tl,br,IM_COL32(11,15,19,225),8.f);
+    draw->AddRect(tl,br,selected?
+        IM_COL32(166,62,53,245):IM_COL32(114,129,142,215),8.f,0,1.5f);
+    draw->AddText({tl.x+14.f,tl.y+9.f},
+        IM_COL32(231,218,191,255),"CRYPTID HUNT  |  MOD LOADED");
+    draw->AddText({tl.x+14.f,tl.y+29.f},
+        selected?IM_COL32(208,98,87,255):IM_COL32(169,180,190,255),
+        selected?"CUSTOM GAME MODE SELECTED":"NORMAL GAME / MOD INACTIVE");
+    const auto creature=status.isGameLobby?status.mapCryptid:
+        status.mapCryptid;
+    std::string label="F8: SELECT GAME MODE";
+    if(creature>0)
+        label+="  |  MAP: "+std::string(
+            HunterNative::CryptidHuntSpeciesName(creature));
+    draw->AddText({tl.x+14.f,tl.y+49.f},
+        IM_COL32(212,199,176,255),label.c_str());
+}
 void DrawJournal() {
     ImGui::SetNextWindowSize(ImVec2(750,690),ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowBgAlpha(.98f);
@@ -23,8 +52,28 @@ void DrawJournal() {
     const int phase=HunterNative::GetCryptidHuntNightState();
     ImGui::TextColored(ImVec4(.76f,.65f,.42f,1.f),
         "CRYPTID HUNT // SURVIVORS AGAINST THE NIGHT");
-    ImGui::Text("Host: %s | Hunt: %s",status.host?"YES":"CLIENT / UNKNOWN",
-                status.activeHuntName.empty()?"not in expedition":status.activeHuntName.c_str());
+    ImGui::SeparatorText("MAIN MENU / CUSTOM GAME MODE");
+    bool custom=HunterNative::CryptidHuntOptedIn();
+    if(ImGui::Checkbox("ENABLE CUSTOM CRYPTID HUNT FOR THIS SESSION",&custom))
+        HunterNative::SetCryptidHuntOptedIn(custom);
+    ImGui::TextWrapped(custom?
+        "MODE SELECTED: start/join a normal Folklore Hunter lobby. The host chooses the map using the existing lobby. The chosen map determines the cryptid.":
+        "NORMAL GAME: this ASI is loaded but its creature rules and possession are disabled. Enable Custom Cryptid Hunt above before starting a lobby.");
+    ImGui::TextDisabled("Mode choice is in memory only; resets OFF at every game launch.");
+    ImGui::TextDisabled("This ASI never changes selected contracts or calls SaveGame APIs.");
+    ImGui::TextDisabled("The base game may still write its normal save/progression data.");
+    ImGui::SeparatorText("STOCK LOBBY / MAP-LOCKED CREATURE");
+    ImGui::Text("Host: %s | State: %s",status.host?"YES":"CLIENT / UNKNOWN",
+        status.isGameLobby?"IN NORMAL LOBBY":
+        status.activeHuntName.empty()?"MAIN MENU / LOADING":"ACTIVE HUNT");
+    ImGui::Text("Lobby map: %s",status.selectedLobbyMap.empty()?
+        "(choose in normal host lobby)":status.selectedLobbyMap.c_str());
+    ImGui::Text("Running hunt: %s",status.activeHuntName.empty()?
+        "(not started)":status.activeHuntName.c_str());
+    ImGui::TextColored(ImVec4(.90f,.60f,.45f,1.f),
+        "MAP ASSIGNS: %s",HunterNative::CryptidHuntSpeciesName(status.mapCryptid));
+    ImGui::TextDisabled("Night of the Wendigo -> Wendigo | Bloodfang -> Vampire | Operation Blackwing -> Mothman.");
+    ImGui::TextDisabled("No map override, save edit, or cross-map creature swapping.");
     ImGui::TextColored(phase==1?ImVec4(.54f,.77f,1.f,1.f):
         phase==0?ImVec4(1.f,.76f,.37f,1.f):ImVec4(.67f,.67f,.67f,1.f),
         "DIRECTOR TIME: %s",phase==1?"NIGHT":phase==0?"DAY":"UNKNOWN (NO HOST DIRECTOR)");
@@ -56,7 +105,7 @@ void DrawJournal() {
             }
             ImGui::PopID();
         }
-        if(!status.host)ImGui::BeginDisabled();
+        if(!status.host || !custom || status.mapCryptid==0)ImGui::BeginDisabled();
         if(ImGui::Button("HOST: DRAW RANDOM CRYPTID PLAYER",ImVec2(-1,36))) {
             std::vector<HunterNative::PlayerInfo> pool;
             for(const auto& p:players)
@@ -72,7 +121,7 @@ void DrawJournal() {
                 selectedIsLocal=winner.local;
             }
         }
-        if(!status.host)ImGui::EndDisabled();
+        if(!status.host || !custom || status.mapCryptid==0)ImGui::EndDisabled();
         if(selectedPlayer>=0) {
             ImGui::TextColored(ImVec4(.90f,.67f,.30f,1.f),
                 "SELECTED CRYPTID PLAYER: %s",selectedPlayerName.c_str());
@@ -91,15 +140,27 @@ void DrawJournal() {
 
     const auto creatures=HunterNative::GetCreatures();
     static int selectedCreature=-1;
-    std::string creatureLabel="Select a live cryptid in this hunt";
+    std::string creatureLabel="Select a map-native cryptid in this hunt";
     bool playable=false;
+    auto speciesOf=[](std::string name) {
+        std::transform(name.begin(),name.end(),name.begin(),
+            [](unsigned char c){return static_cast<char>(std::tolower(c));});
+        if(name.find("wendigo")!=std::string::npos)return 3;
+        if(name.find("vampire")!=std::string::npos)return 2;
+        if(name.find("mothman")!=std::string::npos ||
+           name.find("flyingpawn")!=std::string::npos)return 1;
+        return 0;
+    };
     for(const auto& creature:creatures)
         if(creature.objectIndex==selectedCreature) {
             creatureLabel=creature.displayName;
-            playable=creature.isPawn;
+            playable=creature.isPawn &&
+                speciesOf(creature.displayName)==status.mapCryptid;
         }
     if(ImGui::BeginCombo("Live creature to control",creatureLabel.c_str())) {
         for(const auto& creature:creatures) {
+            if(!creature.isPawn ||
+               speciesOf(creature.displayName)!=status.mapCryptid)continue;
             ImGui::PushID(creature.objectIndex);
             if(ImGui::Selectable(creature.displayName.c_str(),
                                  selectedCreature==creature.objectIndex))
@@ -108,10 +169,12 @@ void DrawJournal() {
         }
         ImGui::EndCombo();
     }
-    if(!status.host || !playable || controlling)ImGui::BeginDisabled();
+    if(!status.host || !custom || status.isGameLobby ||
+       status.mapCryptid==0 || !playable || controlling)ImGui::BeginDisabled();
     if(ImGui::Button("HOST TEST: CONTROL SELECTED LIVE CRYPTID",ImVec2(-1,38)))
         HunterNative::RequestPossessCryptid(selectedCreature);
-    if(!status.host || !playable || controlling)ImGui::EndDisabled();
+    if(!status.host || !custom || status.isGameLobby ||
+       status.mapCryptid==0 || !playable || controlling)ImGui::EndDisabled();
     ImGui::SameLine();
     if(!controlling)ImGui::BeginDisabled();
     if(ImGui::Button("RETURN HUMAN (F11)"))
@@ -121,8 +184,12 @@ void DrawJournal() {
     if(ImGui::CollapsingHeader("WENDIGO // PRIVATE WATCH CAMERAS",
                              ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::TextDisabled("Place a private, native CameraActor watchpoint; no survivor camera feeds.");
-        ImGui::Text("Wendigo watchpoints: %d / 4",HunterNative::WendigoCameraCount());
-        const bool wendigo=controlling && HunterNative::MonsterSpecies()==3;
+        ImGui::Text("Wendigo watchpoints: %d / 4 | Remaining today: %d / 2",
+            HunterNative::WendigoCameraCount(),HunterNative::WendigoCameraDayRemaining());
+        ImGui::TextDisabled("Camera quota resets on native night -> day transition.");
+        ImGui::TextDisabled("Wendigo hides during placement for ~1.6 s, then reappears.");
+        const bool wendigo=custom && controlling &&
+            HunterNative::MonsterSpecies()==3 && status.mapCryptid==3;
         if(!wendigo)ImGui::BeginDisabled();
         if(ImGui::Button("PLACE WATCH CAMERA (C)"))
             HunterNative::RequestWendigoDeployCamera();
@@ -138,10 +205,10 @@ void DrawJournal() {
 
     if(ImGui::CollapsingHeader("DAYLIGHT / SPECIES RULES",
                              ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::TextWrapped("Wendigo: mildly impaired vision during Director daytime; full sight at night.");
-        ImGui::TextWrapped("Vampire: nearly blinded in sunlight; both LMB melee and Q scream are disabled during day, restored at night.");
-        ImGui::TextDisabled("Rules require the host's live Director.IsNight field.");
-        ImGui::TextDisabled("Missing Director state = no invented day/night state.");
+        ImGui::TextWrapped("Wendigo: cannot attack or use offensive abilities in daylight. Mild daytime visibility penalty, restored at night; may place up to two private watch cameras per day.");
+        ImGui::TextWrapped("Vampire: nearly blinded in sunlight; LMB melee and Q scream disabled in daytime, restored at night.");
+        ImGui::TextDisabled("Day/night uses the game state replicated IsNight (or host Director fallback).");
+        ImGui::TextDisabled("If phase is unknown, abilities are not falsely classified as day/night.");
     }
     if(ImGui::CollapsingHeader("POSSESSION CAMERA / LOCAL VISION")) {
         auto cam=HunterNative::GetCryptidCameraSettings();
