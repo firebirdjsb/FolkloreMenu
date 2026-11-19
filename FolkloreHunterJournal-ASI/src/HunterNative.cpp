@@ -2176,59 +2176,31 @@ namespace {
         FHJDiag::Log(L"GROUND CRYPTID: live BP_Cryptid_Base WalkSpeed/RunSpeed now drive native CharacterMovement and species locomotion.");
     }
     void PlayControlledMeleeAudio() {
-        // Prefer the creature's original Blueprint sound event when present.
-        // This keeps native spatial audio and animation timing if the event
-        // is independently callable with no parameters.
-        const auto event=NoArgCryptidAction({L"All_AttackSound",
-            L"AUTH_AttackSound",L"PlayAttackSound",L"AttackSound",
-            L"PlayMeleeSound",L"MeleeSound",L"PlayClawSound"});
-        // A manual asset override must be audible even if ProcessEvent
-        // returns success for a Blueprint sound event that plays nothing.
-        if(gMonsterAttackSoundIndex.load()<0 &&
-           event && Invoke(gMonsterPawn,event,nullptr))return;
-
-        // For classes without an exposed melee sound event, use a loaded
-        // cooked USoundBase through the local owning PlayerController RPC.
-        const auto play=FindFunction(L"PlayerController",L"ClientPlaySound");
-        const auto pc=gHumanInputController;
-        if(!pc || !play)return;
+        // Default: no additional audio. The creature's Server_Attack,
+        // Melee/DarknessAttack and montage/notifies own their animation
+        // and native sound cues. The previous filename-based auto matcher
+        // accidentally selected unrelated loaded weather/thunder effects
+        // for every species, so it MUST NOT choose audio automatically.
+        const int selected=gMonsterAttackSoundIndex.load();
+        if(selected<0)return;
+        // Optional explicit sound selection only, for diagnostics. This
+        // cannot fire by accident and never changes the native attack.
         int total=0;uintptr_t chunks=0;
-        if(!GetObjects(total,chunks))return;
-        int best=gMonsterAttackSoundIndex.load(),scoreBest=0;
-        bool explicitValid=false;
-        if(best>=0 && best<total) {
-            const auto chosen=ObjectAt(best,chunks);
-            explicitValid=chosen && IsSoundAssetClass(ReadPtr(chosen+0x10));
-        }
-        if(!explicitValid)best=-1;
-        for(const auto& info:gSoundCandidates) {
-            if(explicitValid)break;
-            const auto asset=ObjectAt(info.objectIndex,chunks);
-            if(!asset || !IsSoundAssetClass(ReadPtr(asset+0x10)))continue;
-            const auto label=Lower(std::wstring(info.displayName.begin(),info.displayName.end()));
-            int score=0;
-            if(Matches(label,{L"attack",L"melee",L"slash",L"claw",
-                              L"bite",L"swipe",L"swing",L"strike"}))score+=10;
-            if(Matches(label,{L"vamp",L"wendigo",L"mothman",L"cryptid"}))score+=3;
-            if(score>scoreBest){scoreBest=score;best=info.objectIndex;}
-        }
-        if(best<0) {
-            static ULONGLONG lastWarn=0;
-            const auto now=GetTickCount64();
-            if(now-lastWarn>10000) {
-                lastWarn=now;
-                FHJDiag::Log(L"CRYPTID ATTACK AUDIO: no loaded melee USoundBase or native attack-sound event; capture class-specific audio event from SDK.");
-            }
-            return;
-        }
-        const auto asset=ObjectAt(best,chunks);
+        if(!GetObjects(total,chunks) || selected>=total)return;
+        const auto asset=ObjectAt(selected,chunks);
+        if(!asset || !IsSoundAssetClass(ReadPtr(asset+0x10)))return;
+        const auto pc=gHumanInputController;
+        const auto play=FindFunction(L"PlayerController",L"ClientPlaySound");
+        if(!pc || !play)return;
+        uint16_t size=0;
+        if(!Read(play+0xB6,size) || size!=0x10)return;
         alignas(8) uint8_t args[0x10]{};
         constexpr float volume=1.f,pitch=1.f;
         std::memcpy(args,&asset,8);
         std::memcpy(args+8,&volume,4);
         std::memcpy(args+12,&pitch,4);
         if(!Invoke(pc,play,args))
-            FHJDiag::Log(L"CRYPTID ATTACK AUDIO: local ClientPlaySound dispatch failed.");
+            FHJDiag::Log(L"CRYPTID AUDIO: user-selected diagnostic sound failed; native attack remains unchanged.");
     }
     void ExecuteMonsterAbility(int slot) {
         if(slot<0 || slot>=static_cast<int>(gAbilityTicks.size()) ||
