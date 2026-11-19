@@ -49,26 +49,40 @@ jobs:
           THE HUNTER'S JOURNAL — Windows x64
           Admin tools, ESP, host creature spawning and general features.
           Possession/creature abilities are now removed from the Journal UI.
-          Install ONLY FolkloreHunterJournal.asi via the existing ASI loader.
-          DO NOT install FolkloreCryptidHunt.asi at the same time.
-          F8 Journal, F9 diagnostics, F10 console.
+          Install FolkloreHunterJournal.asi via the existing ASI loader.
+          Journal and Cryptid Hunt are separate DLLs; they can now be
+          loaded together using ONE shared DXGI/Win32 hook owner and
+          independently registered native update/render callbacks.
+          One may also be installed alone. F8 opens both panels when
+          both are present. F9 diagnostics, F10 console.
           '@ | Set-Content dist/FolkloreHunterJournal/README.txt
           @'
-          FOLKLORE CRYPTID HUNT — Windows x64, experimental mode v0.1
-          Standalone native possession mode, species rules and private
+          FOLKLORE CRYPTID HUNT — Windows x64, experimental mode v0.2
+          Standalone session-only custom mode, species rules and private
           Wendigo CameraActor watchpoints. Own F8 game-mode menu and F11 return.
-          Host-only Director.IsNight daytime rules: Vampire basic melee locked,
-          severe local daytime glare; Wendigo mild glare only in daytime.
+          Native replicated FL_Gamestate.IsNight day/night rules:
+          Vampire daytime melee/scream locked and severe local glare.
+          Wendigo daytime attacks locked and mild local glare.
+          Wendigo has 2 watch-camera deployments per in-game day,
+          4 active max, and briefly hides when placing a camera.
           Vampire other skill effects and remote player role handoff need testing.
           C deploy Wendigo watchpoint, V cycle (includes chase view).
           Host can randomly draw a selected participating player in local UI,
           but remote-client join/ready messaging and remote possession
           are NOT networked. Do not misrepresent this as a ready PvP mode.
-          Install ONLY FolkloreCryptidHunt.asi via the existing ASI loader.
-          DO NOT install FolkloreHunterJournal.asi simultaneously.
-          Do NOT install both .asi and a renamed .dll copy together.
+          Install FolkloreCryptidHunt.asi via the existing ASI loader.
+          May coexist with FolkloreHunterJournal.asi: only the first
+          ASI hooks DXGI/Win32, second uses exported bridge callbacks.
+          Do NOT copy both an ASI and renamed DLL of the same mod.
+          The native MAIN MENU gets a CRYPTID HUNT LOADED badge;
+          F8 selects the custom mode for THIS SESSION only (OFF on launch).
+          Use the game's normal create/join lobby and choose map there:
+          Night of the Wendigo -> Wendigo; Bloodfang -> Vampire;
+          Operation Blackwing -> Mothman.
+          No SaveGame APIs or chosen contract overrides in this module.
+          The base game can still write its normal progress and saves.
           Camera settings: %LOCALAPPDATA%\FolkloreCryptidHunt\cryptid-hunt.ini.
-          F8 mode panel, F9 diagnostics, F11 return human.
+          F8 mode panels, F9 diagnostics, F11 return human.
           This is an experimental private-game development candidate.
           '@ | Set-Content dist/FolkloreCryptidHunt/README.txt
       - name: Upload Journal
