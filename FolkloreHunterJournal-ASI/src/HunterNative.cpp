@@ -240,6 +240,7 @@ namespace {
     // this is NOT a custom network message and does not imply client readiness.
     std::atomic_bool gClientRoleActive{false},gClientRolePaused{false};
     std::atomic_int gClientRoleSpecies{0};
+    std::atomic<double> gClientRoleHealth{-1.0},gClientRoleMaxHealth{-1.0};
     uintptr_t gClientRolePawn=0;
     int32_t gClientRoleIndex=-1;
     bool gClientRoleAttackHeld=false,gClientRoleJumpHeld=false;
@@ -763,6 +764,7 @@ namespace {
             gNativeRolePlayerId.store(-1);gNativeRoleCryptidId.store(-1);
             gClientRoleActive.store(false);gClientRolePaused.store(false);
             gClientRoleSpecies.store(0);gClientRolePawn=0;gClientRoleIndex=-1;
+            gClientRoleHealth.store(-1.0);gClientRoleMaxHealth.store(-1.0);
             gClientRoleAttackHeld=false;gClientRoleJumpHeld=false;
 #endif
             gWendigoCamerasUsedToday=0;
@@ -2952,6 +2954,7 @@ namespace {
             if(gClientRoleActive.exchange(false))
                 FHJDiag::Log(L"CRYPTID CLIENT: native owning pawn no longer matches this hunt. Released local cryptid input bridge.");
             gClientRoleSpecies.store(0);gClientRolePawn=0;gClientRoleIndex=-1;
+            gClientRoleHealth.store(-1.0);gClientRoleMaxHealth.store(-1.0);
             gClientRolePaused.store(false);
             gClientRoleAttackHeld=false;gClientRoleJumpHeld=false;
             return;
@@ -2968,6 +2971,14 @@ namespace {
         if(gClientRolePaused.load() || gJournalOpen.load() ||
            !gWindow || GetForegroundWindow()!=gWindow)return;
         const int species=gClientRoleSpecies.load();
+        if(species==1) {
+            gClientRoleHealth.store(-1.0);gClientRoleMaxHealth.store(-1.0);
+        } else {
+            double hp=-1.0,maxHp=-1.0;
+            if(!Read(pawn+0x710,hp) || !std::isfinite(hp) || hp<0)hp=-1.0;
+            if(!Read(pawn+0x718,maxHp) || !std::isfinite(maxHp) || maxHp<=0)maxHp=-1.0;
+            gClientRoleHealth.store(hp);gClientRoleMaxHealth.store(maxHp);
+        }
         auto down=[](int vk)->bool {
             return (GetAsyncKeyState(vk)&0x8000)!=0;
         };
@@ -5221,6 +5232,37 @@ void HunterNative::FeedRawMouse(LPARAM lParam) {
     if(gMonsterYaw< -180.0)gMonsterYaw+=360.0;
 }
 void HunterNative::DrawMonsterHUD(ImVec2 screen) {
+#ifdef FCH_STANDALONE
+    if(!gMonsterActive.load() && gClientRoleActive.load()) {
+        const int species=gClientRoleSpecies.load();
+        const bool paused=gClientRolePaused.load();
+        const auto draw=ImGui::GetForegroundDrawList();
+        const ImU32 accent=species==1?IM_COL32(129,169,236,255):
+            species==2?IM_COL32(220,80,88,255):IM_COL32(194,223,173,255);
+        const ImVec2 end{std::min(screen.x-14.f,570.f),118.f};
+        if(end.x<220.f)return;
+        draw->AddRectFilled({14.f,14.f},end,IM_COL32(10,16,17,234),7.f);
+        draw->AddRect({14.f,14.f},end,accent,7.f,0,1.4f);
+        draw->AddText({26.f,24.f},accent,
+            species==1?"REMOTE MOTHMAN / NATIVE OWNER":
+            species==2?"REMOTE VAMPIRE / NATIVE OWNER":
+                       "REMOTE WENDIGO / NATIVE OWNER");
+        draw->AddText({26.f,45.f},IM_COL32(225,211,186,255),
+            paused?"INPUT PAUSED - F8 TO RESUME":
+            species==1?"FLIGHT INPUT UNVERIFIED - HOST MUST RESTORE HUMAN":
+                "WASD MOVE / SPACE JUMP / LMB SERVER ATTACK (EXPERIMENTAL)");
+        char info[180]{};
+        const double hp=gClientRoleHealth.load();
+        const double maxHp=gClientRoleMaxHealth.load();
+        if(species!=1 && hp>=0 && maxHp>0)
+            snprintf(info,sizeof(info),"HP %.0f / %.0f  |  F11 PAUSE INPUT  |  HOST RETURNS HUMAN",hp,maxHp);
+        else snprintf(info,sizeof(info),"HP UNKNOWN  |  F11 PAUSE INPUT  |  HOST RETURNS HUMAN");
+        draw->AddText({26.f,67.f},IM_COL32(216,224,214,255),info);
+        draw->AddText({26.f,89.f},IM_COL32(177,183,177,255),
+            "Owned RPC and movement visibility require a second-client test.");
+        return;
+    }
+#endif
     if(!gMonsterActive.load())return;
     MonsterHUDState snap{};
     {
