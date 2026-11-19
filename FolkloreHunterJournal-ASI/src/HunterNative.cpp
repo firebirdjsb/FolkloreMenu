@@ -3110,6 +3110,38 @@ namespace {
                 L"World gravity changed locally; remote players not targeted.");
         } else FHJDiag::Log(L"WorldGravityZ update failed.");
     }
+    bool VerifyAndInitializeSpawnedCryptid(uintptr_t spawned,uintptr_t wantedClass) {
+        if(!spawned || ReadPtr(spawned+0x10)!=wantedClass)return false;
+        const bool isMothman=ClassName(wantedClass)==L"BP_FlyingPawnTest_C";
+        const auto mesh=ReadPtr(spawned+(isMothman?0x3D0:0x328));
+        // Engine.USkinnedMeshComponent::SkeletalMesh and SkinnedAsset are
+        // +0x520 and +0x528. Engine.USkeletalMeshComponent::AnimClass is
+        // +0x898; an AnimScriptInstance is +0x8A0. Don't report success
+        // for a bare APawn with no cooked model or animation.
+        const bool hasMesh=mesh &&
+            (ReadPtr(mesh+0x520) || ReadPtr(mesh+0x528));
+        const bool hasAnimation=mesh &&
+            (ReadPtr(mesh+0x898) || ReadPtr(mesh+0x8A0));
+        if(!hasMesh || !hasAnimation) {
+            FHJDiag::Log(L"CRYPTID SPAWN: rejected missing skeletal mesh or AnimBlueprint. Species resources are not loaded in this map.");
+            return false;
+        }
+        auto controller=ReadPtr(spawned+0x2D8);
+        if(!controller && ReadPtr(spawned+0x2C0)) {
+            const auto createAI=FindFunction(L"Pawn",L"SpawnDefaultController");
+            uint16_t parms=0;
+            if(createAI && Read(createAI+0xB6,parms) && parms==0)
+                Invoke(spawned,createAI,nullptr);
+            controller=ReadPtr(spawned+0x2D8);
+        }
+        if(!controller) {
+            FHJDiag::Log(L"CRYPTID SPAWN: rejected actor with no AIController after native SpawnDefaultController; map prerequisites may be unloaded.");
+            return false;
+        }
+        // No claim of multiplayer replication merely because the model
+        // and AI pointers exist locally; validate remotely in a private hunt.
+        return true;
+    }
     bool SpawnNativeCryptid(uintptr_t spawner,uintptr_t species,int ordinal,
                              int* createdObjectId=nullptr) {
         if(!spawner || !species || ClassKind(species)!=2 || !IsPawnClass(species))
@@ -3147,6 +3179,13 @@ namespace {
         int32_t id=-1;
         if(returned && Read(returned+0x0C,id) && id>=0 &&
            ClassKind(ReadPtr(returned+0x10))==2) {
+            if(!VerifyAndInitializeSpawnedCryptid(returned,species)) {
+                // Avoid leaving an invisible model-less or controller-less
+                // actor behind; it cannot be safely possessed.
+                const auto destroy=FindFunction(L"Actor",L"K2_DestroyActor");
+                if(destroy)Invoke(returned,destroy,nullptr);
+                return false;
+            }
             if(gKnown.size()<400 &&
                std::none_of(gKnown.begin(),gKnown.end(),
                    [returned](const ActorEntry& e){return e.address==returned;}))
@@ -3230,18 +3269,20 @@ namespace {
                                                &createdId);
         bool dispatched=created;
         if(!created && !spawners.empty()) {
-            // Fall back to the map spawner only if we can ensure it is
-            // configured to spawn exactly the requested species.
-            const auto trigger=FindFunction(L"BP_MobSpawner_C",L"TriggerSpawn");
             const auto original=ReadPtr(anchor+0x2B8);
-            const bool needsSwap=original!=species;
-            const bool canSwap=!needsSwap || TryWrite(anchor+0x2B8,species);
-            if(trigger && canSwap) {
-                alignas(8) uint8_t args[0xA0]{};
-                dispatched=Invoke(anchor,trigger,args);
+            if(original==species) {
+                // Only the map's own species can use the native TriggerSpawn
+                // fallback. Its Blueprint graph can override MobClass when
+                // handling cross-map requests, spawning an invisible/default
+                // creature; never report that as the requested species.
+                const auto trigger=FindFunction(L"BP_MobSpawner_C",L"TriggerSpawn");
+                if(trigger) {
+                    alignas(8) uint8_t args[0xA0]{};
+                    dispatched=Invoke(anchor,trigger,args);
+                }
+            } else {
+                FHJDiag::Log(L"CRYPTID SPAWN: selected off-map class failed model/AI verification; refused TriggerSpawn fallback to prevent default or invisible actor.");
             }
-            if(needsSwap && canSwap && !TryWrite(anchor+0x2B8,original))
-                FHJDiag::Log(L"CRYPTID SPAWN WARNING: original map spawner MobClass could not be restored.");
         }
         if(!dispatched) {
             FHJDiag::Log(L"CRYPTID SPAWN: native deferred spawn and map spawner dispatch failed; stopping wave.");
