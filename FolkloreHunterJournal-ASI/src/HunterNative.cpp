@@ -129,6 +129,20 @@ namespace {
     float gMonsterNativeWalkSpeed=0.f, gMonsterNativeRunSpeed=0.f;
     bool gMonsterSpeedsSaved=false;
     bool gMonsterModeSaved=false;
+    struct GroundMovementSettings {
+        bool saved=false;
+        uintptr_t pawn=0,movement=0;
+        int32_t pawnId=-1;
+        uint8_t rotationBefore=0,pathBefore=0,pawnYawBefore=0;
+    } gGroundMovementSettings;
+    struct GroundMovementDrive {
+        uintptr_t pawn=0;
+        int32_t pawnId=-1;
+        bool useNavFallback=false;
+        bool sampleValid=false;
+        Vec3 samplePosition{};
+        ULONGLONG sampleAt=0;
+    } gGroundDrive;
     bool gMonsterFlightActive=false;
     bool gGroundJumpHeld=false;
     // AI path following accepts movement for AI-possessed cryptids; a regular
@@ -664,6 +678,8 @@ namespace {
             gMonsterIndex=-1;gCameraIndex=-1;gLastMotionTick=0;
             gMonsterAIController=0;gMonsterBrain=0;gMonsterBrainWasRunning=false;
             gMonsterMovement=0;gMonsterSpeedsSaved=false;gPuppeteering=false;
+            gGroundMovementSettings=GroundMovementSettings{};
+            gGroundDrive=GroundMovementDrive{};
             gMonsterPathActive=false;gMonsterLastMoveRequest=0;
             gMonsterFunctions.clear();
             gVampireVerify=VampireInvisibilityVerification{};
@@ -2379,7 +2395,98 @@ namespace {
         return std::string(key)+" "+name;
     }
 
+    void RestoreGroundMovementSettings() {
+        const auto backup=gGroundMovementSettings;
+        gGroundMovementSettings=GroundMovementSettings{};
+        gGroundDrive=GroundMovementDrive{};
+        if(!backup.saved || !backup.pawn || !backup.movement)return;
+        int32_t id=-1;
+        if(!Read(backup.pawn+0xC,id) || id!=backup.pawnId ||
+           ReadPtr(backup.pawn+0x330)!=backup.movement)return;
+        uint8_t rotation=0,path=0,yaw=0;
+        if(Read(backup.movement+0x2D8,rotation)) {
+            // CharacterMovement: orient-to-velocity bit 4;
+            // use-controller-desired-yaw bit 3.
+            const uint8_t bits=static_cast<uint8_t>(0x18);
+            const uint8_t restored=static_cast<uint8_t>(
+                (rotation&~bits) | (backup.rotationBefore&bits));
+            TryWrite(backup.movement+0x2D8,restored);
+        }
+        if(Read(backup.movement+0x546,path)) {
+            // bRequestedMoveUseAcceleration bit 6.
+            const uint8_t restored=static_cast<uint8_t>(
+                (path&~0x40) | (backup.pathBefore&0x40));
+            TryWrite(backup.movement+0x546,restored);
+        }
+        if(Read(backup.pawn+0x2B0,yaw)) {
+            // APawn::bUseControllerRotationYaw bit 1.
+            const uint8_t restored=static_cast<uint8_t>(
+                (yaw&~0x02) | (backup.pawnYawBefore&0x02));
+            TryWrite(backup.pawn+0x2B0,restored);
+        }
+        FHJDiag::Log(L"GROUND CRYPTID: restored original native movement orientation/acceleration flags.");
+    }
+    void EnableGroundMovementSettings() {
+        if(!gMonsterPawn || !gMonsterMovement)return;
+        uint8_t turn=0,path=0,yaw=0;
+        int32_t id=-1;
+        if(!Read(gMonsterPawn+0xC,id) ||
+           !Read(gMonsterMovement+0x2D8,turn) ||
+           !Read(gMonsterMovement+0x546,path) ||
+           !Read(gMonsterPawn+0x2B0,yaw))return;
+        gGroundMovementSettings={true,gMonsterPawn,gMonsterMovement,id,turn,path,yaw};
+        // Native CharacterMovement now rotates in the velocity direction,
+        // accelerates into nav moves, and does not snap to controller yaw.
+        const uint8_t newTurn=static_cast<uint8_t>((turn|0x10)&~0x08);
+        const uint8_t newPath=static_cast<uint8_t>(path|0x40);
+        const uint8_t newYaw=static_cast<uint8_t>(yaw&~0x02);
+        TryWrite(gMonsterMovement+0x2D8,newTurn);
+        TryWrite(gMonsterMovement+0x546,newPath);
+        TryWrite(gMonsterPawn+0x2B0,newYaw);
+        FHJDiag::Log(L"GROUND CRYPTID: native orient-to-velocity and acceleration-based movement enabled.");
+    }
+    // AI pathing is useful where NPC movement input is intentionally
+    // ignored, but its repeated path requests make manual WASD feel
+    // delayed. Try UE CharacterMovement input first, then switch to
+    // native AI navigation only if the actor genuinely remains stuck.
+    void DriveGroundCryptid(const Vec3& desired,bool boost,ULONGLONG now) {
+        int32_t id=-1;
+        Vec3 position{};
+        if(!gMonsterPawn || !Read(gMonsterPawn+0xC,id) ||
+           !Position(gMonsterPawn,position))return;
+        if(gGroundDrive.pawn!=gMonsterPawn || gGroundDrive.pawnId!=id) {
+            gGroundDrive=GroundMovementDrive{};
+            gGroundDrive.pawn=gMonsterPawn;
+            gGroundDrive.pawnId=id;
+        }
+        if(!gGroundDrive.sampleValid) {
+            gGroundDrive.sampleValid=true;
+            gGroundDrive.sampleAt=now;
+            gGroundDrive.samplePosition=position;
+        }
+        if(!gGroundDrive.useNavFallback) {
+            StopCryptidPath();
+            const bool invoked=AddSmoothMovement(gMonsterPawn,desired,1.f);
+            if(!invoked) {
+                gGroundDrive.useNavFallback=true;
+                FHJDiag::Log(L"GROUND CRYPTID: native movement input unavailable; using AI navigation fallback.");
+            } else if(now-gGroundDrive.sampleAt>=480) {
+                const double movement=std::hypot(
+                    position.x-gGroundDrive.samplePosition.x,
+                    position.y-gGroundDrive.samplePosition.y);
+                if(movement<5.0) {
+                    gGroundDrive.useNavFallback=true;
+                    FHJDiag::Log(L"GROUND CRYPTID: movement input was accepted but character stayed stationary; switching to game AI path following.");
+                }
+                gGroundDrive.sampleAt=now;
+                gGroundDrive.samplePosition=position;
+            }
+        }
+        if(gGroundDrive.useNavFallback)
+            MoveCryptidWithAI(desired,now);
+    }
     void RestoreMonsterAI() {
+        RestoreGroundMovementSettings();
         gVampireVerify=VampireInvisibilityVerification{};
         int32_t actorId=-1;
         const bool actorLive=gMonsterPawn &&
@@ -2415,6 +2522,8 @@ namespace {
         gMonsterBrain=0;gMonsterAIController=0;gMonsterBrainWasRunning=false;
     }
     void ConfigureMonsterMovement() {
+        gGroundMovementSettings=GroundMovementSettings{};
+        gGroundDrive=GroundMovementDrive{};
         gMothFlight=NativeMothmanFlight{};
         if(ClassName(ReadPtr(gMonsterPawn+0x10))==L"BP_FlyingPawnTest_C") {
             // The exact SDK says Mothman is APawn; its 0x330 is a
@@ -2456,6 +2565,7 @@ namespace {
             gMonsterNativeRunSpeed=static_cast<float>(naturalRun);
         else gMonsterNativeRunSpeed=gMonsterNativeWalkSpeed*1.45f;
         TryWrite(gMonsterMovement+0x268,gMonsterNativeWalkSpeed);
+        EnableGroundMovementSettings();
         FHJDiag::Log(L"GROUND CRYPTID: live BP_Cryptid_Base WalkSpeed/RunSpeed now drive native CharacterMovement and species locomotion.");
     }
     void PlayControlledMeleeAudio() {
@@ -3020,21 +3130,14 @@ namespace {
                 const double lenXY=std::hypot(horizontal.x,horizontal.y);
                 if(lenXY>1e-3) {
                     horizontal.x/=lenXY;horizontal.y/=lenXY;
-                    if(!MoveCryptidWithAI(horizontal,now)) {
-                        // SDK-verified APawn::AddMovementInput(FVector,
-                        // float, bool): UE's CharacterMovement performs
-                        // collision, speed and animation updates. Never
-                        // teleport a grounded cryptid as an AI fallback,
-                        // which causes foot sliding, jitter, and snapping.
-                        if(!AddSmoothMovement(pawn,horizontal,boost?1.f:.70f)) {
-                            static ULONGLONG lastNativeMoveWarn=0;
-                            if(now-lastNativeMoveWarn>5000) {
-                                lastNativeMoveWarn=now;
-                                FHJDiag::Log(L"GROUND CRYPTID: both native AI MoveToLocation and Pawn.AddMovementInput rejected; leaving physics intact instead of teleporting.");
-                            }
-                        }
-                    }
-                } else StopCryptidPath();
+                    DriveGroundCryptid(horizontal,boost,now);
+                } else {
+                    StopCryptidPath();
+                    // On release, try direct native input again rather
+                    // than being locked in navigation fallback forever.
+                    gGroundDrive.sampleValid=false;
+                    gGroundDrive.useNavFallback=false;
+                }
             }
         }
         const auto movement=monster && species==1 ? 0 : ReadPtr(pawn+0x330);
