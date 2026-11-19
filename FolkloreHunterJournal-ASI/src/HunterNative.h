@@ -54,6 +54,7 @@ namespace HunterNative {
         bool worldReady = false;
         bool host = false;
         bool cameraReady = false;
+        std::string activeHuntName;
         double localHealth = -1.0;
         double localMaxHealth = -1.0;
         bool invuln = false;
@@ -132,6 +133,7 @@ namespace HunterNative {
     bool RequestGiveItem(const std::string& itemName, int amount);
     bool RequestGodMode();
     bool RequestAddXP(int xp);
+    bool RequestAddLevels(int levels);
     bool RequestTime(float hour);
     bool RequestTimeScale(float scale);
     bool RequestAddSilver(int amount);
