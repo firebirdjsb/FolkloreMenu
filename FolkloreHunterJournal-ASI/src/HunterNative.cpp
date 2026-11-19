@@ -535,7 +535,14 @@ namespace {
     std::wstring SettingsPath() {
         wchar_t path[MAX_PATH]{};
         DWORD n=GetEnvironmentVariableW(L"LOCALAPPDATA",path,MAX_PATH);
-        return n&&n<MAX_PATH ? std::wstring(path)+L"\\FolkloreHunterJournal\\journal.ini" : std::wstring();
+        if(!n || n>=MAX_PATH)return {};
+#ifdef FCH_STANDALONE
+        const auto folder=std::wstring(path)+L"\\FolkloreCryptidHunt";
+        CreateDirectoryW(folder.c_str(),nullptr);
+        return folder+L"\\cryptid-hunt.ini";
+#else
+        return std::wstring(path)+L"\\FolkloreHunterJournal\\journal.ini";
+#endif
     }
     void LoadPreferences() {
         std::call_once(gEspPrefsOnce, [] {
