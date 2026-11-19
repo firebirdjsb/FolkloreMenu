@@ -39,7 +39,7 @@ namespace {
     struct Camera { Vec3 pos{}; Rot rot{}; float fov{}; };
     struct ActorEntry { uintptr_t address{}; int index{}; int kind{}; };
     struct LevelView { uintptr_t data{}; int32_t count{}; int32_t start{}; };
-    enum class ActionType { GiveItem, CatalogItem, GodMode, AddXP, AddLevels, Time, TimeScale, AddSilver, InfiniteDamage, BeanMode, RangerMode, SmoreMode, Rain, Snow, ClearWeather, VampireScream, FlickerLights, CancelFlicker, TargetHealth, TargetItem, TargetNoise, TargetRevive, TargetKill, TargetKick, TargetGodMode, TargetSound, TargetCameraShake, NoclipOn, NoclipOff, FallProtection, SpeedChange, JumpBoost, GravityChange, SpawnMob, SpawnSpecies, PossessCryptid, RestoreHuman, MonsterAbility, EquipVanity };
+    enum class ActionType { GiveItem, CatalogItem, GodMode, AddXP, AddLevels, Time, TimeScale, AddSilver, InfiniteDamage, BeanMode, RangerMode, SmoreMode, Rain, Snow, ClearWeather, VampireScream, FlickerLights, CancelFlicker, TargetHealth, TargetItem, TargetNoise, TargetRevive, TargetKill, TargetKick, TargetGodMode, TargetSound, TargetCameraShake, NoclipOn, NoclipOff, FallProtection, SpeedChange, JumpBoost, GravityChange, SpawnMob, SpawnSpecies, SpawnerToggle, PossessCryptid, RestoreHuman, MonsterAbility, EquipVanity };
     struct Action { ActionType type{}; std::string item; int amount{}; float value{}; int target{-1}; double precise{}; };
     std::mutex gMutex;
     std::mutex gActionsMutex;
@@ -3092,6 +3092,30 @@ namespace {
             PossessCreature(createdId,false);
         }
     }
+    void SetNativeMapSpawnerEnabled(int spawnerIndex,bool enabled) {
+        if(!ReadPtr(World()+0x158) || spawnerIndex<0)return;
+        for(const auto& actor:gKnownSpawners) {
+            if(actor.index!=spawnerIndex)continue;
+            int32_t id=-1;
+            if(!Read(actor.address+0x0C,id) || id!=spawnerIndex ||
+               ClassName(ReadPtr(actor.address+0x10))!=L"BP_MobSpawner_C")
+                break;
+            const auto fn=FindFunction(L"BP_MobSpawner_C",L"SetSpawningEnabled");
+            if(!fn)break;
+            alignas(8) uint8_t args[0x40]{};
+            args[0]=enabled?1:0; // SDK native first bool parameter
+            if(!Invoke(actor.address,fn,args))break;
+            bool active=false;
+            if(Read(actor.address+0x308,active) && active==enabled)
+                FHJDiag::Log(enabled?
+                    L"MAP SPAWNER: SetSpawningEnabled(true) reflected state confirmed.":
+                    L"MAP SPAWNER: SetSpawningEnabled(false) reflected state confirmed.");
+            else
+                FHJDiag::Log(L"MAP SPAWNER: native toggle dispatched but state change not confirmed.");
+            return;
+        }
+        FHJDiag::Log(L"MAP SPAWNER: selected live map spawner or native method not found.");
+    }
     void SpawnSelectedClassWave(int count,int classObjectIndex,
                                  int mapSpawnerIndex,bool autoControl) {
         if(!ReadPtr(World()+0x158) || count<1 || count>10 || classObjectIndex<0)
@@ -3227,6 +3251,8 @@ namespace {
         else if(a.type==ActionType::SpawnSpecies)
             SpawnSelectedClassWave(a.amount,a.target,
                 static_cast<int>(a.precise),a.value>0.5f);
+        else if(a.type==ActionType::SpawnerToggle)
+            SetNativeMapSpawnerEnabled(a.target,a.amount!=0);
         else if(a.type==ActionType::PossessCryptid || a.type==ActionType::RestoreHuman)
             PossessCreature(a.target,a.type==ActionType::RestoreHuman);
     }
@@ -3278,6 +3304,7 @@ namespace {
             a.type==ActionType::GravityChange ||
             a.type==ActionType::SpawnMob ||
             a.type==ActionType::SpawnSpecies ||
+            a.type==ActionType::SpawnerToggle ||
             a.type==ActionType::PossessCryptid ||
             a.type==ActionType::RestoreHuman) {
             ExecutePhysics(a); return;
@@ -3352,6 +3379,7 @@ namespace {
             case ActionType::GravityChange:
             case ActionType::SpawnMob:
             case ActionType::SpawnSpecies:
+            case ActionType::SpawnerToggle:
             case ActionType::PossessCryptid:
             case ActionType::RestoreHuman:
             case ActionType::MonsterAbility:
@@ -3675,6 +3703,10 @@ bool HunterNative::RequestSpawnCryptidClass(int classObjectIndex,int count,
         return false;
     return Enqueue({ActionType::SpawnSpecies,"",count,autoControl?1.f:0.f,
                     classObjectIndex,static_cast<double>(mapSpawnerIndex)});
+}
+bool HunterNative::RequestSetMapSpawnerEnabled(int mapSpawnerIndex,bool enabled) {
+    return mapSpawnerIndex>=0 ?
+        Enqueue({ActionType::SpawnerToggle,"",enabled?1:0,0.f,mapSpawnerIndex,0}):false;
 }
 bool HunterNative::RequestPossessCryptid(int index) {
     return index>=0?Enqueue({ActionType::PossessCryptid,"",0,0,index,0}):false;
