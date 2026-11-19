@@ -123,6 +123,11 @@ namespace {
     ULONGLONG gMonsterLastMoveRequest=0;
     bool gMonsterPathActive=false;
     double gMonsterMoveDirX=0.0,gMonsterMoveDirY=0.0;
+    Vec3 gMonsterMoveGoal{};
+    std::atomic<float> gCryptidYawSensitivity{0.12f};
+    std::atomic<float> gCryptidPitchSensitivity{0.12f};
+    std::atomic<float> gCryptidCameraFollow{32.0f};
+    std::atomic_bool gCryptidInvertPitch{false};
     std::unordered_map<std::wstring,uintptr_t> gMonsterFunctions;
     ULONGLONG gLastCreatureMethodWarning=0;
     uint8_t gMonsterPriorMovement=1;
@@ -393,6 +398,15 @@ namespace {
             gLoot.store(GetPrivateProfileIntW(L"ESP",L"Loot",1,f.c_str())!=0);
             gMaxDistanceMeters.store(std::clamp(static_cast<int>(
                 GetPrivateProfileIntW(L"ESP",L"MaxMeters",350,f.c_str())),25,750));
+            gCryptidYawSensitivity.store(std::clamp(
+                GetPrivateProfileIntW(L"CryptidCamera",L"YawMilli",120,f.c_str())*.001f,.015f,.60f));
+            gCryptidPitchSensitivity.store(std::clamp(
+                GetPrivateProfileIntW(L"CryptidCamera",L"PitchMilli",120,f.c_str())*.001f,.015f,.60f));
+            gCryptidCameraFollow.store(std::clamp(
+                static_cast<float>(GetPrivateProfileIntW(L"CryptidCamera",L"FollowRate",32,f.c_str())),
+                8.f,72.f));
+            gCryptidInvertPitch.store(
+                GetPrivateProfileIntW(L"CryptidCamera",L"InvertPitch",0,f.c_str())!=0);
         });
     }
     void SavePreferences() {
@@ -1718,18 +1732,23 @@ namespace {
             }
             return false;
         }
-        if(now-gMonsterLastMoveRequest<180 &&
-           input.x*gMonsterMoveDirX+input.y*gMonsterMoveDirY>.97)
-            return true; // existing path following moves the character natively
         Vec3 origin{};
         if(!Position(gMonsterPawn,origin))return false;
-        // A short moving target feels like directional input while navigation
-        // still prevents walking through level geometry.
-        const Vec3 target{origin.x+input.x*390.0,
-                          origin.y+input.y*390.0,origin.z};
+        const double alignment=input.x*gMonsterMoveDirX+
+                               input.y*gMonsterMoveDirY;
+        const double remaining=std::hypot(
+            gMonsterMoveGoal.x-origin.x,gMonsterMoveGoal.y-origin.y);
+        if(gMonsterPathActive && alignment>.972 && remaining>150.0)
+            return true; // keep one continuous native path instead of jerky 180ms reissues
+        if(gMonsterPathActive && now-gMonsterLastMoveRequest<85)
+            return true; // short directional debounce keeps animation continuous
+        // Project farther ahead so the AI follows a continuous path until
+        // approaching its goal; repath only near the target or upon turning.
+        const Vec3 target{origin.x+input.x*900.0,
+                          origin.y+input.y*900.0,origin.z};
         alignas(8) uint8_t args[0x38]{};
         std::memcpy(args,&target,sizeof(target));
-        const float acceptance=24.0f;
+        const float acceptance=50.0f;
         std::memcpy(args+0x18,&acceptance,sizeof(acceptance));
         args[0x1C]=0; // StopOnOverlap: disabled, use explicit acceptance radius
         args[0x1D]=1; // bUsePathfinding
@@ -1742,6 +1761,7 @@ namespace {
         if(args[0x29]==0)return false;
         gMonsterLastMoveRequest=now;
         gMonsterMoveDirX=input.x;gMonsterMoveDirY=input.y;
+        gMonsterMoveGoal=target;
         gMonsterPathActive=true;
         return true;
     }
@@ -2497,7 +2517,8 @@ namespace {
                 } else {
                     // Shorter interpolation tail reduces perceived ghosting
                     // and the camera visibly lagging behind moving cryptids.
-                    const double alpha=1.-std::exp(-28.*dt);
+                    const double alpha=1.-std::exp(
+                    -static_cast<double>(gCryptidCameraFollow.load())*dt);
                     gChaseSmoothedPos.x+=(safeGoal.x-gChaseSmoothedPos.x)*alpha;
                     gChaseSmoothedPos.y+=(safeGoal.y-gChaseSmoothedPos.y)*alpha;
                     gChaseSmoothedPos.z+=(safeGoal.z-gChaseSmoothedPos.z)*alpha;
@@ -3495,10 +3516,12 @@ void HunterNative::FeedRawMouse(LPARAM lParam) {
     auto raw=reinterpret_cast<const RAWINPUT*>(buffer);
     if(raw->header.dwType!=RIM_TYPEMOUSE)return;
     // Camera look stays independent of creature AI/controller movement graphs.
-    constexpr double sensitivity=0.12;
-    gMonsterYaw+=static_cast<double>(raw->data.mouse.lLastX)*sensitivity;
-    gMonsterPitch=std::clamp(gMonsterPitch-
-        static_cast<double>(raw->data.mouse.lLastY)*sensitivity,-82.0,82.0);
+    gMonsterYaw+=static_cast<double>(raw->data.mouse.lLastX)*
+        static_cast<double>(gCryptidYawSensitivity.load());
+    const double sign=gCryptidInvertPitch.load()?1.0:-1.0;
+    gMonsterPitch=std::clamp(gMonsterPitch+sign*
+        static_cast<double>(raw->data.mouse.lLastY)*
+        static_cast<double>(gCryptidPitchSensitivity.load()),-82.0,82.0);
     if(gMonsterYaw>180.0)gMonsterYaw-=360.0;
     if(gMonsterYaw< -180.0)gMonsterYaw+=360.0;
 }
