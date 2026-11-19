@@ -314,6 +314,7 @@ namespace {
     void RefreshPossessionClarity(uintptr_t pc);
     void VerifyVampireInvisibility(ULONGLONG now);
     int NativeHuntNightState();
+    bool IsGameStateBasedOn(uintptr_t obj,const wchar_t* baseName);
     int HuntSpeciesFromName(const std::wstring& name);
     void UpdateWendigoCameraQuota(int phase);
     void RestoreWendigoPlacementStealth();
@@ -2075,6 +2076,70 @@ namespace {
                 gMothRender.postModified=true;
         }
     }
+    void UpdateWendigoCameraQuota(int phase) {
+#ifdef FCH_STANDALONE
+        const auto world=World();
+        if(world!=gWendigoDayWorld) {
+            gWendigoDayWorld=world;
+            gWendigoPriorPhase=-1;
+            gWendigoCamerasUsedToday=0;
+            gWendigoCameraDayRemaining.store(kWendigoCamerasPerDay);
+        }
+        // The replicated FL_Gamestate.IsNight transition night -> day
+        // marks a new in-game day, including on host and connected clients.
+        if(gWendigoPriorPhase==1 && phase==0) {
+            gWendigoCamerasUsedToday=0;
+            gWendigoCameraDayRemaining.store(kWendigoCamerasPerDay);
+            FHJDiag::Log(L"CRYPTID HUNT WENDIGO: sunrise; replenished two camera placements for the new day.");
+        }
+        if(phase>=0)gWendigoPriorPhase=phase;
+#else
+        (void)phase;
+#endif
+    }
+    bool SetWendigoActorHidden(uintptr_t pawn,bool hidden) {
+        const auto fn=FindFunction(L"Actor",L"SetActorHiddenInGame");
+        uint16_t bytes=0;
+        if(!pawn || !fn || !Read(fn+0xB6,bytes) ||
+           bytes!=1)return false;
+        const uint8_t flag=hidden?1:0;
+        return Invoke(pawn,fn,const_cast<uint8_t*>(&flag));
+    }
+    void RestoreWendigoPlacementStealth() {
+        const auto old=gWendigoPlacingStealth;
+        gWendigoPlacingStealth=WendigoPlacingStealth{};
+        if(!old.pawn)return;
+        int32_t id=-1;
+        if(!Read(old.pawn+0xC,id) || id!=old.id)return;
+        if(!SetWendigoActorHidden(old.pawn,old.wasHidden))
+            FHJDiag::Log(L"WENDIGO PLACEMENT STEALTH: restore of prior hidden state failed.");
+        const auto net=FindFunction(L"Actor",L"ForceNetUpdate");
+        if(net)Invoke(old.pawn,net,nullptr);
+    }
+    void FinishWendigoStealthIfDue(ULONGLONG now) {
+        if(gWendigoPlacingStealth.pawn &&
+           now>=gWendigoPlacingStealth.restoreAt)
+            RestoreWendigoPlacementStealth();
+    }
+    void BeginWendigoPlacementStealth(ULONGLONG now) {
+        RestoreWendigoPlacementStealth();
+        if(!gMonsterPawn)return;
+        int32_t id=-1;
+        uint8_t flags=0;
+        if(!Read(gMonsterPawn+0xC,id) ||
+           !Read(gMonsterPawn+0x58,flags))return;
+        // Engine.AActor.bHidden is replicated bit 7 at +0x58.
+        // Use the actual Actor.SetActorHiddenInGame method, never
+        // mesh-only local visibility that survivors would still see.
+        const bool original=(flags&0x80)!=0;
+        if(!SetWendigoActorHidden(gMonsterPawn,true))return;
+        gWendigoPlacingStealth={
+            gMonsterPawn,id,original,now+1600
+        };
+        const auto net=FindFunction(L"Actor",L"ForceNetUpdate");
+        if(net)Invoke(gMonsterPawn,net,nullptr);
+        FHJDiag::Log(L"WENDIGO PLACEMENT STEALTH: temporarily hidden for camera placement; previous replicated visibility will be restored.");
+    }
     bool IsControllingWendigo() {
         if(!gMonsterActive.load() || gControlledRespawnStart>=0.)return false;
         if(ClassName(ReadPtr(gMonsterPawn+0x10))!=L"BP_Wendigo_C")return false;
@@ -2124,8 +2189,15 @@ namespace {
 #ifdef FCH_STANDALONE
         if(!IsControllingWendigo() || !ReadPtr(World()+0x158))
             return false;
+        if(!gCryptidHuntOptedIn.load() ||
+           gCryptidHuntMapSpecies.load()!=3)return false;
+        UpdateWendigoCameraQuota(NativeHuntNightState());
+        if(gWendigoCamerasUsedToday>=kWendigoCamerasPerDay) {
+            FHJDiag::Log(L"WENDIGO CAMERAS: all two daily camera placements used; resets after next sunrise.");
+            return false;
+        }
         if(gWendigoWatchCameras.size()>=4) {
-            FHJDiag::Log(L"WENDIGO CAMERAS: maximum of four private watchpoints. Press V to cycle views.");
+            FHJDiag::Log(L"WENDIGO CAMERAS: maximum of four active watchpoints. Press V to cycle views.");
             return false;
         }
         const auto cls=FindObjectByName(L"CameraActor");
@@ -2165,6 +2237,10 @@ namespace {
         SetActorRotationSafe(cam,{std::clamp(gMonsterPitch-8.0,-60.0,35.0),
                                   gMonsterYaw,0.0});
         gWendigoWatchCameras.push_back({cam,world,id});
+        ++gWendigoCamerasUsedToday;
+        gWendigoCameraDayRemaining.store(
+            std::max(0,kWendigoCamerasPerDay-gWendigoCamerasUsedToday));
+        BeginWendigoPlacementStealth(GetTickCount64());
         gWendigoWatchCount.store(
             static_cast<int>(gWendigoWatchCameras.size()));
         if(gHumanInputController &&
@@ -2177,6 +2253,7 @@ namespace {
 #endif
     }
     void ReleaseMonsterCamera(uintptr_t pc,uintptr_t destination) {
+        RestoreWendigoPlacementStealth();
         RestorePossessionClarity(pc);
         RestoreLocalMothmanSmoke();
         RestoreLocalMothmanRender();
@@ -2828,11 +2905,12 @@ namespace {
         }
         if(gMonsterFunctions.empty())CacheCryptidActions();
 #ifdef FCH_STANDALONE
-        if(species==2 && (slot==0 || slot==1) && NativeHuntNightState()==0) {
+        if((species==2 || species==3) &&
+           NativeHuntNightState()==0) {
             static ULONGLONG lastWarning=0;
             if(now-lastWarning>2200) {
                 lastWarning=now;
-                FHJDiag::Log(L"CRYPTID HUNT DAYTIME: Vampire basic attacks and scream are disabled until native Director.IsNight becomes true.");
+                FHJDiag::Log(L"CRYPTID HUNT DAYTIME: Wendigo cannot attack/use offensive skills; Vampire cannot attack/use offensive skills until replicated IsNight becomes true.");
             }
             return;
         }
@@ -3220,9 +3298,12 @@ namespace {
     void FreeflightTick() {
         const ULONGLONG now=GetTickCount64();
 #ifdef FCH_STANDALONE
+        FinishWendigoStealthIfDue(now);
         if(now-gHuntNightLastRead>450) {
             gHuntNightLastRead=now;
-            gHuntNightCached.store(NativeHuntNightState());
+            const auto phase=NativeHuntNightState();
+            gHuntNightCached.store(phase);
+            UpdateWendigoCameraQuota(phase);
         }
 #endif
         VerifyVampireInvisibility(now);
