@@ -39,7 +39,7 @@ namespace {
     struct Camera { Vec3 pos{}; Rot rot{}; float fov{}; };
     struct ActorEntry { uintptr_t address{}; int index{}; int kind{}; };
     struct LevelView { uintptr_t data{}; int32_t count{}; int32_t start{}; };
-    enum class ActionType { GiveItem, CatalogItem, GodMode, AddXP, Time, TimeScale, AddSilver, InfiniteDamage, BeanMode, RangerMode, SmoreMode, Rain, Snow, ClearWeather, VampireScream, FlickerLights, CancelFlicker, TargetHealth, TargetItem, TargetNoise, TargetRevive, TargetKill, TargetKick, TargetGodMode, TargetSound, TargetCameraShake, NoclipOn, NoclipOff, FallProtection, SpeedChange, JumpBoost, GravityChange, SpawnMob, SpawnSpecies, PossessCryptid, RestoreHuman, MonsterAbility, EquipVanity };
+    enum class ActionType { GiveItem, CatalogItem, GodMode, AddXP, AddLevels, Time, TimeScale, AddSilver, InfiniteDamage, BeanMode, RangerMode, SmoreMode, Rain, Snow, ClearWeather, VampireScream, FlickerLights, CancelFlicker, TargetHealth, TargetItem, TargetNoise, TargetRevive, TargetKill, TargetKick, TargetGodMode, TargetSound, TargetCameraShake, NoclipOn, NoclipOff, FallProtection, SpeedChange, JumpBoost, GravityChange, SpawnMob, SpawnSpecies, PossessCryptid, RestoreHuman, MonsterAbility, EquipVanity };
     struct Action { ActionType type{}; std::string item; int amount{}; float value{}; int target{-1}; double precise{}; };
     std::mutex gMutex;
     std::mutex gActionsMutex;
@@ -593,6 +593,13 @@ namespace {
         status.worldReady=world!=0;
         if(world) {
             status.host=ReadPtr(world+0x158)!=0;
+            const auto gameState=ReadPtr(world+0x160); // Engine.UWorld::GameState
+            if(gameState && ClassName(ReadPtr(gameState+0x10))==L"FL_Gamestate_C") {
+                const auto huntClass=ReadPtr(gameState+0x340); // FL_Gamestate_C::HuntData
+                const auto hunt=ObjectName(huntClass);
+                if(!hunt.empty())
+                    status.activeHuntName.assign(hunt.begin(),hunt.end());
+            }
             cam=GetCamera(world);
             status.cameraReady=cam.fov>=20.f;
             const auto gi=ReadPtr(world+0x1D8);
@@ -615,7 +622,7 @@ namespace {
             // This fixes worlds where the global array contains no *live* actor of interest
             // in the current scan slice, or where stale UObject slots are common.
             const bool esp=gEsp.load(std::memory_order_relaxed);
-            const int maxScan=esp ? 700 : 180; // player list remains available when ESP is off
+            const int maxScan=esp ? 900 : 600; // quicker Mothman/cryptid roster discovery
             for(int i=0;i<maxScan && totalActors>0;++i) {
                 if(gScanIndex>=totalActors)gScanIndex=0;
                 const int slot=gScanIndex++;
@@ -655,13 +662,10 @@ namespace {
             std::vector<HunterNative::CryptidSpawnPoint> points;
             points.reserve(gKnownSpawners.size());
             for(const auto& point:gKnownSpawners) {
-                Vec3 loc{};
-                char label[120]{};
-                if(Position(point.address,loc))
-                    snprintf(label,sizeof(label),"Map spawner #%d (%.0f, %.0f, %.0f)",
-                        point.index,loc.x,loc.y,loc.z);
-                else
-                    snprintf(label,sizeof(label),"Map spawner #%d",point.index);
+                // Avoid expensive ProcessEvent world-position reads on
+                // every scan; a large map can have many mob spawners.
+                char label[80]{};
+                snprintf(label,sizeof(label),"Current-map spawner #%d",point.index);
                 points.push_back({point.index,label});
             }
             spawnPointsOut=std::move(points);
@@ -3322,6 +3326,7 @@ namespace {
             case ActionType::GiveItem:fn=L"GiveItem";break;
             case ActionType::GodMode:fn=L"ToggleGodMode";break;
             case ActionType::AddXP:fn=L"AddXP";break;
+            case ActionType::AddLevels:fn=L"AddLevels";break;
             case ActionType::Time:fn=L"SetTime";break;
             case ActionType::TimeScale:fn=L"SetTimeScale";break;
             case ActionType::AddSilver:fn=L"Cheat_AddSilver";owner=L"FL_Gamemode_C";break;
@@ -3360,7 +3365,7 @@ namespace {
             function=FindFunction(L"FolkloreGamemode",fn);
         } else if(a.type==ActionType::GiveItem || a.type==ActionType::Time ||
                   a.type==ActionType::TimeScale || a.type==ActionType::RangerMode ||
-                  a.type==ActionType::SmoreMode) {
+                  a.type==ActionType::SmoreMode || a.type==ActionType::AddLevels) {
             function=FindFunction(L"FL_Gamemode_C",fn);
         }
         if (!function) function=FindFunction(owner,fn);
@@ -3572,6 +3577,10 @@ bool HunterNative::RequestGiveItem(const std::string& item,int n) {
 }
 bool HunterNative::RequestGodMode() {return Enqueue({ActionType::GodMode,"",0,0});}
 bool HunterNative::RequestAddXP(int xp) {return xp>0 && xp<=100000?Enqueue({ActionType::AddXP,"",xp,0}):false;}
+bool HunterNative::RequestAddLevels(int levels) {
+    return levels>0 && levels<=100 ?
+        Enqueue({ActionType::AddLevels,"",levels,0}):false;
+}
 bool HunterNative::RequestTime(float hour) {return std::isfinite(hour)?Enqueue({ActionType::Time,"",0,hour}):false;}
 bool HunterNative::RequestTimeScale(float scale) {return std::isfinite(scale) && scale>0.05f && scale<10.f?Enqueue({ActionType::TimeScale,"",0,scale}):false;}
 bool HunterNative::RequestAddSilver(int n) {return n>0&&n<=100000?Enqueue({ActionType::AddSilver,"",n,0}):false;}
