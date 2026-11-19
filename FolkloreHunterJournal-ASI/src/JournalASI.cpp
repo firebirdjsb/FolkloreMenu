@@ -64,6 +64,65 @@ namespace {
     RECT gClipBeforeJournal{};
     bool gClipSaved = false;
 
+    // One DXGI hook owner, separate module callbacks. Both plugins may
+    // coexist without a second MinHook patch of the same Present address.
+    using BridgeAttach=void (*)(void*,HWND);
+    using BridgeFrame=void (*)(void*,bool);
+    using BridgeMessage=void (*)(UINT);
+    using BridgeMouse=void (*)(LPARAM);
+    using BridgeBool=bool (*)();
+    using BridgeVoid=void (*)();
+    HMODULE gCompanionModule=nullptr;
+    BridgeAttach gBridgeAttach=nullptr;
+    BridgeFrame gBridgeFrame=nullptr;
+    BridgeMessage gBridgeMessage=nullptr;
+    BridgeMouse gBridgeMouse=nullptr;
+    BridgeBool gBridgeMonsterActive=nullptr;
+    BridgeVoid gBridgeRestoreHuman=nullptr;
+    std::atomic_bool gBridgeReady{false};
+
+    void TryConnectCompanion() {
+        if(gBridgeReady.load(std::memory_order_acquire) ||
+           !gGameWindow || !ImGui::GetCurrentContext())return;
+#ifdef FCH_STANDALONE
+        constexpr const wchar_t* other=L"FolkloreHunterJournal.asi";
+#else
+        constexpr const wchar_t* other=L"FolkloreCryptidHunt.asi";
+#endif
+        const auto module=GetModuleHandleW(other);
+        if(!module || module==gJournalModule)return;
+        auto attach=reinterpret_cast<BridgeAttach>(
+            GetProcAddress(module,"FHJ_ModuleBridgeAttach"));
+        auto frame=reinterpret_cast<BridgeFrame>(
+            GetProcAddress(module,"FHJ_ModuleBridgeFrame"));
+        auto message=reinterpret_cast<BridgeMessage>(
+            GetProcAddress(module,"FHJ_ModuleBridgeMessage"));
+        auto mouse=reinterpret_cast<BridgeMouse>(
+            GetProcAddress(module,"FHJ_ModuleBridgeMouse"));
+        auto active=reinterpret_cast<BridgeBool>(
+            GetProcAddress(module,"FHJ_ModuleBridgeMonsterActive"));
+        auto restore=reinterpret_cast<BridgeVoid>(
+            GetProcAddress(module,"FHJ_ModuleBridgeRestoreHuman"));
+        if(!attach || !frame || !message || !mouse || !active || !restore)
+            return;
+        // Only publish pointers to WndProc after the second module has
+        // received the owning ImGui context and game HWND.
+        gCompanionModule=module;
+        gBridgeAttach=attach;
+        gBridgeFrame=frame;
+        gBridgeMessage=message;
+        gBridgeMouse=mouse;
+        gBridgeMonsterActive=active;
+        gBridgeRestoreHuman=restore;
+        attach(static_cast<void*>(ImGui::GetCurrentContext()),gGameWindow);
+        gBridgeReady.store(true,std::memory_order_release);
+        Log(L"Shared hook bridge: companion ASI registered independent UI/engine callbacks; no second DXGI or WndProc patch.");
+    }
+    bool CompanionMonsterActive() {
+        return gBridgeReady.load(std::memory_order_acquire) &&
+               gBridgeMonsterActive && gBridgeMonsterActive();
+    }
+
     void ReleaseGamePointer(HWND hwnd) {
         // Unreal may use a confined or relative mouse while the game is playing.
         // The journal needs a free cursor, and will draw its own pointer via ImGui.
