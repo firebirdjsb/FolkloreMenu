@@ -141,6 +141,20 @@ namespace {
     std::atomic<float> gCryptidPitchSensitivity{0.12f};
     std::atomic<float> gCryptidCameraFollow{32.0f};
     std::atomic_bool gCryptidInvertPitch{false};
+    std::atomic_bool gCryptidClearLocalBlur{true};
+    // The two motion-blur CVars and depth-of-field CVar are viewport-
+    // local, not replicated. Save before changing and restore on return.
+    struct PossessionClarityBackup {
+        bool active=false;
+        uintptr_t camera=0;
+        int32_t cameraIndex=-1;
+        bool cameraSaved=false;
+        uint8_t previousOverrides=0;
+        float previousWeight=0.f,previousBlurAmount=0.f,previousBlurMax=0.f;
+        std::array<int32_t,3> originalCvars{};
+        std::array<bool,3> cvarsSaved{};
+    } gPossessionClarity;
+    ULONGLONG gLastPossessionClarityRefresh=0;
     std::atomic_bool gMothmanReduceLocalSmoke{true};
     struct LocalMothmanSmoke {
         uintptr_t pawn=0,component=0;
@@ -231,6 +245,9 @@ namespace {
     void FreeflightTick();
     void RestoreLocalMothmanSmoke();
     void SyncLocalMothmanSmoke();
+    void ApplyPossessionClarity(uintptr_t pc,uintptr_t cameraComponent);
+    void RestorePossessionClarity(uintptr_t pc);
+    void RefreshPossessionClarity(uintptr_t pc);
     void TickNativeMothmanFlight(uintptr_t pawn,const Vec3& desiredInput,
                                   bool boosting,double dt,ULONGLONG now);
     uintptr_t CreatureSkillFunction(int species,int slot);
@@ -488,6 +505,8 @@ namespace {
                 8.f,72.f));
             gCryptidInvertPitch.store(
                 GetPrivateProfileIntW(L"CryptidCamera",L"InvertPitch",0,f.c_str())!=0);
+            gCryptidClearLocalBlur.store(
+                GetPrivateProfileIntW(L"CryptidCamera",L"ClearBlurWhilePossessed",1,f.c_str())!=0);
             gMothmanReduceLocalSmoke.store(
                 GetPrivateProfileIntW(L"Mothman",L"ReduceLocalSmoke",1,f.c_str())!=0);
         });
@@ -3711,7 +3730,8 @@ std::vector<HunterNative::CryptidSpawnPoint> HunterNative::GetActiveMapSpawners(
 HunterNative::CryptidCameraSettings HunterNative::GetCryptidCameraSettings() {
     LoadPreferences();
     return {gCryptidYawSensitivity.load(),gCryptidPitchSensitivity.load(),
-            gCryptidCameraFollow.load(),gCryptidInvertPitch.load()};
+            gCryptidCameraFollow.load(),gCryptidInvertPitch.load(),
+            gCryptidClearLocalBlur.load()};
 }
 void HunterNative::SetCryptidCameraSettings(const CryptidCameraSettings& value) {
     if(!std::isfinite(value.yawSensitivity) ||
@@ -3721,6 +3741,7 @@ void HunterNative::SetCryptidCameraSettings(const CryptidCameraSettings& value) 
     gCryptidPitchSensitivity.store(std::clamp(value.pitchSensitivity,.015f,.60f));
     gCryptidCameraFollow.store(std::clamp(value.followRate,8.f,72.f));
     gCryptidInvertPitch.store(value.invertPitch);
+    gCryptidClearLocalBlur.store(value.clearBlurDuringPossession);
     auto file=SettingsPath();
     if(file.empty())return;
     wchar_t buf[32]{};
@@ -3732,6 +3753,8 @@ void HunterNative::SetCryptidCameraSettings(const CryptidCameraSettings& value) 
     WritePrivateProfileStringW(L"CryptidCamera",L"FollowRate",buf,file.c_str());
     WritePrivateProfileStringW(L"CryptidCamera",L"InvertPitch",
         value.invertPitch?L"1":L"0",file.c_str());
+    WritePrivateProfileStringW(L"CryptidCamera",L"ClearBlurWhilePossessed",
+        value.clearBlurDuringPossession?L"1":L"0",file.c_str());
 }
 bool HunterNative::MothmanLocalSmokeReduction() {
     LoadPreferences();
