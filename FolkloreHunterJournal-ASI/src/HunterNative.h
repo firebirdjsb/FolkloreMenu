@@ -102,6 +102,7 @@ namespace HunterNative {
     // spawner (-1 = automatic; host-pawn fallback if the map has none).
     bool RequestSpawnCryptidClass(int classObjectIndex, int count,
                                   int mapSpawnerIndex = -1, bool autoControl = false);
+    bool RequestSetMapSpawnerEnabled(int mapSpawnerIndex, bool enabled);
     bool RequestPossessCryptid(int objectIndex);
     bool RequestRestoreHuman();
     // Only abilities exposed by the matching creature's reflected class are invoked.
