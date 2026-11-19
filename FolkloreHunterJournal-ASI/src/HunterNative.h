@@ -57,6 +57,9 @@ namespace HunterNative {
         bool host = false;
         bool cameraReady = false;
         std::string activeHuntName;
+        std::string selectedLobbyMap;
+        bool isGameLobby=false;
+        int mapCryptid=0; // 0=unsupported/unknown, 1=Mothman, 2=Vampire, 3=Wendigo
         double localHealth = -1.0;
         double localMaxHealth = -1.0;
         bool invuln = false;
@@ -112,6 +115,11 @@ namespace HunterNative {
     // Separate game-mode controls. Day state is authoritative when the
     // live FL_Gamemode_C.Director component is accessible; -1 = unknown.
     int GetCryptidHuntNightState();
+    bool CryptidHuntOptedIn();
+    void SetCryptidHuntOptedIn(bool enabled); // session-only, no save writes
+    int CryptidHuntMapSpecies();
+    const char* CryptidHuntSpeciesName(int species);
+    int WendigoCameraDayRemaining();
     void DrawCryptidHuntDaylightVision(ImVec2 screen);
     bool RequestWendigoDeployCamera();
     bool RequestWendigoCycleCamera();
