@@ -146,6 +146,14 @@ namespace {
         int32_t pawnIndex=-1,componentIndex=-1;
         bool previouslyHidden=false;
     } gLocalMothmanSmoke;
+    struct NativeMothmanFlight {
+        uintptr_t pawn=0;
+        int32_t objectIndex=-1;
+        Vec3 smoothedVelocity{},lastPosition{};
+        ULONGLONG lastMotionSeen=0;
+        bool positionValid=false;
+        bool loggedFallback=false;
+    } gMothFlight;
     std::unordered_map<std::wstring,uintptr_t> gMonsterFunctions;
     ULONGLONG gLastCreatureMethodWarning=0;
     uint8_t gMonsterPriorMovement=1;
@@ -222,6 +230,8 @@ namespace {
     void FreeflightTick();
     void RestoreLocalMothmanSmoke();
     void SyncLocalMothmanSmoke();
+    void TickNativeMothmanFlight(uintptr_t pawn,const Vec3& desiredInput,
+                                  bool boosting,double dt,ULONGLONG now);
     uintptr_t CreatureSkillFunction(int species,int slot);
     std::string CreatureSkillLabel(int species,int slot,uintptr_t fn);
     void AdvanceSpawnWave();
@@ -589,6 +599,7 @@ namespace {
             // Old UObjects are invalid after level transition. Do not call
             // render functions on them; the scene is destroyed by the engine.
             gLocalMothmanSmoke=LocalMothmanSmoke{};
+            gMothFlight=NativeMothmanFlight{};
             gCameraAutoManageSaved=false;
             gMonsterIndex=-1;gCameraIndex=-1;gLastMotionTick=0;
             gMonsterAIController=0;gMonsterBrain=0;gMonsterBrainWasRunning=false;
@@ -2086,6 +2097,7 @@ namespace {
         gMonsterMovement=0;
         gMonsterSpeedsSaved=false;gMonsterModeSaved=false;
         gMonsterFlightActive=false;gGroundJumpHeld=false;
+        gMothFlight=NativeMothmanFlight{};
         if(controllerLive && gMonsterBrain && gMonsterBrainWasRunning) {
             const auto restart=FindFunction(L"BrainComponent",L"RestartLogic");
             if(restart)Invoke(gMonsterBrain,restart,nullptr);
@@ -2094,6 +2106,7 @@ namespace {
         gMonsterBrain=0;gMonsterAIController=0;gMonsterBrainWasRunning=false;
     }
     void ConfigureMonsterMovement() {
+        gMothFlight=NativeMothmanFlight{};
         if(ClassName(ReadPtr(gMonsterPawn+0x10))==L"BP_FlyingPawnTest_C") {
             // The exact SDK says Mothman is APawn; its 0x330 is a
             // StuckDetector component. Never treat it as CharacterMovement.
@@ -2423,6 +2436,95 @@ namespace {
         UpdateMonsterHUD();
         return false; // camera and human control stay in cryptid mode
     }
+    void TickNativeMothmanFlight(uintptr_t pawn,const Vec3& desiredInput,
+                                  bool boosting,double dt,ULONGLONG now) {
+        // Exact SDK: BP_FlyingPawnTest_C inherits APawn and exposes
+        // FlightTarget at 0x400. This path drives its own ReceiveTick /
+        // physics and MothmanCreature_...AnimBlueprint rather than invoking
+        // K2_SetActorLocation on every movement frame.
+        int32_t id=-1;
+        Vec3 current{};
+        if(!pawn || !Read(pawn+0x0C,id) || !Position(pawn,current))return;
+        if(gMothFlight.pawn!=pawn || gMothFlight.objectIndex!=id) {
+            gMothFlight=NativeMothmanFlight{};
+            gMothFlight.pawn=pawn;
+            gMothFlight.objectIndex=id;
+            gMothFlight.lastPosition=current;
+            gMothFlight.lastMotionSeen=now;
+            gMothFlight.positionValid=true;
+            FHJDiag::Log(L"MOTHMAN FLIGHT: switched to native FlightTarget steering and actual-velocity animation blending.");
+        }
+        const double speed=boosting?1100.0:690.0;
+        const double gain=1.0-std::exp(-std::clamp(5.5*dt,0.0,1.0));
+        gMothFlight.smoothedVelocity.x+=(desiredInput.x*speed-
+            gMothFlight.smoothedVelocity.x)*gain;
+        gMothFlight.smoothedVelocity.y+=(desiredInput.y*speed-
+            gMothFlight.smoothedVelocity.y)*gain;
+        gMothFlight.smoothedVelocity.z+=(desiredInput.z*speed-
+            gMothFlight.smoothedVelocity.z)*gain;
+        const double commanded=std::hypot(std::hypot(
+            gMothFlight.smoothedVelocity.x,gMothFlight.smoothedVelocity.y),
+            gMothFlight.smoothedVelocity.z);
+        // Look ahead from the real current location while keeping the flight
+        // target continuous as input accelerates/decelerates. Idle targets the
+        // current position to avoid drifting after releasing the keys.
+        const double leadSeconds=1.10;
+        const Vec3 target{
+            current.x+gMothFlight.smoothedVelocity.x*leadSeconds,
+            current.y+gMothFlight.smoothedVelocity.y*leadSeconds,
+            current.z+gMothFlight.smoothedVelocity.z*leadSeconds};
+        const bool targetAccepted=TryWrite(pawn+0x400,target);
+        double nativeSpeed=0.0;
+        if(Read(pawn+0x420,nativeSpeed) &&
+           (!std::isfinite(nativeSpeed)||nativeSpeed<=1.0)) {
+            const double initial=690.0;
+            TryWrite(pawn+0x420,initial);
+        }
+        // Derive anim blend parameters from observed actor motion, rather
+        // than moving the mesh with an artificial animation montage.
+        const double observationDt=std::max(dt,0.005);
+        const Vec3 delta{current.x-gMothFlight.lastPosition.x,
+                         current.y-gMothFlight.lastPosition.y,
+                         current.z-gMothFlight.lastPosition.z};
+        const double progress=std::hypot(std::hypot(delta.x,delta.y),delta.z);
+        const double measuredH=std::clamp(std::hypot(delta.x,delta.y)/
+            observationDt,0.0,2500.0);
+        const double measuredFull=std::clamp(progress/observationDt,
+            0.0,2500.0);
+        if(progress>2.0 || commanded<30.0)gMothFlight.lastMotionSeen=now;
+        if(!targetAccepted)gMothFlight.lastMotionSeen=now;
+        if(targetAccepted && commanded>120.0 &&
+           now-gMothFlight.lastMotionSeen>650) {
+            // Only a bounded emergency swept move is used if the game never
+            // consumes FlightTarget. This is not the normal animation path.
+            const Vec3 fallback{
+                current.x+gMothFlight.smoothedVelocity.x*dt,
+                current.y+gMothFlight.smoothedVelocity.y*dt,
+                current.z+gMothFlight.smoothedVelocity.z*dt};
+            SetActorLocationSafe(pawn,fallback,true,false);
+            if(!gMothFlight.loggedFallback) {
+                gMothFlight.loggedFallback=true;
+                FHJDiag::Log(L"MOTHMAN FLIGHT: native pawn stalled; swept recovery engaged. Inspect FlightTarget/ReceiveTick in live dump.");
+            }
+        }
+        gMothFlight.lastPosition=current;
+
+        // Exact Mothman SDK: USkeletalMeshComponent at Pawn+0x3D0,
+        // AnimScriptInstance +0x8A0, AnimBlueprint IsFlying 0x1310,
+        // HSpeed 0x1314, FSpeed 0x1318. These feed the original blend graph;
+        // keep wings/physical animation and native character visuals intact.
+        const auto mesh=ReadPtr(pawn+0x3D0);
+        const auto anim=ReadPtr(mesh+0x8A0);
+        if(anim && ClassName(ReadPtr(anim+0x10))==
+           L"MothmanCreature_Body_Skeleton_AnimBlueprint_C") {
+            const bool isFlying=true;
+            const float h=static_cast<float>(measuredH);
+            const float v=static_cast<float>(measuredFull);
+            TryWrite(anim+0x1310,isFlying);
+            TryWrite(anim+0x1314,h);
+            TryWrite(anim+0x1318,v);
+        }
+    }
     void FreeflightTick() {
         const ULONGLONG now=GetTickCount64();
         const ULONGLONG elapsed=gLastMotionTick?now-gLastMotionTick:16;
@@ -2535,43 +2637,7 @@ namespace {
             gMonsterFlightActive=(species==1);
             if(gMonsterFlightActive) {
                 StopCryptidPath();
-                // BP_FlyingPawnTest_C uses FlightTarget (0x400) and
-                // FlightSpeed (0x420) instead of CharacterMovement.
-                // Prefer its native flight-target steering and keep a swept
-                // fallback when its AI/Blueprint tick doesn't consume it.
-                if(length>1e-3) {
-                    Vec3 current{};
-                    if(Position(pawn,current)) {
-                        const double speed=boost?1100.0:690.0;
-                        const Vec3 goal{current.x+input.x*speed*.25,
-                                        current.y+input.y*speed*.25,
-                                        current.z+input.z*speed*.25};
-                        const bool targetWritten=TryWrite(pawn+0x400,goal);
-                        double configured=0.0;
-                        if(!Read(pawn+0x420,configured) ||
-                           !std::isfinite(configured)||configured<1.0) {
-                            const double nativeSpeed=boost?1100.0:690.0;
-                            TryWrite(pawn+0x420,nativeSpeed);
-                        }
-                        // Keep the pawn responsive even when its original
-                        // controller's flight-target logic was paused.
-                        static Vec3 observed{};
-                        static int32_t observedId=-1;
-                        static ULONGLONG observedAt=0;
-                        if(observedId!=gMonsterIndex || now-observedAt>120) {
-                            observed=current;observedId=gMonsterIndex;observedAt=now;
-                        }
-                        const double progressed=std::hypot(std::hypot(
-                            current.x-observed.x,current.y-observed.y),
-                            current.z-observed.z);
-                        if(!targetWritten || (now-observedAt>75 && progressed<1.0)) {
-                            const Vec3 dest{current.x+input.x*speed*dt,
-                                            current.y+input.y*speed*dt,
-                                            current.z+input.z*speed*dt};
-                            SetActorLocationSafe(pawn,dest,true,false);
-                        }
-                    }
-                }
+                TickNativeMothmanFlight(pawn,input,boost,dt,now);
             } else {
                 // Space invokes Character.Jump rather than enabling flight.
                 // This uses normal walk physics and leaves collision intact.
@@ -2661,10 +2727,14 @@ namespace {
             hudTick=now;
             HideHumanHUD();
         }
-        // Rotate the creature itself so its mesh and melee hit direction face the view.
-        const Rot desired{0.0,gMonsterYaw,0.0};
-        const auto turn=FindFunction(L"Actor",L"K2_SetActorRotation");
-        if(turn) SetActorRotationSafe(pawn,desired);
+        // Ground cryptids face camera yaw. Mothman's native
+        // TorqueTowardsVelocity and wing animation need control of its
+        // orientation: never hard-snap the aerial pawn to camera yaw.
+        if(species!=1) {
+            const Rot desired{0.0,gMonsterYaw,0.0};
+            if(FindFunction(L"Actor",L"K2_SetActorRotation"))
+                SetActorRotationSafe(pawn,desired);
+        }
         if(gChaseCamera) {
             Vec3 location{};
             if(Position(pawn,location)) {
