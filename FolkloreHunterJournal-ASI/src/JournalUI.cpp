@@ -428,6 +428,16 @@ namespace FHJ
                 }
                 ImGui::EndCombo();
             }
+            if(selectedSpawnPoint>=0) {
+                if(!state.host)ImGui::BeginDisabled();
+                if(ImGui::Button("ENABLE THIS MAP SPAWNER"))
+                    HunterNative::RequestSetMapSpawnerEnabled(selectedSpawnPoint,true);
+                ImGui::SameLine();
+                if(ImGui::Button("DISABLE THIS MAP SPAWNER"))
+                    HunterNative::RequestSetMapSpawnerEnabled(selectedSpawnPoint,false);
+                if(!state.host)ImGui::EndDisabled();
+                ImGui::TextDisabled("Uses BP_MobSpawner_C.SetSpawningEnabled; restores map rules on level change.");
+            }
             ImGui::Checkbox("Immediately control first verified spawn",&controlFirstSpawn);
             ImGui::Text("Loaded cryptid classes: %d  |  Map spawners: %d",
                         static_cast<int>(spawnTypes.size()),
