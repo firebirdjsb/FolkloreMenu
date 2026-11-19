@@ -2853,7 +2853,8 @@ namespace {
         if(lowered.find(L"bloodfang")!=std::wstring::npos ||
            lowered.find(L"vampire")!=std::wstring::npos)return 2;
         if(lowered.find(L"mothman")!=std::wstring::npos ||
-           lowered.find(L"blackwing")!=std::wstring::npos)return 1;
+           lowered.find(L"blackwing")!=std::wstring::npos ||
+           lowered.find(L"flyingpawntest")!=std::wstring::npos)return 1;
         return 0;
     }
     bool IsGameStateBasedOn(uintptr_t obj,const wchar_t* baseName) {
