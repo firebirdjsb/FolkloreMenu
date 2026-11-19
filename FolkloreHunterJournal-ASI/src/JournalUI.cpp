@@ -448,8 +448,9 @@ namespace FHJ
                                                        selectedSpawnPoint,controlFirstSpawn);
             if(!state.host || selectedSpawnClass<0)ImGui::EndDisabled();
             ImGui::TextDisabled("Mothman loads as BP_FlyingPawnTest_C, not BP_Cryptid_Base_C.");
-            ImGui::TextDisabled("Only currently loaded SDK classes can spawn; map assets may be absent.");
-            ImGui::TextDisabled("A direct native spawn is verified by actor ID; a TriggerSpawn call is not.");
+            ImGui::TextDisabled("Cross-map species require loaded mesh, AnimBlueprint and AI controller.");
+            ImGui::TextDisabled("Incomplete direct spawns are rejected to avoid invisible, motionless actors.");
+            ImGui::TextDisabled("A direct spawn is verified by model+animation+AI; TriggerSpawn calls are not actor proof.");
             const auto creatures=HunterNative::GetCreatures();
             ImGui::TextColored(Palette::col_gold,"BECOME A LIVE CRYPTID [EXPERIMENTAL]");
             std::string selectedLabel="Select a live cryptid";
@@ -502,6 +503,13 @@ namespace FHJ
             camChanged|=ImGui::Checkbox("Invert vertical look",&camSettings.invertPitch);
             if(camChanged)HunterNative::SetCryptidCameraSettings(camSettings);
             ImGui::TextDisabled("Higher follow rate = less trailing blur; sensitivity persists in journal.ini.");
+            bool reduceMothSmoke=HunterNative::MothmanLocalSmokeReduction();
+            if(ImGui::Checkbox("Reduce Mothman smoke ONLY for my possession camera",
+                               &reduceMothSmoke))
+                HunterNative::SetMothmanLocalSmokeReduction(reduceMothSmoke);
+            ImGui::TextDisabled("Hides local non-replicated Smoke component during possession;");
+            ImGui::TextDisabled("restores it afterward. Other players retain normal effects and particles.");
+            ImGui::TextDisabled("Mothman: native FlightTarget steering and wing AnimBlueprint (experimental).");
             ImGui::TextDisabled("Mothman: aerial movement (Space up / Ctrl down).");
             ImGui::TextDisabled("Wendigo and Vampire: ground movement only (Space jump, no noclip).");
             ImGui::TextDisabled("Creature-specific native skill keybinds appear ONLY on the possession HUD.");
