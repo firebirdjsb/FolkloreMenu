@@ -203,19 +203,23 @@ namespace {
     }
 
     LRESULT CALLBACK JournalWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
-        if (msg == WM_INPUT && HunterNative::MonsterModeActive()) {
-            HunterNative::FeedRawMouse(lparam);
-            // Prevent the human-pawn camera from turning during remote monster control.
+        if (msg == WM_INPUT &&
+            (HunterNative::MonsterModeActive() || CompanionMonsterActive())) {
+            if(HunterNative::MonsterModeActive())
+                HunterNative::FeedRawMouse(lparam);
+            if(CompanionMonsterActive())gBridgeMouse(lparam);
             return DefWindowProcW(hwnd,msg,wparam,lparam);
         }
-#ifdef FCH_STANDALONE
-        if (msg == WM_KEYUP && wparam == VK_F11 && HunterNative::MonsterModeActive()) {
-            HunterNative::RequestRestoreHuman(); // emergency escape if chase view is obstructed
+        if (msg == WM_KEYUP && wparam == VK_F11 &&
+            (HunterNative::MonsterModeActive() || CompanionMonsterActive())) {
+            if(HunterNative::MonsterModeActive())HunterNative::RequestRestoreHuman();
+            if(CompanionMonsterActive())gBridgeRestoreHuman();
             return 0;
         }
-#endif
         if (msg == HunterNative::kGameTick || msg == HunterNative::kGameAction) {
             HunterNative::HandleWindowMessage(msg);
+            if(gBridgeReady.load(std::memory_order_acquire) &&
+               gBridgeMessage)gBridgeMessage(msg);
             return 0;
         }
         if (msg == WM_KEYUP && wparam == VK_F9) { FHJDiag::ToggleOverlay(); return 0; }
@@ -231,7 +235,7 @@ namespace {
         // Only puppet mode takes the human pawn's controls. Noclip keeps the
         // normal game input pipeline active so walking keys are not starved.
         if(!gShowMenu.load(std::memory_order_acquire) &&
-           HunterNative::MonsterModeActive()) {
+           (HunterNative::MonsterModeActive() || CompanionMonsterActive())) {
             // Q/E/R ability presses are polled as key-down edges by the
             // native cryptid tick. Do not dispatch again on WM_KEYUP: holding
             // E used to activate and then deactivate invisibility on release.
@@ -242,13 +246,14 @@ namespace {
                (wparam=='C' || wparam=='V'))
                 return 0; // Wendigo's private watchpoint shortcuts
 #endif
-            if(HunterNative::MonsterModeActive() &&
+            if((HunterNative::MonsterModeActive() || CompanionMonsterActive()) &&
                 (msg==WM_LBUTTONDOWN || msg==WM_LBUTTONUP))return 0;
             if((msg==WM_KEYDOWN || msg==WM_KEYUP) &&
                (wparam=='W'||wparam=='A'||wparam=='S'||wparam=='D'||
                 wparam==VK_SPACE || wparam==VK_CONTROL || wparam==VK_SHIFT ||
-                (HunterNative::MonsterModeActive() &&
-                (wparam=='Q' || wparam=='E' || wparam=='R'))))return 0;
+                ((HunterNative::MonsterModeActive() || CompanionMonsterActive()) &&
+                (wparam=='Q' || wparam=='E' || wparam=='R' ||
+                 wparam=='C' || wparam=='V'))))return 0;
         }
         if (gShowMenu.load(std::memory_order_acquire) && msg == WM_SETCURSOR) {
             SetCursor(nullptr); // Dear ImGui draws the visible cursor above the game.
