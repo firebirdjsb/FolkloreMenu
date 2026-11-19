@@ -39,7 +39,7 @@ namespace {
     struct Camera { Vec3 pos{}; Rot rot{}; float fov{}; };
     struct ActorEntry { uintptr_t address{}; int index{}; int kind{}; };
     struct LevelView { uintptr_t data{}; int32_t count{}; int32_t start{}; };
-    enum class ActionType { GiveItem, CatalogItem, GodMode, AddXP, Time, TimeScale, AddSilver, InfiniteDamage, BeanMode, RangerMode, SmoreMode, Rain, Snow, ClearWeather, VampireScream, FlickerLights, CancelFlicker, TargetHealth, TargetItem, TargetNoise, TargetRevive, TargetKill, TargetKick, TargetGodMode, TargetSound, TargetCameraShake, NoclipOn, NoclipOff, FallProtection, SpeedChange, JumpBoost, GravityChange, SpawnMob, PossessCryptid, RestoreHuman, MonsterAbility, EquipVanity };
+    enum class ActionType { GiveItem, CatalogItem, GodMode, AddXP, Time, TimeScale, AddSilver, InfiniteDamage, BeanMode, RangerMode, SmoreMode, Rain, Snow, ClearWeather, VampireScream, FlickerLights, CancelFlicker, TargetHealth, TargetItem, TargetNoise, TargetRevive, TargetKill, TargetKick, TargetGodMode, TargetSound, TargetCameraShake, NoclipOn, NoclipOff, FallProtection, SpeedChange, JumpBoost, GravityChange, SpawnMob, SpawnSpecies, PossessCryptid, RestoreHuman, MonsterAbility, EquipVanity };
     struct Action { ActionType type{}; std::string item; int amount{}; float value{}; int target{-1}; double precise{}; };
     std::mutex gMutex;
     std::mutex gActionsMutex;
@@ -49,6 +49,10 @@ namespace {
     std::atomic_bool gActionPending{false};
     std::vector<Action> gActions;
     std::vector<ActorEntry> gKnown;
+    std::vector<ActorEntry> gKnownSpawners;
+    std::vector<HunterNative::CryptidSpawnClass> gSpawnClassCandidates,gSpawnClassCatalog;
+    std::vector<HunterNative::CryptidSpawnPoint> gSpawnPointCatalog;
+    int gSpawnClassScanCursor=0;
     std::vector<Marker> gMarkers;
     std::vector<HunterNative::PlayerInfo> gRoster;
     std::vector<HunterNative::CreatureInfo> gCreatures;
@@ -92,8 +96,12 @@ namespace {
     bool gPossessedCryptid = false;
     // One map spawner can be used for many requests. Pace native TriggerSpawn
     // invocations so a one-spawner level doesn't silently cap a wave at one.
-    struct SpawnWave {int remaining=0, requested=0, dispatched=0, speciesIndex=-1;
-        ULONGLONG nextTick=0;int created=0;};
+    struct SpawnWave {
+        int remaining=0, requested=0, dispatched=0, speciesIndex=-1;
+        ULONGLONG nextTick=0;int created=0;
+        int classObjectIndex=-1, spawnerObjectIndex=-1;
+        bool controlFirst=false;
+    };
     SpawnWave gSpawnWave{};
     std::atomic_bool gWildlife{true}, gContainers{true}, gQuest{true}, gLoot{true};
     
@@ -205,6 +213,8 @@ namespace {
     uintptr_t CreatureSkillFunction(int species,int slot);
     std::string CreatureSkillLabel(int species,int slot,uintptr_t fn);
     void AdvanceSpawnWave();
+    void PossessCreature(int index,bool restore);
+    void RefreshSpawnableClassCatalog();
     std::atomic_bool gAutoJump{false};
     int gLastReported=0;
     constexpr double kPi=3.1415926535897932384626433832795;
@@ -287,6 +297,33 @@ namespace {
             cls=parent;
         }
         return false;
+    }
+    void RefreshSpawnableClassCatalog() {
+        // Incremental GUObject enumeration: Blueprint classes can be loaded
+        // independently of the level's live actors. Do not inspect 49k
+        // UObjects in one 16ms frame.
+        int count=0;uintptr_t chunks=0;
+        if(!GetObjects(count,chunks))return;
+        for(int n=0;n<600 && gSpawnClassScanCursor<count;++n,++gSpawnClassScanCursor) {
+            const int id=gSpawnClassScanCursor;
+            const auto klass=ObjectAt(id,chunks);
+            if(!klass)continue;
+            const auto meta=ClassName(ReadPtr(klass+0x10));
+            if(meta!=L"BlueprintGeneratedClass" && meta!=L"Class")continue;
+            if(ClassKind(klass)!=2 || !IsPawnClass(klass))continue;
+            const auto name=ObjectName(klass);
+            if(name.size()<3 || name.substr(name.size()-2)!=L"_C")continue;
+            int32_t liveId=-1;
+            if(!Read(klass+0x0C,liveId) || liveId!=id)continue;
+            const bool already=std::any_of(gSpawnClassCandidates.begin(),
+                gSpawnClassCandidates.end(),
+                [id](const auto& entry){return entry.objectIndex==id;});
+            if(already)continue;
+            const bool mothman=name==L"BP_FlyingPawnTest_C";
+            const auto title=mothman?"Mothman / BP_FlyingPawnTest_C":
+                std::string(name.begin(),name.end());
+            gSpawnClassCandidates.push_back({id,title,mothman});
+        }
     }
     void ScanLoadedSounds() {
         if(gSoundCandidates.size()>=256 && gCameraShakeCandidates.size()>=96)return;
@@ -507,7 +544,9 @@ namespace {
             gPrevWorld=world;
             gScanIndex=0;
             gKinds.clear();gClassNames.clear();gFunctionCache.clear();
-            gKnown.clear();
+            gKnown.clear();gKnownSpawners.clear();
+            gSpawnClassCandidates.clear();gSpawnClassCatalog.clear();
+            gSpawnPointCatalog.clear();gSpawnClassScanCursor=0;
             gSoundScanCursor=0;gSoundCandidates.clear();gCameraShakeCandidates.clear();
             gMonsterAttackSoundIndex.store(-1);
             gPhysicsBackups.clear();gFallBackups.clear();gGodBackups.clear();
@@ -538,7 +577,10 @@ namespace {
             FHJDiag::Log(L"World changed: reset ESP and player cache.");
         }
         AdvanceSpawnWave();
-        if(world)ScanLoadedSounds();
+        if(world) {
+            ScanLoadedSounds();
+            RefreshSpawnableClassCatalog();
+        }
         HunterNative::Status status{};
         status.pendingSpawnTriggers=gSpawnWave.remaining;
         status.confirmedSpawned=gSpawnWave.created;
@@ -583,7 +625,13 @@ namespace {
                 ++status.actorsExamined;
                 int32_t objIndex=-1;
                 if(!Read(actor+0xC,objIndex) || objIndex<0)continue;
-                const int kind=ClassKind(ReadPtr(actor+0x10));
+                const auto cls=ReadPtr(actor+0x10);
+                if(ClassName(cls)==L"BP_MobSpawner_C" &&
+                   gKnownSpawners.size()<100 &&
+                   std::none_of(gKnownSpawners.begin(),gKnownSpawners.end(),
+                       [actor](const ActorEntry& e){return e.address==actor;}))
+                    gKnownSpawners.push_back({actor,objIndex,7});
+                const int kind=ClassKind(cls);
                 if(kind && gKnown.size()<400 &&
                     std::none_of(gKnown.begin(),gKnown.end(),
                         [actor](const ActorEntry& e){return e.address==actor;}))
@@ -595,6 +643,26 @@ namespace {
                     int32_t actual=-1;
                     return !Read(a.address+0xC,actual) || actual!=a.index;
                 }),gKnown.end());
+            gKnownSpawners.erase(std::remove_if(gKnownSpawners.begin(),gKnownSpawners.end(),
+                [](const ActorEntry& a) {
+                    int32_t id=-1;
+                    return !Read(a.address+0x0C,id) || id!=a.index ||
+                        ClassName(ReadPtr(a.address+0x10))!=L"BP_MobSpawner_C";
+                }),gKnownSpawners.end());
+            status.activeMobSpawners=static_cast<int>(gKnownSpawners.size());
+            std::vector<HunterNative::CryptidSpawnPoint> points;
+            points.reserve(gKnownSpawners.size());
+            for(const auto& point:gKnownSpawners) {
+                Vec3 loc{};
+                char label[120]{};
+                if(Position(point.address,loc))
+                    snprintf(label,sizeof(label),"Map spawner #%d (%.0f, %.0f, %.0f)",
+                        point.index,loc.x,loc.y,loc.z);
+                else
+                    snprintf(label,sizeof(label),"Map spawner #%d",point.index);
+                points.push_back({point.index,label});
+            }
+            gSpawnPointCatalog=std::move(points);
             status.knownActors=static_cast<int>(gKnown.size());
             markers.reserve(kMaxActors);
             for(const auto& actor:gKnown) {
@@ -713,6 +781,7 @@ namespace {
             gStatus=status;gCamera=cam;gMarkers=std::move(markers);
             gRoster=std::move(playersOut);
             gCreatures=std::move(creaturesOut);
+            gSpawnClassCatalog=gSpawnClassCandidates;
             gVanityChoices=std::move(vanity);
             gSounds=gSoundCandidates;
             gCameraShakes=gCameraShakeCandidates;
