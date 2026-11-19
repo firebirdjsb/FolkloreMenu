@@ -43,7 +43,7 @@ namespace {
     struct Camera { Vec3 pos{}; Rot rot{}; float fov{}; };
     struct ActorEntry { uintptr_t address{}; int index{}; int kind{}; };
     struct LevelView { uintptr_t data{}; int32_t count{}; int32_t start{}; };
-    enum class ActionType { GiveItem, CatalogItem, GodMode, AddXP, AddLevels, Time, TimeScale, AddSilver, InfiniteDamage, BeanMode, RangerMode, SmoreMode, Rain, Snow, ClearWeather, VampireScream, FlickerLights, CancelFlicker, TargetHealth, TargetItem, TargetNoise, TargetRevive, TargetKill, TargetKick, TargetGodMode, TargetSound, TargetCameraShake, NoclipOn, NoclipOff, FallProtection, SpeedChange, JumpBoost, GravityChange, SpawnMob, SpawnSpecies, SpawnerToggle, PossessCryptid, RestoreHuman, MonsterAbility, EquipVanity, WendigoPlaceCamera, WendigoCycleCamera, WendigoCloseCamera };
+    enum class ActionType { GiveItem, CatalogItem, GodMode, AddXP, AddLevels, Time, TimeScale, AddSilver, InfiniteDamage, BeanMode, RangerMode, SmoreMode, Rain, Snow, ClearWeather, VampireScream, FlickerLights, CancelFlicker, TargetHealth, TargetItem, TargetNoise, TargetRevive, TargetKill, TargetKick, TargetGodMode, TargetSound, TargetCameraShake, NoclipOn, NoclipOff, FallProtection, SpeedChange, JumpBoost, GravityChange, SpawnMob, SpawnSpecies, SpawnerToggle, PossessCryptid, RestoreHuman, AssignRemoteRole, RestoreRemoteRole, MonsterAbility, EquipVanity, WendigoPlaceCamera, WendigoCycleCamera, WendigoCloseCamera };
     struct Action { ActionType type{}; std::string item; int amount{}; float value{}; int target{-1}; double precise{}; };
     std::mutex gMutex;
     std::mutex gActionsMutex;
@@ -227,6 +227,24 @@ namespace {
     // Never change SaveGame objects, contract selection, map path or game mode.
     std::atomic_bool gCryptidHuntOptedIn{false};
     std::atomic_int gCryptidHuntMapSpecies{0};
+#ifdef FCH_STANDALONE
+    // Server-only, single remote role. Keep both live UObject identity and
+    // source world; never apply an old role to actors from another map.
+    struct NativeRemoteRole {
+        uintptr_t world=0,playerController=0,human=0,cryptid=0,ai=0;
+        int32_t controllerId=-1,humanId=-1,cryptidId=-1,aiId=-1;
+        ULONGLONG assignedAt=0;
+    } gNativeRemoteRole;
+    std::atomic_int gNativeRolePlayerId{-1},gNativeRoleCryptidId{-1};
+    // Owning client discovers native Controller.Pawn replication independently;
+    // this is NOT a custom network message and does not imply client readiness.
+    std::atomic_bool gClientRoleActive{false},gClientRolePaused{false};
+    std::atomic_int gClientRoleSpecies{0};
+    uintptr_t gClientRolePawn=0;
+    int32_t gClientRoleIndex=-1;
+    bool gClientRoleAttackHeld=false,gClientRoleJumpHeld=false;
+    ULONGLONG gClientRoleLastWarning=0;
+#endif
     constexpr int kWendigoCamerasPerDay=2;
     int gWendigoCamerasUsedToday=0;
     std::atomic_int gWendigoCameraDayRemaining{kWendigoCamerasPerDay};
@@ -330,6 +348,12 @@ namespace {
     std::string CreatureSkillLabel(int species,int slot,uintptr_t fn);
     void AdvanceSpawnWave();
     void PossessCreature(int index,bool restore);
+#ifdef FCH_STANDALONE
+    void TickOwningClientRole(uintptr_t world,ULONGLONG now);
+    void MaintainServerRemoteRole(uintptr_t world);
+    void AssignServerRemoteRole(int playerPawnIndex,int cryptidPawnIndex);
+    bool RestoreServerRemoteRole();
+#endif
     void RefreshSpawnableClassCatalog();
     std::atomic_bool gAutoJump{false};
     int gLastReported=0;
@@ -730,6 +754,17 @@ namespace {
             gWendigoWatchCameras.clear();gWendigoWatchCount.store(0);
             gHuntNightCached.store(-1);gHuntNightLastRead=0;
             gCryptidHuntMapSpecies.store(0);
+#ifdef FCH_STANDALONE
+            // Travel invalidates both controllers and pawns. Never call a
+            // reflected function on pointers retained from the old world.
+            if(gNativeRemoteRole.world)
+                FHJDiag::Log(L"CRYPTID NETWORK ROLE: level travel invalidated old handoff; no unsafe cross-world restoration attempted.");
+            gNativeRemoteRole=NativeRemoteRole{};
+            gNativeRolePlayerId.store(-1);gNativeRoleCryptidId.store(-1);
+            gClientRoleActive.store(false);gClientRolePaused.store(false);
+            gClientRoleSpecies.store(0);gClientRolePawn=0;gClientRoleIndex=-1;
+            gClientRoleAttackHeld=false;gClientRoleJumpHeld=false;
+#endif
             gWendigoCamerasUsedToday=0;
             gWendigoCameraDayRemaining.store(kWendigoCamerasPerDay);
             gWendigoLastNightNum=-1;gWendigoPriorPhase=-1;
@@ -750,6 +785,9 @@ namespace {
             FHJDiag::Log(L"World changed: reset ESP and player cache.");
         }
         AdvanceSpawnWave();
+#ifdef FCH_STANDALONE
+        MaintainServerRemoteRole(world);
+#endif
         if(world) {
             ScanLoadedSounds();
             RefreshSpawnableClassCatalog();
@@ -2892,6 +2930,94 @@ namespace {
         return -1;
 #endif
     }
+
+#ifdef FCH_STANDALONE
+    void TickOwningClientRole(uintptr_t world,ULONGLONG now) {
+        // This branch is for the owning *remote* client only. The host uses
+        // its original human-preserving puppet mode instead.
+        const bool remote=!ReadPtr(world+0x158);
+        const auto gi=ReadPtr(world+0x1D8);
+        const auto locals=ReadPtr(gi+0x38);
+        const auto local=ReadPtr(locals);
+        const auto pc=ReadPtr(local+0x30);
+        const auto pawn=ReadPtr(pc+0x350);
+        int32_t id=-1;
+        const bool matched=remote && gCryptidHuntOptedIn.load() &&
+            !gMonsterActive.load() && gCryptidHuntMapSpecies.load()!=0 &&
+            pawn && Read(pawn+0xC,id) && id>=0 &&
+            ClassKind(ReadPtr(pawn+0x10))==2 && IsPawnClass(ReadPtr(pawn+0x10)) &&
+            HuntSpeciesFromName(ClassName(ReadPtr(pawn+0x10)))==
+                gCryptidHuntMapSpecies.load();
+        if(!matched) {
+            if(gClientRoleActive.exchange(false))
+                FHJDiag::Log(L"CRYPTID CLIENT: native owning pawn no longer matches this hunt. Released local cryptid input bridge.");
+            gClientRoleSpecies.store(0);gClientRolePawn=0;gClientRoleIndex=-1;
+            gClientRolePaused.store(false);
+            gClientRoleAttackHeld=false;gClientRoleJumpHeld=false;
+            return;
+        }
+        if(!gClientRoleActive.load() || pawn!=gClientRolePawn ||
+           id!=gClientRoleIndex) {
+            gClientRolePawn=pawn;gClientRoleIndex=id;
+            gClientRoleSpecies.store(gCryptidHuntMapSpecies.load());
+            gClientRolePaused.store(false);
+            gClientRoleAttackHeld=false;gClientRoleJumpHeld=false;
+            gClientRoleActive.store(true);
+            FHJDiag::Log(L"CRYPTID CLIENT: native server possession replicated to this owning PlayerController. Starting guarded local input bridge; remote attack/flight still require live tests.");
+        }
+        if(gClientRolePaused.load() || gJournalOpen.load() ||
+           !gWindow || GetForegroundWindow()!=gWindow)return;
+        const int species=gClientRoleSpecies.load();
+        auto down=[](int vk)->bool {
+            return (GetAsyncKeyState(vk)&0x8000)!=0;
+        };
+        // CharacterMovement on the owning client can consume the native
+        // AddMovementInput accumulator and generate its normal movement RPCs.
+        // The unrelated Mothman APawn uses FlightTarget and needs a separate
+        // server-authoritative movement contract; never write its FlightTarget
+        // speculatively from the client.
+        if(species!=1) {
+            const auto cam=GetCamera(world);
+            const double yaw=cam.rot.yaw*kPi/180.0;
+            const double f=static_cast<double>(down('W'))-static_cast<double>(down('S'));
+            const double s=static_cast<double>(down('D'))-static_cast<double>(down('A'));
+            const double len=std::hypot(f,s);
+            if(len>0.01 && std::isfinite(yaw)) {
+                const double cy=std::cos(yaw),sy=std::sin(yaw);
+                Vec3 input{(cy*f-sy*s)/len,(sy*f+cy*s)/len,0.0};
+                AddSmoothMovement(pawn,input);
+            }
+            const bool jump=down(VK_SPACE);
+            if(jump && !gClientRoleJumpHeld) {
+                const auto fn=FindFunction(L"Character",L"Jump");
+                uint16_t params=0;
+                if(fn && Read(fn+0xB6,params) && params==0)
+                    Invoke(pawn,fn,nullptr);
+            }
+            gClientRoleJumpHeld=jump;
+        }
+        const bool attack=down(VK_LBUTTON);
+        if(attack && !gClientRoleAttackHeld &&
+           (species!=2 && species!=3 || NativeHuntNightState()!=0)) {
+            // Do not invoke host-only Blueprint ability events on clients.
+            // Server_Attack is an owned Server RPC only if actual reflected
+            // flags confirm FUNC_Net | FUNC_NetServer and no parameters.
+            const auto fn=FindFunction(L"BP_Cryptid_Base_C",L"Server_Attack");
+            uint16_t params=0;uint32_t flags=0;
+            if(species!=1 && fn && Read(fn+0xB6,params) &&
+               Read(fn+0xB0,flags) && params==0 &&
+               (flags&0x60u)==0x60u) {
+                if(!Invoke(pawn,fn,nullptr))
+                    FHJDiag::Log(L"CRYPTID CLIENT: Server_Attack RPC dispatch failed.");
+            } else if(now-gClientRoleLastWarning>6000) {
+                gClientRoleLastWarning=now;
+                FHJDiag::Log(L"CRYPTID CLIENT: no verified zero-param Server_Attack RPC for this pawn; attack suppressed. Q/E/R and Mothman flight need a validated owned RPC.");
+            }
+        }
+        gClientRoleAttackHeld=attack;
+    }
+#endif
+
     void ExecuteMonsterAbility(int slot) {
         if(slot<0 || slot>=static_cast<int>(gAbilityTicks.size()) ||
            !gMonsterActive.load() || !ReadPtr(World()+0x158) ||
@@ -3306,6 +3432,13 @@ namespace {
     void FreeflightTick() {
         const ULONGLONG now=GetTickCount64();
 #ifdef FCH_STANDALONE
+        // A remote owner sees the new pawn via Unreal's replicated possession,
+        // without relying on the host's in-process selected-player UI.
+        const auto roleWorld=World();
+        if(roleWorld && roleWorld==gPrevWorld)
+            TickOwningClientRole(roleWorld,now);
+#endif
+#ifdef FCH_STANDALONE
         FinishWendigoStealthIfDue(now);
         if(now-gHuntNightLastRead>450) {
             gHuntNightLastRead=now;
@@ -3614,6 +3747,194 @@ namespace {
         return pawn && Read(pawn+0x0C,index) && index>=0 &&
             ClassKind(ReadPtr(pawn+0x10))==1;
     }
+
+#ifdef FCH_STANDALONE
+    bool RemoteRoleObjectLive(uintptr_t obj,int32_t id) {
+        int32_t actual=-1;
+        return obj && id>=0 && Read(obj+0xC,actual) && actual==id;
+    }
+    bool RemoteRoleControllerIs(uintptr_t controller,const wchar_t* base) {
+        auto klass=ReadPtr(controller+0x10);
+        for(int depth=0;klass && depth<24;++depth) {
+            if(ClassName(klass)==base)return true;
+            const auto parent=ReadPtr(klass+0x40);
+            if(!parent || parent==klass)break;
+            klass=parent;
+        }
+        return false;
+    }
+    uintptr_t RemoteRolePossessMethod() {
+        const auto fn=FindFunction(L"Controller",L"Possess");
+        uint16_t size=0;
+        // UE5.5 AController.Possess(APawn*) has one 8-byte pointer argument;
+        // fail closed if this game's live UFunction is different.
+        return fn && Read(fn+0xB6,size) && size==sizeof(uintptr_t)?fn:0;
+    }
+    void ClearServerRemoteRole() {
+        gNativeRemoteRole=NativeRemoteRole{};
+        gNativeRolePlayerId.store(-1);
+        gNativeRoleCryptidId.store(-1);
+    }
+    bool RestoreServerRemoteRole() {
+        const auto role=gNativeRemoteRole;
+        if(!role.world)return false;
+        if(role.world!=World()) {
+            ClearServerRemoteRole();
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: remote return skipped after world change.");
+            return false;
+        }
+        if(!RemoteRoleObjectLive(role.playerController,role.controllerId) ||
+           !RemoteRoleObjectLive(role.human,role.humanId)) {
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: original controller or human pawn is gone; cannot promise safe restoration. Inspect native hunt respawn.");
+            return false;
+        }
+        const auto possess=RemoteRolePossessMethod();
+        if(!possess) {
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: Controller.Possess(APawn*) reflection unavailable; restoration blocked.");
+            return false;
+        }
+        const auto current=ReadPtr(role.playerController+0x350);
+        if(current!=role.human && current!=role.cryptid && current!=0) {
+            // The game may have already put the player in a fresh pawn.
+            // Never seize an unrelated pawn away from its controller.
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: base game already replaced remote pawn; leaving new gameplay ownership intact.");
+            ClearServerRemoteRole();
+            return true;
+        }
+        if(current!=role.human) {
+            uintptr_t human=role.human;
+            if(!Invoke(role.playerController,possess,&human) ||
+               ReadPtr(role.playerController+0x350)!=human) {
+                FHJDiag::Log(L"CRYPTID NETWORK ROLE: remote human return not confirmed; handoff retained for retry.");
+                return false;
+            }
+        }
+        const bool cryptidLive=RemoteRoleObjectLive(role.cryptid,role.cryptidId);
+        const bool aiLive=RemoteRoleObjectLive(role.ai,role.aiId) &&
+                          RemoteRoleControllerIs(role.ai,L"AIController");
+        if(cryptidLive && aiLive && !ReadPtr(role.ai+0x350)) {
+            uintptr_t cryptid=role.cryptid;
+            if(!Invoke(role.ai,possess,&cryptid) ||
+               ReadPtr(role.cryptid+0x2D8)!=role.ai)
+                FHJDiag::Log(L"CRYPTID NETWORK ROLE: human restored, but original AI could not repossess cryptid; inspect native controller.");
+        }
+        ForceActorNetUpdate(role.human);
+        if(cryptidLive)ForceActorNetUpdate(role.cryptid);
+        ClearServerRemoteRole();
+        FHJDiag::Log(L"CRYPTID NETWORK ROLE: remote PlayerController repointed to original human; native handoff cleared.");
+        return true;
+    }
+    void AssignServerRemoteRole(int playerPawnIndex,int cryptidPawnIndex) {
+        const auto world=World();
+        if(!world || !ReadPtr(world+0x158) ||
+           world!=gPrevWorld || !gCryptidHuntOptedIn.load() ||
+           gCryptidHuntMapSpecies.load()==0 || gMonsterActive.load() ||
+           gNativeRemoteRole.world) {
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: requires a single, opted-in authoritative host hunt without another active handoff.");
+            return;
+        }
+        uintptr_t human=0,cryptid=0;
+        for(const auto& a:gKnown) {
+            int32_t id=-1;
+            if(!a.address || !Read(a.address+0xC,id) || id!=a.index)continue;
+            if(a.kind==1 && a.index==playerPawnIndex)human=a.address;
+            if(a.kind==2 && a.index==cryptidPawnIndex)cryptid=a.address;
+        }
+        int32_t humanId=-1,cryptidId=-1;
+        if(!ValidPlayerPawn(human,humanId) || humanId!=playerPawnIndex ||
+           !cryptid || !Read(cryptid+0xC,cryptidId) ||
+           cryptidId!=cryptidPawnIndex || !IsPawnClass(ReadPtr(cryptid+0x10)) ||
+           HuntSpeciesFromName(ClassName(ReadPtr(cryptid+0x10)))!=
+               gCryptidHuntMapSpecies.load()) {
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: selected world actors missing, invalid or incompatible with stock map.");
+            return;
+        }
+        const auto pc=ReadPtr(human+0x2D8);
+        const auto ai=ReadPtr(cryptid+0x2D8);
+        int32_t pcId=-1,aiId=-1;
+        const auto instance=ReadPtr(world+0x1D8);
+        const auto locals=ReadPtr(instance+0x38);
+        const auto local=ReadPtr(locals);
+        const auto ownPc=ReadPtr(local+0x30);
+        if(!pc || pc==ownPc || !Read(pc+0xC,pcId) ||
+           !RemoteRoleControllerIs(pc,L"PlayerController") ||
+           ReadPtr(pc+0x350)!=human ||
+           (ai && (!Read(ai+0xC,aiId) ||
+                   !RemoteRoleControllerIs(ai,L"AIController"))) ||
+           (ai && ReadPtr(ai+0x350)!=cryptid)) {
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: target is not an authoritative remote PlayerController owning its human, or cryptid is not AI-owned.");
+            return;
+        }
+        const auto possess=RemoteRolePossessMethod();
+        if(!possess) {
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: no validated Controller.Possess(APawn*) UFunction; refusing unsafe swap.");
+            return;
+        }
+        gNativeRemoteRole={world,pc,human,cryptid,ai,pcId,humanId,
+                           cryptidId,aiId,GetTickCount64()};
+        // Native authority-side possession triggers UE's existing Pawn owner
+        // replication. Does not imply that a remote ASI or its input is ready.
+        uintptr_t target=cryptid;
+        const bool invoked=Invoke(pc,possess,&target);
+        const bool attached=invoked && ReadPtr(pc+0x350)==cryptid &&
+                            ReadPtr(cryptid+0x2D8)==pc;
+        if(!attached) {
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: native possess unconfirmed. Attempting immediate human rollback.");
+            if(ReadPtr(pc+0x350)!=human) {
+                uintptr_t original=human;
+                Invoke(pc,possess,&original);
+            }
+            if(ReadPtr(pc+0x350)==human)ClearServerRemoteRole();
+            else {
+                gNativeRolePlayerId.store(humanId);
+                gNativeRoleCryptidId.store(cryptidId);
+                FHJDiag::Log(L"CRYPTID NETWORK ROLE: rollback not confirmed. Use host RESTORE REMOTE HUMAN; session still tracked.");
+            }
+            return;
+        }
+        gNativeRolePlayerId.store(humanId);
+        gNativeRoleCryptidId.store(cryptidId);
+        ForceActorNetUpdate(human);
+        ForceActorNetUpdate(cryptid);
+        FHJDiag::Log(L"CRYPTID NETWORK ROLE: server PlayerController.Possess verified against live pawn and controller. Client camera/input, controls and survivor visibility require two-client verification.");
+    }
+    void MaintainServerRemoteRole(uintptr_t world) {
+        const auto role=gNativeRemoteRole;
+        if(!role.world)return;
+        if(world!=role.world) {
+            ClearServerRemoteRole();
+            return;
+        }
+        if(!RemoteRoleObjectLive(role.playerController,role.controllerId)) {
+            ClearServerRemoteRole();
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: original remote controller no longer exists.");
+            return;
+        }
+        const auto owned=ReadPtr(role.playerController+0x350);
+        if(owned==role.human) {
+            ClearServerRemoteRole();
+            return;
+        }
+        if(owned!=role.cryptid && owned!=0) {
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: player switched to game-owned replacement pawn; not overriding the game.");
+            ClearServerRemoteRole();
+            return;
+        }
+        if(!RemoteRoleObjectLive(role.cryptid,role.cryptidId)) {
+            RestoreServerRemoteRole();
+            return;
+        }
+        // The base cryptids have replicated HP, but Mothman is unrelated
+        // APawn and must never read the 0x710 health offset.
+        if(ClassName(ReadPtr(role.cryptid+0x10))!=L"BP_FlyingPawnTest_C") {
+            double health=-1.0;
+            if(Read(role.cryptid+0x710,health) &&
+               std::isfinite(health) && health<=0)
+                RestoreServerRemoteRole();
+        }
+    }
+#endif
+
     bool ApplyGodProtection(uintptr_t pawn,bool enabled) {
         if(!ReadPtr(World()+0x158)) {
             FHJDiag::Log(L"God Mode rejected: requires authoritative host GameMode.");
@@ -4296,6 +4617,12 @@ namespace {
             SetNativeMapSpawnerEnabled(a.target,a.amount!=0);
         else if(a.type==ActionType::PossessCryptid || a.type==ActionType::RestoreHuman)
             PossessCreature(a.target,a.type==ActionType::RestoreHuman);
+#ifdef FCH_STANDALONE
+        else if(a.type==ActionType::AssignRemoteRole)
+            AssignServerRemoteRole(a.amount,a.target);
+        else if(a.type==ActionType::RestoreRemoteRole)
+            RestoreServerRemoteRole();
+#endif
     }
 
     void EquipVanity(const Action& a) {
@@ -4350,7 +4677,9 @@ namespace {
             a.type==ActionType::SpawnSpecies ||
             a.type==ActionType::SpawnerToggle ||
             a.type==ActionType::PossessCryptid ||
-            a.type==ActionType::RestoreHuman) {
+            a.type==ActionType::RestoreHuman ||
+            a.type==ActionType::AssignRemoteRole ||
+            a.type==ActionType::RestoreRemoteRole) {
             ExecutePhysics(a); return;
         }
         if(a.type==ActionType::NoclipOn || a.type==ActionType::NoclipOff) {
@@ -4426,6 +4755,8 @@ namespace {
             case ActionType::SpawnerToggle:
             case ActionType::PossessCryptid:
             case ActionType::RestoreHuman:
+            case ActionType::AssignRemoteRole:
+            case ActionType::RestoreRemoteRole:
             case ActionType::MonsterAbility:
             case ActionType::WendigoPlaceCamera:
             case ActionType::WendigoCycleCamera:
@@ -4483,7 +4814,11 @@ void HunterNative::AttachWindow(HWND window) { gWindow=window; }
 void HunterNative::RequestTick() {
     if (!gWindow) return;
     const ULONGLONG now=GetTickCount64();
-    const DWORD desiredInterval = (gNoclipEnabled || gMonsterActive.load()) ? 16 : kScanIntervalMs;
+    const DWORD desiredInterval = (gNoclipEnabled || gMonsterActive.load()
+#ifdef FCH_STANDALONE
+        || gClientRoleActive.load()
+#endif
+        ) ? 16 : kScanIntervalMs;
     if (now-gLastTick<desiredInterval) return;
     gLastTick=now;
     if (!gTickPending.exchange(true,std::memory_order_acq_rel))
@@ -4783,7 +5118,71 @@ bool HunterNative::RequestPossessCryptid(int index) {
     return index>=0?Enqueue({ActionType::PossessCryptid,"",0,0,index,0}):false;
 }
 bool HunterNative::RequestRestoreHuman() {
+#ifdef FCH_STANDALONE
+    // A remote owning client cannot run the host-only Controller.Possess.
+    // F11 pauses its local input; the host owns actual return/rollback.
+    if(gClientRoleActive.load()) {
+        gClientRolePaused.store(true);
+        FHJDiag::Log(L"CRYPTID CLIENT: F11 paused local input only. Host must restore the original human pawn.");
+        return true;
+    }
+#endif
     return Enqueue({ActionType::RestoreHuman,"",0,0,-1,0});
+}
+bool HunterNative::RequestAssignRemoteCryptid(int playerPawnIndex,int cryptidPawnIndex) {
+#ifdef FCH_STANDALONE
+    if(playerPawnIndex<0 || cryptidPawnIndex<0 ||
+       !gCryptidHuntOptedIn.load() || !gCryptidHuntMapSpecies.load())
+        return false;
+    return Enqueue({ActionType::AssignRemoteRole,"",playerPawnIndex,0.f,cryptidPawnIndex,0.});
+#else
+    (void)playerPawnIndex;(void)cryptidPawnIndex;return false;
+#endif
+}
+bool HunterNative::RequestRestoreRemoteHuman() {
+#ifdef FCH_STANDALONE
+    return gNativeRolePlayerId.load()>=0 ?
+        Enqueue({ActionType::RestoreRemoteRole,"",0,0.f,-1,0.}):false;
+#else
+    return false;
+#endif
+}
+int HunterNative::ActiveRemoteRolePlayerIndex() {
+#ifdef FCH_STANDALONE
+    return gNativeRolePlayerId.load();
+#else
+    return -1;
+#endif
+}
+int HunterNative::ActiveRemoteRoleCryptidIndex() {
+#ifdef FCH_STANDALONE
+    return gNativeRoleCryptidId.load();
+#else
+    return -1;
+#endif
+}
+bool HunterNative::LocalNetworkCryptidRoleActive() {
+#ifdef FCH_STANDALONE
+    return gClientRoleActive.load();
+#else
+    return false;
+#endif
+}
+bool HunterNative::LocalNetworkCryptidRolePaused() {
+#ifdef FCH_STANDALONE
+    return gClientRoleActive.load() && gClientRolePaused.load();
+#else
+    return false;
+#endif
+}
+bool HunterNative::ResumeLocalNetworkCryptidControl() {
+#ifdef FCH_STANDALONE
+    if(!gClientRoleActive.load())return false;
+    gClientRolePaused.store(false);
+    return true;
+#else
+    return false;
+#endif
 }
 
 
@@ -4791,7 +5190,11 @@ bool HunterNative::ESPEnabled() {
     return gEsp.load(std::memory_order_relaxed);
 }
 bool HunterNative::MonsterModeActive() {
-    return gMonsterActive.load(std::memory_order_relaxed);
+    return gMonsterActive.load(std::memory_order_relaxed)
+#ifdef FCH_STANDALONE
+        || (gClientRoleActive.load() && !gClientRolePaused.load())
+#endif
+        ;
 }
 void HunterNative::SetJournalOpen(bool isOpen) {
     gJournalOpen.store(isOpen,std::memory_order_relaxed);
@@ -4931,6 +5334,8 @@ void HunterNative::SetCryptidHuntOptedIn(bool enabled) {
     const bool was=gCryptidHuntOptedIn.exchange(enabled);
     if(was && !enabled && gMonsterActive.load())
         RequestRestoreHuman(); // native game-thread cleanup
+    if(was && !enabled && gNativeRolePlayerId.load()>=0)
+        RequestRestoreRemoteHuman(); // host-native restoration, never client-side
     if(was!=enabled)
         FHJDiag::Log(enabled?
             L"CRYPTID HUNT: opted into custom mode for this running session only. Normal lobby contract and save system untouched.":
@@ -4955,8 +5360,9 @@ int HunterNative::WendigoCameraDayRemaining() {
 }
 void HunterNative::DrawCryptidHuntDaylightVision(ImVec2 screen) {
 #ifdef FCH_STANDALONE
-    if(!gMonsterActive.load() || gHuntNightCached.load()!=0)return;
-    const auto species=MonsterSpecies();
+    if(gHuntNightCached.load()!=0)return;
+    if(!gMonsterActive.load() && !gClientRoleActive.load())return;
+    const auto species=gMonsterActive.load()?MonsterSpecies():gClientRoleSpecies.load();
     if(species!=2 && species!=3)return;
     // A local possession-camera rendering rule, NOT a replicated
     // material or physics change. Night always restores clear vision.
