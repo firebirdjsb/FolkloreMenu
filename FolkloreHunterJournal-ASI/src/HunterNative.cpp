@@ -245,6 +245,8 @@ namespace {
         int species=0;
         double health=0.0, maxHealth=0.0;
         bool cameraReady=false;
+        bool mothmanStealthed=false;
+        bool vampireInvisible=false;
         bool possessConfirmed=false;
         bool respawning=false;
         float respawnSeconds=0.f;
@@ -2060,6 +2062,8 @@ namespace {
         gMonsterHUD.health=health;
         gMonsterHUD.maxHealth=maxHealth;
         gMonsterHUD.cameraReady=gChaseCamera!=0;
+        if(species==1)Read(gMonsterPawn+0x431,gMonsterHUD.mothmanStealthed);
+        if(species==2)Read(gMonsterPawn+0x7D0,gMonsterHUD.vampireInvisible);
         gMonsterHUD.possessConfirmed=true;
         gMonsterHUD.respawning=false;
         gMonsterHUD.respawnSeconds=0.f;
@@ -4500,7 +4504,13 @@ void HunterNative::DrawMonsterHUD(ImVec2 screen) {
         snprintf(health,sizeof(health),"RESPAWN IN %.1fs  |  CAMERA %s",
             snap.respawnSeconds,snap.cameraReady?"ATTACHED":"NOT READY");
     else if(snap.species==1)
-        snprintf(health,sizeof(health),"MOTHMAN ACTIVE / HP UNAVAILABLE  |  CAMERA %s",
+        snprintf(health,sizeof(health),"MOTHMAN HP UNKNOWN | NATIVE STEALTH %s | CAMERA %s",
+            snap.mothmanStealthed?"ON":"OFF",
+            snap.cameraReady?"CHASE":"FALLBACK");
+    else if(snap.species==2)
+        snprintf(health,sizeof(health),"HEALTH %.0f / %.0f | INVIS %s | CAMERA %s",
+            snap.health,snap.maxHealth,
+            snap.vampireInvisible?"ON":"OFF",
             snap.cameraReady?"CHASE":"FALLBACK");
     else
         snprintf(health,sizeof(health),"HEALTH %.0f / %.0f  |  CAMERA %s",
