@@ -2024,6 +2024,107 @@ namespace {
                 gMothRender.postModified=true;
         }
     }
+    bool IsControllingWendigo() {
+        if(!gMonsterActive.load() || gControlledRespawnStart>=0.)return false;
+        if(ClassName(ReadPtr(gMonsterPawn+0x10))!=L"BP_Wendigo_C")return false;
+        int32_t live=-1;
+        return Read(gMonsterPawn+0xC,live) && live==gMonsterIndex;
+    }
+    void ClearWendigoWatchCameras() {
+        // Only destroy the independent CameraActor instances created by
+        // this mode. Never inspect, take over or remove ACamera_C survivor
+        // equipment or the survivor CameraFeed_C widget.
+        const auto destroy=FindFunction(L"Actor",L"K2_DestroyActor");
+        const auto world=World();
+        for(const auto& cam:gWendigoWatchCameras) {
+            int32_t live=-1;
+            if(cam.world==world && cam.object && destroy &&
+               Read(cam.object+0xC,live) && live==cam.objectId)
+                Invoke(cam.object,destroy,nullptr);
+        }
+        gWendigoWatchCameras.clear();
+        gWendigoWatchCount.store(0);
+        gWendigoViewIndex=-1;
+    }
+    bool CycleWendigoWatchCamera(bool returnToChase) {
+#ifdef FCH_STANDALONE
+        if(!IsControllingWendigo() || !gHumanInputController ||
+           !gChaseCamera)return false;
+        const int count=static_cast<int>(gWendigoWatchCameras.size());
+        if(returnToChase || count==0 || gWendigoViewIndex+1>=count) {
+            gWendigoViewIndex=-1;
+            return SetCameraViewTarget(gHumanInputController,gChaseCamera);
+        }
+        const int next=gWendigoViewIndex+1;
+        const auto& cam=gWendigoWatchCameras[static_cast<size_t>(next)];
+        int32_t live=-1;
+        if(!cam.object || cam.world!=World() ||
+           !Read(cam.object+0xC,live) || live!=cam.objectId)return false;
+        if(!SetCameraViewTarget(gHumanInputController,cam.object))return false;
+        gWendigoViewIndex=next;
+        FHJDiag::Log(L"WENDIGO CAMERAS: switched to private Wendigo-owned surveillance viewpoint. Survivor cameras are untouched.");
+        return true;
+#else
+        (void)returnToChase;
+        return false;
+#endif
+    }
+    bool PlaceWendigoWatchCamera() {
+#ifdef FCH_STANDALONE
+        if(!IsControllingWendigo() || !ReadPtr(World()+0x158))
+            return false;
+        if(gWendigoWatchCameras.size()>=4) {
+            FHJDiag::Log(L"WENDIGO CAMERAS: maximum of four private watchpoints. Press V to cycle views.");
+            return false;
+        }
+        const auto cls=FindObjectByName(L"CameraActor");
+        const auto context=FindObjectByName(L"Default__GameplayStatics");
+        const auto begin=FindFunction(L"GameplayStatics",L"BeginDeferredActorSpawnFromClass");
+        const auto finish=FindFunction(L"GameplayStatics",L"FinishSpawningActor");
+        const auto world=World();
+        if(!cls || ClassName(ReadPtr(cls+0x10))!=L"Class" ||
+           !context || !begin || !finish || !world)return false;
+        Vec3 origin{};
+        if(!Position(gMonsterPawn,origin))return false;
+        const double radians=gMonsterYaw*kPi/180.0;
+        Transform64 tx{};
+        // Place an independent camera node slightly ahead of Wendigo.
+        // No use of PlayerCharacter.CurrentCamera or CameraFeed_C.
+        tx.location.x=origin.x+std::cos(radians)*180.;
+        tx.location.y=origin.y+std::sin(radians)*180.;
+        tx.location.z=origin.z+140.;
+        alignas(8) uint8_t beginArgs[0x90]{};
+        std::memcpy(beginArgs,&world,8);
+        std::memcpy(beginArgs+8,&cls,8);
+        std::memcpy(beginArgs+0x10,&tx,sizeof(tx));
+        beginArgs[0x70]=1;
+        if(!Invoke(context,begin,beginArgs))return false;
+        uintptr_t cam=0;
+        std::memcpy(&cam,beginArgs+0x88,sizeof(cam));
+        if(!cam)return false;
+        alignas(8) uint8_t finishArgs[0x80]{};
+        std::memcpy(finishArgs,&cam,8);
+        std::memcpy(finishArgs+0x10,&tx,sizeof(tx));
+        if(!Invoke(context,finish,finishArgs))return false;
+        std::memcpy(&cam,finishArgs+0x78,sizeof(cam));
+        int32_t id=-1;
+        if(!cam || !Read(cam+0xC,id) || id<0)return false;
+        // Own controller view only; never put the camera in the game's
+        // replicated Camera_C equipment list or spectator feeds.
+        SetActorRotationSafe(cam,{std::clamp(gMonsterPitch-8.0,-60.0,35.0),
+                                  gMonsterYaw,0.0});
+        gWendigoWatchCameras.push_back({cam,world,id});
+        gWendigoWatchCount.store(
+            static_cast<int>(gWendigoWatchCameras.size()));
+        if(gHumanInputController &&
+           SetCameraViewTarget(gHumanInputController,cam))
+            gWendigoViewIndex=static_cast<int>(gWendigoWatchCameras.size())-1;
+        FHJDiag::Log(L"WENDIGO CAMERAS: created an independent private UE CameraActor watchpoint; C places, V cycles, F11 returns human. This does not use survivor cameras.");
+        return true;
+#else
+        return false;
+#endif
+    }
     void ReleaseMonsterCamera(uintptr_t pc,uintptr_t destination) {
         RestorePossessionClarity(pc);
         RestoreLocalMothmanSmoke();
