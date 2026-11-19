@@ -109,6 +109,14 @@ namespace HunterNative {
     bool RequestSetMapSpawnerEnabled(int mapSpawnerIndex, bool enabled);
     bool RequestPossessCryptid(int objectIndex);
     bool RequestRestoreHuman();
+    // Separate game-mode controls. Day state is authoritative when the
+    // live FL_Gamemode_C.Director component is accessible; -1 = unknown.
+    int GetCryptidHuntNightState();
+    void DrawCryptidHuntDaylightVision(ImVec2 screen);
+    bool RequestWendigoDeployCamera();
+    bool RequestWendigoCycleCamera();
+    bool RequestWendigoExitCamera();
+    int WendigoCameraCount();
     // Only abilities exposed by the matching creature's reflected class are invoked.
     bool RequestMonsterAbility(int slot);
     // -1 uses automatic native sound matching; otherwise a loaded USoundBase
