@@ -161,6 +161,21 @@ namespace {
         int32_t pawnIndex=-1,componentIndex=-1;
         bool previouslyHidden=false;
     } gLocalMothmanSmoke;
+    struct LocalMothmanRender {
+        struct Part {
+            uintptr_t component=0;
+            int32_t id=-1;
+            bool originallyHidden=false;
+            bool modified=false;
+        };
+        uintptr_t pawn=0;
+        int32_t pawnId=-1;
+        std::array<Part,3> visibleParts{};
+        uintptr_t postProcess=0;
+        int32_t postId=-1;
+        bool postEnabled=false,postModified=false;
+        bool lastStealthed=false,stealthLogged=false;
+    } gMothRender;
     struct NativeMothmanFlight {
         uintptr_t pawn=0;
         int32_t objectIndex=-1;
@@ -251,6 +266,8 @@ namespace {
     void FreeflightTick();
     void RestoreLocalMothmanSmoke();
     void SyncLocalMothmanSmoke();
+    void RestoreLocalMothmanRender();
+    void SyncLocalMothmanRender();
     void ApplyPossessionClarity(uintptr_t pc,uintptr_t cameraComponent);
     void RestorePossessionClarity(uintptr_t pc);
     void RefreshPossessionClarity(uintptr_t pc);
@@ -641,6 +658,7 @@ namespace {
             // Old UObjects are invalid after level transition. Do not call
             // render functions on them; the scene is destroyed by the engine.
             gLocalMothmanSmoke=LocalMothmanSmoke{};
+            gMothRender=LocalMothmanRender{};
             gMothFlight=NativeMothmanFlight{};
             gCameraAutoManageSaved=false;
             gMonsterIndex=-1;gCameraIndex=-1;gLastMotionTick=0;
@@ -1877,9 +1895,105 @@ namespace {
         gLocalMothmanSmoke={gMonsterPawn,smoke,pawnId,smokeId,wasHidden};
         FHJDiag::Log(L"MOTHMAN LOCAL SMOKE: hid only the local Smoke Niagara renderer; eyes, moths, wings and remote player visuals are unchanged.");
     }
+    void RestoreLocalMothmanRender() {
+        const auto saved=gMothRender;
+        gMothRender=LocalMothmanRender{};
+        int32_t live=-1;
+        if(!saved.pawn || !Read(saved.pawn+0xC,live) ||
+           live!=saved.pawnId)return;
+        constexpr uintptr_t expectedOffsets[3]{0x3D0,0x3B8,0x3C0};
+        for(size_t i=0;i<3;++i) {
+            const auto& part=saved.visibleParts[i];
+            int32_t id=-1;
+            if(part.modified && part.component &&
+               ReadPtr(saved.pawn+expectedOffsets[i])==part.component &&
+               Read(part.component+0xC,id) && id==part.id)
+                SetLocalSmokeHidden(part.component,part.originallyHidden);
+        }
+        int32_t postId=-1;
+        if(saved.postModified && saved.postProcess &&
+           ReadPtr(saved.pawn+0x340)==saved.postProcess &&
+           Read(saved.postProcess+0xC,postId) && postId==saved.postId) {
+            uint8_t flags=0;
+            if(Read(saved.postProcess+0x94C,flags)) {
+                const uint8_t restored=saved.postEnabled?
+                    static_cast<uint8_t>(flags|1):
+                    static_cast<uint8_t>(flags&~1);
+                TryWrite(saved.postProcess+0x94C,restored);
+            }
+        }
+        FHJDiag::Log(L"MOTHMAN LOCAL VISION: restored pre-possession body/wing visibility and post-process state.");
+    }
+    void SyncLocalMothmanRender() {
+        if(!gMonsterActive.load() ||
+           ClassName(ReadPtr(gMonsterPawn+0x10))!=L"BP_FlyingPawnTest_C") {
+            if(gMothRender.pawn)RestoreLocalMothmanRender();
+            return;
+        }
+        int32_t id=-1;
+        if(!Read(gMonsterPawn+0xC,id) || id!=gMonsterIndex)return;
+        if(gMothRender.pawn!=gMonsterPawn || gMothRender.pawnId!=id) {
+            if(gMothRender.pawn)RestoreLocalMothmanRender();
+            gMothRender.pawn=gMonsterPawn;
+            gMothRender.pawnId=id;
+        }
+        // IsStealthed (+0x431) is a replicated gameplay state: it MUST NOT
+        // be altered just to make the local camera easier to use.
+        bool stealth=false;
+        if(Read(gMonsterPawn+0x431,stealth) &&
+           (!gMothRender.stealthLogged || stealth!=gMothRender.lastStealthed)) {
+            gMothRender.lastStealthed=stealth;
+            gMothRender.stealthLogged=true;
+            FHJDiag::Log(stealth?
+                L"MOTHMAN VISIBILITY: native replicated IsStealthed=TRUE; local renderer is compensated without changing stealth for other players.":
+                L"MOTHMAN VISIBILITY: native replicated IsStealthed=FALSE; local render visibility rechecked.");
+        }
+        constexpr uintptr_t offsets[3]{0x3D0,0x3B8,0x3C0};
+        for(size_t i=0;i<3;++i) {
+            const auto partPtr=ReadPtr(gMonsterPawn+offsets[i]);
+            if(!partPtr)continue;
+            auto& part=gMothRender.visibleParts[i];
+            int32_t partIndex=-1;
+            if(!Read(partPtr+0xC,partIndex))continue;
+            if(part.component!=partPtr || part.id!=partIndex) {
+                part=LocalMothmanRender::Part{};
+                part.component=partPtr;
+                part.id=partIndex;
+                uint8_t flags=0;
+                if(Read(partPtr+0x189,flags))
+                    part.originallyHidden=(flags&0x08)!=0;
+            }
+            uint8_t flags=0;
+            if(Read(partPtr+0x189,flags) && (flags&0x08)) {
+                if(SetLocalSmokeHidden(partPtr,false))
+                    part.modified=true;
+            }
+        }
+        // BP_FlyingPawnTest_C.PostProcess is a separate local
+        // UPostProcessComponent, whose bEnabled (+0x94C bit 0) is NOT
+        // replicated in UE5.5. Suppress only its local darkening/
+        // blur effect while the hunter is piloting the creature.
+        const auto post=ReadPtr(gMonsterPawn+0x340);
+        int32_t postId=-1;
+        if(post && Read(post+0xC,postId)) {
+            if(gMothRender.postProcess!=post ||
+               gMothRender.postId!=postId) {
+                gMothRender.postProcess=post;
+                gMothRender.postId=postId;
+                uint8_t flags=0;
+                if(Read(post+0x94C,flags))
+                    gMothRender.postEnabled=(flags&1)!=0;
+            }
+            uint8_t flags=0;
+            if(Read(post+0x94C,flags) && (flags&1) &&
+               TryWrite(post+0x94C,static_cast<uint8_t>(flags&~1)))
+                gMothRender.postModified=true;
+        }
+    }
     void ReleaseMonsterCamera(uintptr_t pc,uintptr_t destination) {
         RestorePossessionClarity(pc);
         RestoreLocalMothmanSmoke();
+        RestoreLocalMothmanRender();
         if(pc && gCameraAutoManageSaved) {
             TryWrite(pc+0x370,gOriginalCameraAutoManage);
             gCameraAutoManageSaved=false;
@@ -2560,6 +2674,7 @@ namespace {
     }
     bool RebindControlledCryptid(uintptr_t newPawn) {
         RestoreLocalMothmanSmoke(); // restore the old actor before reassignment
+        RestoreLocalMothmanRender();
         int32_t id=-1;
         if(!newPawn || ReadPtr(newPawn+0x10)!=gControlledCryptidClass ||
            !Read(newPawn+0xC,id) || id<0)return false;
@@ -2772,6 +2887,8 @@ namespace {
         if(gMonsterActive.load() && !MonitorControlledRespawn(world,now))return;
         if(gMonsterActive.load() || gLocalMothmanSmoke.component)
             SyncLocalMothmanSmoke();
+        if(gMonsterActive.load() || gMothRender.pawn)
+            SyncLocalMothmanRender();
         if(now-gLastPossessionClarityRefresh>=600) {
             gLastPossessionClarityRefresh=now;
             if(gMonsterActive.load() || gPossessionClarity.active) {
