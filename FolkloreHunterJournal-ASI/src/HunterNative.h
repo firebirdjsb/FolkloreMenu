@@ -90,6 +90,8 @@ namespace HunterNative {
     std::vector<CryptidSpawnPoint> GetActiveMapSpawners();
     CryptidCameraSettings GetCryptidCameraSettings();
     void SetCryptidCameraSettings(const CryptidCameraSettings& value);
+    bool MothmanLocalSmokeReduction();
+    void SetMothmanLocalSmokeReduction(bool enabled);
     std::vector<VanityItem> GetVanityItems();
     bool RequestEquipVanity(const std::string& className);
     // Gameplay changes are runtime experiments and may not replicate to clients.
