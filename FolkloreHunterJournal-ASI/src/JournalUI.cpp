@@ -377,6 +377,8 @@ namespace FHJ
             HunterNative::DrawESPSettings();
             ImGui::Spacing();ImGui::Separator();
             ImGui::TextColored(Palette::col_gold,"CRYPTID SPAWNING [HOST]");
+            ImGui::Text("Loaded hunt: %s",
+                state.activeHuntName.empty()?"awaiting FL_Gamestate":state.activeHuntName.c_str());
             static int wave=1,selectedCreature=-1;
             ImGui::SliderInt("Native spawner triggers",&wave,1,10);
             ImGui::Text("Queued requests: %d | Directly created: %d",
@@ -582,7 +584,7 @@ namespace FHJ
                 status.host ? "Native host commands can be queued on the game window thread." : "Start your own solo/private host session to access this page.",!status.host);
             static float hour=12.0f;
             static float timeScale=1.0f;
-            static int xp=100, silver=100;
+            static int xp=100, levels=1, silver=100;
             if (!status.host) ImGui::BeginDisabled();
             if (ImGui::SliderFloat("Time of day",&hour,0,24,"%.1f"))
                 hour=std::clamp(hour,0.f,24.f);
@@ -592,6 +594,10 @@ namespace FHJ
             ImGui::InputInt("Add XP",&xp);
             xp=std::clamp(xp,1,100000);
             if (ImGui::Button("GRANT XP",ImVec2(-1,30))) HunterNative::RequestAddXP(xp);
+            ImGui::InputInt("Grant levels",&levels);
+            levels=std::clamp(levels,1,100);
+            if(ImGui::Button("GRANT LEVELS (NATIVE GAMEMODE)",ImVec2(-1,30)))
+                HunterNative::RequestAddLevels(levels);
             ImGui::InputInt("Silver",&silver);
             silver=std::clamp(silver,1,100000);
             if (ImGui::Button("GRANT SILVER",ImVec2(-1,30))) HunterNative::RequestAddSilver(silver);
