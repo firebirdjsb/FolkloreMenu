@@ -295,8 +295,9 @@ namespace FHJ
             static bool noclip = false;
             if(ImGui::Checkbox("Local noclip / free-fly (experimental)", &noclip))
                 HunterNative::RequestNoclip(noclip);
-            ImGui::TextDisabled("Free flight: WASD camera-relative movement, Space up, Ctrl down, Shift boost.");
-            ImGui::TextDisabled("Game clients may receive server correction; test while hosting.");
+            ImGui::TextDisabled("Minecraft-style noclip: WASD horizontal, Space up, Ctrl down, Shift boost.");
+            ImGui::TextDisabled("Releasing the keys holds exact position; game movement input is suspended.");
+            ImGui::TextDisabled("ESP health values/bars only appear on PLAYERS and CRYPTIDS.");
             Notice("MULTIPLAYER AUTHORITY", status.host ? "Authoritative GameMode detected; host actions available." : "Client-only session: host actions are disabled.", !status.host);
         }
 
@@ -362,7 +363,7 @@ namespace FHJ
 
         void DrawCryptids()
         {
-            Heading("CRYPTIDS, NPCS & WORLD OBJECTS", "REAL-TIME ESP / SPAWNED HUNTS / BECOME A CREATURE");
+            Heading("CRYPTIDS, NPCS & WORLD OBJECTS", "REAL-TIME ESP / NATIVE HOST SPAWNING");
             const auto state=HunterNative::GetStatus();
             ImGui::Text("Cryptids: %d  Wildlife/NPCs: %d  Players: %d",state.activeCryptids,
                 state.activeWildlife,state.activePlayers);
@@ -376,63 +377,95 @@ namespace FHJ
             HunterNative::DrawESPSettings();
             ImGui::Spacing();ImGui::Separator();
             ImGui::TextColored(Palette::col_gold,"CRYPTID SPAWNING [HOST]");
+            ImGui::Text("Loaded hunt: %s",
+                state.activeHuntName.empty()?"awaiting FL_Gamestate":state.activeHuntName.c_str());
             static int wave=1,selectedCreature=-1;
             ImGui::SliderInt("Native spawner triggers",&wave,1,10);
-            if(!state.host)ImGui::BeginDisabled();
+            ImGui::Text("Queued requests: %d | Directly created: %d",
+                state.pendingSpawnTriggers,state.confirmedSpawned);
+            if(!state.host || state.activeMobSpawners==0)ImGui::BeginDisabled();
             if(ImGui::Button("TRIGGER LOADED MOB SPAWNERS",ImVec2(-1,32)))
                 HunterNative::RequestSpawnMobWave(wave,selectedCreature);
-            if(!state.host)ImGui::EndDisabled();
+            if(!state.host || state.activeMobSpawners==0)ImGui::EndDisabled();
+            if(state.activeMobSpawners==0)
+                ImGui::TextDisabled("No live BP_MobSpawner in this map; use SPAWN SELECTED CRYPTID below (host position).");
+            ImGui::TextDisabled("Verified cryptid classes use native deferred spawning;");
+            ImGui::TextDisabled("other classes fall back to the map's TriggerSpawn rules.");
             ImGui::TextDisabled("Select a live cryptid below to override spawner MobClass for one trigger,");
             ImGui::TextDisabled("or leave it unselected for each map spawner's default species.");
-            const auto creatures=HunterNative::GetCreatures();
-            ImGui::TextColored(Palette::col_gold,"BECOME A LIVE CRYPTID [EXPERIMENTAL]");
-            std::string selectedLabel="Select a live cryptid";
-            bool isPawn=false;
-            for(const auto& creature:creatures) if(creature.objectIndex==selectedCreature) {
-                selectedLabel=creature.displayName+" #"+std::to_string(creature.objectIndex);
-                isPawn=creature.isPawn;
-            }
-            if(ImGui::BeginCombo("Cryptid",selectedLabel.c_str())) {
-                for(const auto& creature:creatures) {
-                    const auto name=creature.displayName+" #"+std::to_string(creature.objectIndex);
-                    ImGui::PushID(creature.objectIndex);
-                    if(ImGui::Selectable(name.c_str(),creature.objectIndex==selectedCreature))
-                        selectedCreature=creature.objectIndex;
+            ImGui::Separator();
+            ImGui::TextColored(Palette::col_gold,"SPAWN A SPECIFIC CRYPTID IN THIS MAP");
+            const auto spawnTypes=HunterNative::GetSpawnableCryptidClasses();
+            const auto spawnPoints=HunterNative::GetActiveMapSpawners();
+            static int selectedSpawnClass=-1,selectedSpawnPoint=-1;
+            
+            std::string spawnLabel="Choose a loaded cryptid class";
+            bool selectedMapNative=false;
+            for(const auto& type:spawnTypes)
+                if(type.objectIndex==selectedSpawnClass) {
+                    selectedMapNative=type.presentAsLiveActor;
+                    spawnLabel=type.displayName+
+                        (type.presentAsLiveActor?" [MAP NATIVE]":" [CROSS-MAP EXPERIMENTAL]");
+                }
+            if(ImGui::BeginCombo("Cryptid species to create",spawnLabel.c_str())) {
+                for(const auto& type:spawnTypes) {
+                    const std::string label=type.displayName+
+                        (type.presentAsLiveActor?" [MAP NATIVE]":" [CROSS-MAP EXPERIMENTAL]");
+                    ImGui::PushID(type.objectIndex);
+                    if(ImGui::Selectable(label.c_str(),
+                                        type.objectIndex==selectedSpawnClass))
+                        selectedSpawnClass=type.objectIndex;
                     ImGui::PopID();
                 }
                 ImGui::EndCombo();
             }
-            if(!state.host || selectedCreature<0 || !isPawn)ImGui::BeginDisabled();
-            if(ImGui::Button("CONTROL CRYPTID [PUPPET MODE]",ImVec2(-1,32)))
-                HunterNative::RequestPossessCryptid(selectedCreature);
-            if(!state.host || selectedCreature<0 || !isPawn)ImGui::EndDisabled();
-            if(!state.host)ImGui::BeginDisabled();
-            if(ImGui::Button("RESTORE HUMAN CHARACTER",ImVec2(-1,30)))
-                HunterNative::RequestRestoreHuman();
-            if(!state.host)ImGui::EndDisabled();
-            ImGui::TextDisabled("Puppet Mode keeps your human pawn possessed, avoiding solo-session restart.");
-            ImGui::TextDisabled("Native movement input drives monster walking/running animation.");
-            if(HunterNative::MonsterModeActive()) {
-                ImGui::Separator();
-                ImGui::TextColored(Palette::col_gold,"MONSTER ABILITIES");
-                if(ImGui::Button("MELEE ATTACK [LMB]",ImVec2(-1,29)))
-                    HunterNative::RequestMonsterAbility(0);
-                const bool vampire=HunterNative::MonsterSpecies()==2;
-                if(!vampire)ImGui::BeginDisabled();
-                if(ImGui::Button("VAMPIRE SCREAM [Q]",ImVec2(-1,29)))
-                    HunterNative::RequestMonsterAbility(1);
-                if(ImGui::Button("VAMPIRE INVISIBILITY [E]",ImVec2(-1,29)))
-                    HunterNative::RequestMonsterAbility(2);
-                if(ImGui::Button("VAMPIRE CHANGE STANCE [R]",ImVec2(-1,29)))
-                    HunterNative::RequestMonsterAbility(3);
-                if(ImGui::Button("VAMPIRE SCREAM AUDIO",ImVec2(-1,29)))
-                    HunterNative::RequestMonsterAbility(4);
-                if(!vampire)ImGui::EndDisabled();
-                if(!vampire)ImGui::TextDisabled("Mothman/Wendigo unique abilities need verified class-specific parameters.");
+            std::string spawnPointLabel="Automatic / host location if map has no spawner";
+            for(const auto& point:spawnPoints)
+                if(point.objectIndex==selectedSpawnPoint)
+                    spawnPointLabel=point.displayName;
+            if(ImGui::BeginCombo("Spawn point on current map",spawnPointLabel.c_str())) {
+                if(ImGui::Selectable("Automatic / host location if no spawner",
+                                      selectedSpawnPoint<0))
+                    selectedSpawnPoint=-1;
+                for(const auto& point:spawnPoints) {
+                    ImGui::PushID(point.objectIndex);
+                    if(ImGui::Selectable(point.displayName.c_str(),
+                                        point.objectIndex==selectedSpawnPoint))
+                        selectedSpawnPoint=point.objectIndex;
+                    ImGui::PopID();
+                }
+                ImGui::EndCombo();
             }
-            ImGui::TextDisabled("F8 journal, F11 safe Return Human; hunter HUD hidden in monster mode.");
-            Notice("SDK VALIDATION",
-                "ESP animal/box/mission categories use class-name heuristics, not a verified complete object list. Native spawning and possession are untested in multiplayer.",true);
+            if(selectedSpawnPoint>=0) {
+                if(!state.host)ImGui::BeginDisabled();
+                if(ImGui::Button("ENABLE THIS MAP SPAWNER"))
+                    HunterNative::RequestSetMapSpawnerEnabled(selectedSpawnPoint,true);
+                ImGui::SameLine();
+                if(ImGui::Button("DISABLE THIS MAP SPAWNER"))
+                    HunterNative::RequestSetMapSpawnerEnabled(selectedSpawnPoint,false);
+                if(!state.host)ImGui::EndDisabled();
+                ImGui::TextDisabled("Uses BP_MobSpawner_C.SetSpawningEnabled; restores map rules on level change.");
+            }
+            ImGui::Text("Loaded cryptid classes: %d  |  Map spawners: %d",
+                        static_cast<int>(spawnTypes.size()),
+                        static_cast<int>(spawnPoints.size()));
+            if(!state.host || selectedSpawnClass<0)ImGui::BeginDisabled();
+            if(ImGui::Button("SPAWN SELECTED CRYPTID",ImVec2(-1,35)))
+                HunterNative::RequestSpawnCryptidClass(selectedSpawnClass,wave,
+                                                       selectedSpawnPoint,false);
+            if(!state.host || selectedSpawnClass<0)ImGui::EndDisabled();
+            ImGui::TextDisabled("Mothman loads as BP_FlyingPawnTest_C, not BP_Cryptid_Base_C.");
+            if(selectedSpawnClass>=0 && !selectedMapNative)
+                ImGui::TextColored(Palette::col_gold,
+                    "FOREIGN CREATURE: class exists but no live actor of that class on this map.");
+            ImGui::TextDisabled("Only complete Wendigo, Vampire and Mothman actor classes are listed.");
+            ImGui::TextDisabled("Cross-map species require loaded mesh, AnimBlueprint and AI controller.");
+            ImGui::TextDisabled("Incomplete direct spawns are rejected to avoid invisible, motionless actors.");
+            ImGui::TextDisabled("A direct spawn is verified by model+animation+AI; TriggerSpawn calls are not actor proof.");
+            ImGui::Separator();
+            ImGui::TextColored(Palette::col_gold,"POSSESSION HAS MOVED");
+            ImGui::TextWrapped("Cryptid possession, survivor-vs-cryptid rounds, creature abilities and night rules now belong to the separate FolkloreCryptidHunt.asi game mode.");
+            ImGui::TextWrapped("This Journal keeps world ESP and host creature spawning only. Use ONE of the two ASI modules until a shared rendering hook is implemented.");
         }
 
         void DrawPhysics()
@@ -491,7 +524,7 @@ namespace FHJ
                 status.host ? "Native host commands can be queued on the game window thread." : "Start your own solo/private host session to access this page.",!status.host);
             static float hour=12.0f;
             static float timeScale=1.0f;
-            static int xp=100, silver=100;
+            static int xp=100, levels=1, silver=100;
             if (!status.host) ImGui::BeginDisabled();
             if (ImGui::SliderFloat("Time of day",&hour,0,24,"%.1f"))
                 hour=std::clamp(hour,0.f,24.f);
@@ -501,6 +534,10 @@ namespace FHJ
             ImGui::InputInt("Add XP",&xp);
             xp=std::clamp(xp,1,100000);
             if (ImGui::Button("GRANT XP",ImVec2(-1,30))) HunterNative::RequestAddXP(xp);
+            ImGui::InputInt("Grant levels",&levels);
+            levels=std::clamp(levels,1,100);
+            if(ImGui::Button("GRANT LEVELS (NATIVE GAMEMODE)",ImVec2(-1,30)))
+                HunterNative::RequestAddLevels(levels);
             ImGui::InputInt("Silver",&silver);
             silver=std::clamp(silver,1,100000);
             if (ImGui::Button("GRANT SILVER",ImVec2(-1,30))) HunterNative::RequestAddSilver(silver);
@@ -575,7 +612,62 @@ namespace FHJ
             ImGui::TextColored(Palette::col_gold,"THE HOST'S HAUNTINGS");
 
             const auto selectedPrankTarget=DrawPlayerSelect("Scare target (host actions)");
-            ImGui::TextDisabled("Shared horror effects target current world; player-specific noise below targets selection.");
+            ImGui::TextDisabled("Select a player for a client-side native sound or AI noise event.");
+            const auto sounds=HunterNative::GetSounds();
+            static int selectedSound=-1;
+            static float selectedSoundVolume=1.f;
+            std::string soundName="Choose a loaded game sound";
+            for(const auto& sound:sounds)if(sound.objectIndex==selectedSound)
+                soundName=sound.displayName;
+            if(ImGui::BeginCombo("Native horror sound",soundName.c_str())) {
+                for(const auto& sound:sounds) {
+                    ImGui::PushID(sound.objectIndex);
+                    if(ImGui::Selectable(sound.displayName.c_str(),
+                        selectedSound==sound.objectIndex))selectedSound=sound.objectIndex;
+                    ImGui::PopID();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::TextDisabled("Loaded in-game sounds found: %d. Catalog fills as assets are scanned.",
+                static_cast<int>(sounds.size()));
+            ImGui::SliderFloat("Remote sound volume",&selectedSoundVolume,.1f,2.f,"%.1fx");
+            if(!HunterNative::GetStatus().host || selectedSound<0)ImGui::BeginDisabled();
+            if(selectedPrankTarget<0)ImGui::BeginDisabled();
+            if(ImGui::Button("PLAY SOUND ON SELECTED HUNTER",ImVec2(-1,30)))
+                HunterNative::RequestTargetSound(selectedPrankTarget,selectedSound,selectedSoundVolume);
+            if(selectedPrankTarget<0)ImGui::EndDisabled();
+            if(ImGui::Button("PLAY SOUND ON ALL HUNTERS",ImVec2(-1,30)))
+                HunterNative::RequestTargetSound(-1,selectedSound,selectedSoundVolume);
+            if(!HunterNative::GetStatus().host || selectedSound<0)ImGui::EndDisabled();
+            ImGui::TextDisabled("Uses PlayerController.ClientPlaySound (owning-client RPC).");
+            const auto shakes=HunterNative::GetCameraShakes();
+            static int selectedShake=-1;
+            static float shakeIntensity=1.f;
+            std::string shakeName="Choose a loaded camera shake class";
+            for(const auto& item:shakes)if(item.objectIndex==selectedShake)
+                shakeName=item.displayName;
+            if(ImGui::BeginCombo("Online scare camera effect",shakeName.c_str())) {
+                for(const auto& item:shakes) {
+                    ImGui::PushID(item.objectIndex);
+                    if(ImGui::Selectable(item.displayName.c_str(),
+                        selectedShake==item.objectIndex))selectedShake=item.objectIndex;
+                    ImGui::PopID();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::TextDisabled("Loaded native camera shakes: %d",
+                static_cast<int>(shakes.size()));
+            ImGui::SliderFloat("Scare shake intensity",&shakeIntensity,.1f,2.f,"%.1fx");
+            if(!HunterNative::GetStatus().host || selectedShake<0)ImGui::BeginDisabled();
+            if(selectedPrankTarget<0)ImGui::BeginDisabled();
+            if(ImGui::Button("SHAKE SELECTED HUNTER'S CAMERA",ImVec2(-1,30)))
+                HunterNative::RequestTargetCameraShake(selectedPrankTarget,selectedShake,shakeIntensity);
+            if(selectedPrankTarget<0)ImGui::EndDisabled();
+            if(ImGui::Button("SHAKE ALL HUNTERS' CAMERAS",ImVec2(-1,30)))
+                HunterNative::RequestTargetCameraShake(-1,selectedShake,shakeIntensity);
+            if(!HunterNative::GetStatus().host || selectedShake<0)ImGui::EndDisabled();
+            ImGui::TextDisabled("Native shake + sound can reach owning clients; custom local ImGui art cannot.");
+            ImGui::TextDisabled("For an online scare, trigger the sound and shake on the same target.");
             if(selectedPrankTarget>=0) {
                 static float loudness=5.f, range=70.f;
                 ImGui::SliderFloat("Noise loudness",&loudness,0.1f,25.f);
@@ -593,7 +685,7 @@ namespace FHJ
             if (ImGui::Button("RESTORE HUNTERS' FLASHLIGHTS  [HOST]",ImVec2(-1,32)))
                 HunterNative::RequestFlickerLights(true);
             if (!horrorHost.host) ImGui::EndDisabled();
-            ImGui::TextDisabled("Multicast declarations confirmed in SDK. Host effects require live actors.");
+            ImGui::TextDisabled("Native host effects require loaded actors and two-client playback testing.");
             ImGui::Separator();
 
             const auto status=HunterNative::GetStatus();
@@ -627,9 +719,8 @@ namespace FHJ
             ImGui::BulletText("S'more: FL_Gamemode.EnableSmoreMode (Blueprint override)");
             ImGui::TextDisabled("Their effects are NOT documented; dispatch is logged; gameplay must be tested.");
             ImGui::TextDisabled("Some developer modes may persist until restarting the session.");
-            if(ImGui::Button("CLEAR ALL WEATHER EFFECTS",ImVec2(-1,30))) {
-                HunterNative::RequestRain(0);HunterNative::RequestSnow(0);
-            }
+            if(ImGui::Button("CLEAR ALL RAIN + SNOW",ImVec2(-1,30)))
+                HunterNative::RequestClearWeather();
             ImGui::TextDisabled("Time of day and movement cheats were moved out of MISCHIEF.");
             ImGui::Spacing();
             if (!status.host) ImGui::EndDisabled();

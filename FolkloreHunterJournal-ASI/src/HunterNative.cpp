@@ -8,9 +8,11 @@
 #include <imgui.h>
 #include <Windows.h>
 #include <atomic>
+#include <array>
 #include <mutex>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 #include <string>
 #include <cmath>
@@ -33,11 +35,15 @@ namespace {
     struct Rot { double pitch{},yaw{},roll{}; };
     struct Name { int32_t index{}; uint32_t number{}; };
     struct FStringView { wchar_t* data{}; int32_t size{},capacity{}; };
-    struct Marker { Vec3 pos{}; int kind{}; double health{-1.0}; };
+    struct Marker {
+        Vec3 pos{}; int kind{};
+        double health{-1.0},maxHealth{-1.0};
+        bool mothman=false; // APawn species has no base-cryptid HP fields
+    };
     struct Camera { Vec3 pos{}; Rot rot{}; float fov{}; };
     struct ActorEntry { uintptr_t address{}; int index{}; int kind{}; };
     struct LevelView { uintptr_t data{}; int32_t count{}; int32_t start{}; };
-    enum class ActionType { GiveItem, CatalogItem, GodMode, AddXP, Time, TimeScale, AddSilver, InfiniteDamage, BeanMode, RangerMode, SmoreMode, Rain, Snow, VampireScream, FlickerLights, CancelFlicker, TargetHealth, TargetItem, TargetNoise, TargetRevive, TargetKill, TargetKick, TargetGodMode, NoclipOn, NoclipOff, FallProtection, SpeedChange, JumpBoost, GravityChange, SpawnMob, PossessCryptid, RestoreHuman, MonsterAbility, EquipVanity };
+    enum class ActionType { GiveItem, CatalogItem, GodMode, AddXP, AddLevels, Time, TimeScale, AddSilver, InfiniteDamage, BeanMode, RangerMode, SmoreMode, Rain, Snow, ClearWeather, VampireScream, FlickerLights, CancelFlicker, TargetHealth, TargetItem, TargetNoise, TargetRevive, TargetKill, TargetKick, TargetGodMode, TargetSound, TargetCameraShake, NoclipOn, NoclipOff, FallProtection, SpeedChange, JumpBoost, GravityChange, SpawnMob, SpawnSpecies, SpawnerToggle, PossessCryptid, RestoreHuman, AssignRemoteRole, RestoreRemoteRole, MonsterAbility, EquipVanity, WendigoPlaceCamera, WendigoCycleCamera, WendigoCloseCamera };
     struct Action { ActionType type{}; std::string item; int amount{}; float value{}; int target{-1}; double precise{}; };
     std::mutex gMutex;
     std::mutex gActionsMutex;
@@ -47,9 +53,16 @@ namespace {
     std::atomic_bool gActionPending{false};
     std::vector<Action> gActions;
     std::vector<ActorEntry> gKnown;
+    std::vector<ActorEntry> gKnownSpawners;
+    std::vector<HunterNative::CryptidSpawnClass> gSpawnClassCandidates,gSpawnClassCatalog;
+    std::vector<HunterNative::CryptidSpawnPoint> gSpawnPointCatalog;
+    int gSpawnClassScanCursor=0;
     std::vector<Marker> gMarkers;
     std::vector<HunterNative::PlayerInfo> gRoster;
     std::vector<HunterNative::CreatureInfo> gCreatures;
+    std::vector<HunterNative::SoundInfo> gSounds, gSoundCandidates;
+    std::vector<HunterNative::CameraShakeInfo> gCameraShakes, gCameraShakeCandidates;
+    int gSoundScanCursor=0;
     struct VanityChoice { uintptr_t klass{}; std::string name; bool equipped{}; };
     std::vector<VanityChoice> gVanityChoices;
     // Saved original values for correct reversibility, keyed to live pawn identity.
@@ -82,13 +95,30 @@ namespace {
     std::unordered_map<uintptr_t, GodBackup> gGodBackups;
     uintptr_t gHumanPawn = 0;
     int32_t gHumanIndex = -1;
+    uintptr_t gHumanInputController=0;
+    bool gHumanInputDisabled=false, gHumanIgnoreMovement=false, gHumanIgnoreLook=false;
     bool gPossessedCryptid = false;
+    // One map spawner can be used for many requests. Pace native TriggerSpawn
+    // invocations so a one-spawner level doesn't silently cap a wave at one.
+    struct SpawnWave {
+        int remaining=0, requested=0, dispatched=0, speciesIndex=-1;
+        ULONGLONG nextTick=0;int created=0;
+        int classObjectIndex=-1, spawnerObjectIndex=-1;
+        bool controlFirst=false;
+    };
+    SpawnWave gSpawnWave{};
     std::atomic_bool gWildlife{true}, gContainers{true}, gQuest{true}, gLoot{true};
     
     uintptr_t gNoclipPawn = 0;
     uint8_t gPriorMovement = 1;
     bool gPriorCollision = true;
     bool gNoclipEnabled = false;
+    // Minecraft-style free-flight holds its own position every simulation
+    // update. CharacterMovement/Blueprint velocity cannot create idle drift.
+    Vec3 gNoclipPosition{};
+    bool gNoclipPositionValid=false;
+    uintptr_t gNoclipController=0;
+    bool gNoclipIgnoredMove=false;
     float gOriginalFlySpeed=0.f;
     uintptr_t gOriginalFlyMovement=0;
     bool gFlySpeedSaved=false;
@@ -96,13 +126,141 @@ namespace {
     bool gMonsterBrainWasRunning=false;
     uintptr_t gMonsterMovement=0;
     float gMonsterOriginalWalkSpeed=0.f, gMonsterOriginalFlySpeed=0.f;
+    float gMonsterNativeWalkSpeed=0.f, gMonsterNativeRunSpeed=0.f;
     bool gMonsterSpeedsSaved=false;
+    bool gMonsterModeSaved=false;
+    struct GroundMovementSettings {
+        bool saved=false;
+        uintptr_t pawn=0,movement=0;
+        int32_t pawnId=-1;
+        uint8_t rotationBefore=0,pathBefore=0,pawnYawBefore=0;
+    } gGroundMovementSettings;
+    struct GroundMovementDrive {
+        uintptr_t pawn=0;
+        int32_t pawnId=-1;
+        bool useNavFallback=false;
+        bool sampleValid=false;
+        Vec3 samplePosition{};
+        ULONGLONG sampleAt=0;
+    } gGroundDrive;
+    bool gMonsterFlightActive=false;
+    bool gGroundJumpHeld=false;
+    // AI path following accepts movement for AI-possessed cryptids; a regular
+    // Pawn.AddMovementInput call can be ignored by their controller.
+    ULONGLONG gMonsterLastMoveRequest=0;
+    bool gMonsterPathActive=false;
+    double gMonsterMoveDirX=0.0,gMonsterMoveDirY=0.0;
+    Vec3 gMonsterMoveGoal{};
+    std::atomic<float> gCryptidYawSensitivity{0.12f};
+    std::atomic<float> gCryptidPitchSensitivity{0.12f};
+    std::atomic<float> gCryptidCameraFollow{32.0f};
+    std::atomic_bool gCryptidInvertPitch{false};
+    std::atomic_bool gCryptidClearLocalBlur{true};
+    // The two motion-blur CVars and depth-of-field CVar are viewport-
+    // local, not replicated. Save before changing and restore on return.
+    struct PossessionClarityBackup {
+        bool active=false;
+        uintptr_t camera=0;
+        int32_t cameraIndex=-1;
+        bool cameraSaved=false;
+        uint8_t previousOverrides=0;
+        float previousWeight=0.f,previousBlurAmount=0.f,previousBlurMax=0.f;
+        std::array<int32_t,3> originalCvars{};
+        std::array<bool,3> cvarsSaved{};
+    } gPossessionClarity;
+    ULONGLONG gLastPossessionClarityRefresh=0;
+    std::atomic_bool gMothmanReduceLocalSmoke{true};
+    struct LocalMothmanSmoke {
+        uintptr_t pawn=0,component=0;
+        int32_t pawnIndex=-1,componentIndex=-1;
+        bool previouslyHidden=false;
+    } gLocalMothmanSmoke;
+    struct LocalMothmanRender {
+        struct Part {
+            uintptr_t component=0;
+            int32_t id=-1;
+            bool originallyHidden=false;
+            bool modified=false;
+        };
+        uintptr_t pawn=0;
+        int32_t pawnId=-1;
+        std::array<Part,3> visibleParts{};
+        uintptr_t postProcess=0;
+        int32_t postId=-1;
+        bool postEnabled=false,postModified=false;
+        bool lastStealthed=false,stealthLogged=false;
+    } gMothRender;
+    struct NativeMothmanFlight {
+        uintptr_t pawn=0;
+        int32_t objectIndex=-1;
+        Vec3 smoothedVelocity{},lastPosition{};
+        ULONGLONG lastMotionSeen=0;
+        bool positionValid=false;
+        bool loggedFallback=false;
+    } gMothFlight;
+    std::unordered_map<std::wstring,uintptr_t> gMonsterFunctions;
+    ULONGLONG gLastCreatureMethodWarning=0;
+    uint8_t gMonsterPriorMovement=1;
     uintptr_t gHumanHUD=0;
     int32_t gHumanHUDIndex=-1;
     uint8_t gPriorHumanHudVisibility=0;
     bool gHumanHudHidden=false;
     bool gHudRestorePending=false;
     int gVampireStance=0;
+    bool gVampireInvisible=false;
+    struct VampireInvisibilityVerification {
+        uintptr_t pawn=0;
+        int32_t actorIndex=-1;
+        bool wanted=false;
+        ULONGLONG verifyAt=0;
+    } gVampireVerify;
+    std::array<ULONGLONG,5> gAbilityTicks{};
+    std::array<bool,3> gAbilityKeyDown{};
+    struct WendigoWatchCamera {
+        uintptr_t object=0,world=0;
+        int32_t objectId=-1;
+    };
+    std::vector<WendigoWatchCamera> gWendigoWatchCameras;
+    std::atomic_int gWendigoWatchCount{0};
+    std::atomic_int gHuntNightCached{-1};
+    // In-memory only; ON means custom Hunt rules apply to this process.
+    // Never change SaveGame objects, contract selection, map path or game mode.
+    std::atomic_bool gCryptidHuntOptedIn{false};
+    std::atomic_int gCryptidHuntMapSpecies{0};
+#ifdef FCH_STANDALONE
+    // Server-only, single remote role. Keep both live UObject identity and
+    // source world; never apply an old role to actors from another map.
+    struct NativeRemoteRole {
+        uintptr_t world=0,playerController=0,human=0,cryptid=0,ai=0;
+        int32_t controllerId=-1,humanId=-1,cryptidId=-1,aiId=-1;
+        ULONGLONG assignedAt=0;
+    } gNativeRemoteRole;
+    std::atomic_int gNativeRolePlayerId{-1},gNativeRoleCryptidId{-1};
+    // Owning client discovers native Controller.Pawn replication independently;
+    // this is NOT a custom network message and does not imply client readiness.
+    std::atomic_bool gClientRoleActive{false},gClientRolePaused{false};
+    std::atomic_int gClientRoleSpecies{0};
+    std::atomic<double> gClientRoleHealth{-1.0},gClientRoleMaxHealth{-1.0};
+    uintptr_t gClientRolePawn=0;
+    int32_t gClientRoleIndex=-1;
+    bool gClientRoleAttackHeld=false,gClientRoleJumpHeld=false;
+    ULONGLONG gClientRoleLastWarning=0;
+#endif
+    constexpr int kWendigoCamerasPerDay=2;
+    int gWendigoCamerasUsedToday=0;
+    std::atomic_int gWendigoCameraDayRemaining{kWendigoCamerasPerDay};
+    int gWendigoLastNightNum=-1,gWendigoPriorPhase=-1;
+    uintptr_t gWendigoDayWorld=0;
+    struct WendigoPlacingStealth {
+        uintptr_t pawn=0,world=0;
+        int32_t id=-1;
+        bool wasHidden=false;
+        ULONGLONG restoreAt=0;
+    } gWendigoPlacingStealth;
+    ULONGLONG gHuntNightLastRead=0;
+    int gWendigoViewIndex=-1;
+    bool gWendigoPlaceKey=false,gWendigoCycleKey=false;
+    std::atomic_int gMonsterAttackSoundIndex{-1};
     ULONGLONG gLastAbilityTick=0;
     Vec3 gChaseSmoothedPos{};
     bool gChaseSmoothedValid=false;
@@ -113,6 +271,17 @@ namespace {
     int32_t gMonsterIndex=-1, gCameraIndex=-1;
     double gMonsterYaw=0.0, gMonsterPitch=0.0;
     double gFlightSpeed=1100.0;
+    // Controlled creature identity survives the old UObject being destroyed.
+    // After a game-world countdown a native map spawner is triggered once,
+    // and the camera/HUD are rebound only to a verified new cryptid actor.
+    uintptr_t gControlledCryptidClass=0;
+    uintptr_t gControlledRespawnSpawner=0;
+    int32_t gControlledRespawnSpawnerIndex=-1;
+    std::unordered_set<int32_t> gControlledExistingIds;
+    double gControlledRespawnStart=-1.0, gControlledRespawnRemaining=0.0;
+    bool gControlledSpawnRequested=false;
+    ULONGLONG gNextControlledRespawnScan=0;
+    Vec3 gControlledLastPosition{};
     ULONGLONG gLastMotionTick=0, gLastScanTick=0, gLastAttackTick=0;
     std::mutex gMonsterStatusMutex;
     struct MonsterHUDState {
@@ -120,7 +289,14 @@ namespace {
         int species=0;
         double health=0.0, maxHealth=0.0;
         bool cameraReady=false;
+        bool mothmanStealthed=false;
+        bool vampireInvisible=false;
         bool possessConfirmed=false;
+        bool respawning=false;
+        float respawnSeconds=0.f;
+        // Only the current cryptid's callable, reflected skills appear.
+        std::array<bool,5> available{};
+        std::array<std::string,5> skills{};
     } gMonsterHUD;
     struct WorldGravityBackup {
         uintptr_t worldSettings=0;
@@ -148,6 +324,38 @@ namespace {
     void MaintainGodProtection();
     void ForceActorNetUpdate(uintptr_t pawn);
     void FreeflightTick();
+    void RestoreLocalMothmanSmoke();
+    void SyncLocalMothmanSmoke();
+    void RestoreLocalMothmanRender();
+    void SyncLocalMothmanRender();
+    void ApplyPossessionClarity(uintptr_t pc,uintptr_t cameraComponent);
+    void RestorePossessionClarity(uintptr_t pc);
+    void RefreshPossessionClarity(uintptr_t pc);
+    void VerifyVampireInvisibility(ULONGLONG now);
+    int NativeHuntNightState();
+    bool IsGameStateBasedOn(uintptr_t obj,const wchar_t* baseName);
+    int HuntSpeciesFromName(const std::wstring& name);
+    void UpdateWendigoCameraQuota(int phase);
+    void RestoreWendigoPlacementStealth();
+    void FinishWendigoStealthIfDue(ULONGLONG now);
+    void ClearWendigoWatchCameras();
+    bool PlaceWendigoWatchCamera();
+    bool CycleWendigoWatchCamera(bool returnToChase);
+    void StopCryptidPath();
+    bool MoveCryptidWithAI(const Vec3& input,ULONGLONG now);
+    void TickNativeMothmanFlight(uintptr_t pawn,const Vec3& desiredInput,
+                                  bool boosting,double dt,ULONGLONG now);
+    uintptr_t CreatureSkillFunction(int species,int slot);
+    std::string CreatureSkillLabel(int species,int slot,uintptr_t fn);
+    void AdvanceSpawnWave();
+    void PossessCreature(int index,bool restore);
+#ifdef FCH_STANDALONE
+    void TickOwningClientRole(uintptr_t world,ULONGLONG now);
+    void MaintainServerRemoteRole(uintptr_t world);
+    void AssignServerRemoteRole(int playerPawnIndex,int cryptidPawnIndex);
+    bool RestoreServerRemoteRole();
+#endif
+    void RefreshSpawnableClassCatalog();
     std::atomic_bool gAutoJump{false};
     int gLastReported=0;
     constexpr double kPi=3.1415926535897932384626433832795;
@@ -209,6 +417,94 @@ namespace {
         }
         return false;
     }
+    bool GetObjects(int& count,uintptr_t& chunks);
+    uintptr_t ObjectAt(int index,uintptr_t chunks);
+    int ClassKind(uintptr_t cls);
+    bool IsCameraShakeClass(uintptr_t klass) {
+        if(ClassName(klass)==L"CameraShakeBase")return false; // abstract base
+        for(int depth=0;klass && depth<25;++depth) {
+            if(ClassName(klass)==L"CameraShakeBase")return depth>0;
+            const auto parent=ReadPtr(klass+0x40);
+            if(!parent || parent==klass)break;
+            klass=parent;
+        }
+        return false;
+    }
+    bool IsSoundAssetClass(uintptr_t cls) {
+        for(int depth=0;cls && depth<25;++depth) {
+            const auto name=ClassName(cls);
+            if(name==L"SoundBase")return true;
+            const auto parent=ReadPtr(cls+0x40);
+            if(!parent || parent==cls)break;
+            cls=parent;
+        }
+        return false;
+    }
+    void RefreshSpawnableClassCatalog() {
+        // Incremental GUObject enumeration: Blueprint classes can be loaded
+        // independently of the level's live actors. Do not inspect 49k
+        // UObjects in one 16ms frame.
+        int count=0;uintptr_t chunks=0;
+        if(!GetObjects(count,chunks))return;
+        static ULONGLONG lastCatalogCycle=0;
+        const auto now=GetTickCount64();
+        if(gSpawnClassScanCursor>=count &&
+           now-lastCatalogCycle>12000) {
+            lastCatalogCycle=now;
+            gSpawnClassScanCursor=0;
+            // Already-discovered classes remain in the catalog, but their
+            // indices are checked again before a spawn is accepted.
+        }
+        for(int n=0;n<350 && gSpawnClassScanCursor<count;++n,++gSpawnClassScanCursor) {
+            const int id=gSpawnClassScanCursor;
+            const auto klass=ObjectAt(id,chunks);
+            if(!klass)continue;
+            const auto meta=ClassName(ReadPtr(klass+0x10));
+            if(meta!=L"BlueprintGeneratedClass" && meta!=L"Class")continue;
+            if(ClassKind(klass)!=2 || !IsPawnClass(klass))continue;
+            const auto name=ObjectName(klass);
+            // Full three-map SDK comparison: BP_Cryptid_Base_C and
+            // BP_VampireBase_C are inherited base classes, not the
+            // complete gameplay actors. Offering them for spawning caused
+            // empty models / missing AI on foreign maps. Only concrete
+            // species encountered as actual PersistentLevel actors qualify.
+            if(name!=L"BP_FlyingPawnTest_C" &&
+               name!=L"BP_Wendigo_C" && name!=L"BP_Vampire_C")continue;
+            int32_t liveId=-1;
+            if(!Read(klass+0x0C,liveId) || liveId!=id)continue;
+            const bool already=std::any_of(gSpawnClassCandidates.begin(),
+                gSpawnClassCandidates.end(),
+                [id](const auto& entry){return entry.objectIndex==id;});
+            if(already)continue;
+            const bool mothman=name==L"BP_FlyingPawnTest_C";
+            const auto title=mothman?"Mothman / BP_FlyingPawnTest_C":
+                std::string(name.begin(),name.end());
+            gSpawnClassCandidates.push_back({id,title,mothman});
+        }
+    }
+    void ScanLoadedSounds() {
+        if(gSoundCandidates.size()>=256 && gCameraShakeCandidates.size()>=96)return;
+        int total=0;uintptr_t chunks=0;
+        if(!GetObjects(total,chunks))return;
+        for(int n=0;n<600 && gSoundScanCursor<total;++n,++gSoundScanCursor) {
+            const auto sound=ObjectAt(gSoundScanCursor,chunks);
+            if(!sound)continue;
+            const auto type=ClassName(ReadPtr(sound+0x10));
+            const bool asset=gSoundCandidates.size()<256 &&
+                IsSoundAssetClass(ReadPtr(sound+0x10));
+            const bool shakeClass=gCameraShakeCandidates.size()<96 &&
+                (type==L"Class" || type==L"BlueprintGeneratedClass") &&
+                IsCameraShakeClass(sound);
+            if(!asset && !shakeClass)continue;
+            auto name=ObjectName(sound);
+            if(name.empty())continue;
+            int32_t index=-1;
+            if(!Read(sound+0x0C,index) || index!=gSoundScanCursor)continue;
+            if(asset)gSoundCandidates.push_back({index,std::string(name.begin(),name.end())});
+            if(shakeClass)gCameraShakeCandidates.push_back(
+                {index,std::string(name.begin(),name.end())});
+        }
+    }
     int ClassKind(uintptr_t cls) {
         if (!cls) return 0;
         if (auto it=gKinds.find(cls);it!=gKinds.end()) return it->second;
@@ -217,7 +513,11 @@ namespace {
         for (int depth=0;depth<24 && current;++depth) {
             const auto name=ClassName(current);
             if (name==L"PlayerCharacter_C") {result=1;break;}
-            if (name==L"BP_Cryptid_Base_C" || name==L"CryptidBase") {result=2;break;}
+            // SDK: Mothman is BP_FlyingPawnTest_C : APawn, not a
+            // BP_Cryptid_Base_C/ACryptidBase descendant. Treat it as a
+            // cryptid for the live roster/ESP/possession selection.
+            if (name==L"BP_Cryptid_Base_C" || name==L"CryptidBase" ||
+                name==L"BP_FlyingPawnTest_C") {result=2;break;}
             const auto parent=ReadPtr(current+0x40);
             if (!parent || parent==current)break;
             current=parent;
@@ -226,8 +526,10 @@ namespace {
             const auto name=Lower(ClassName(cls));
             // Class-name categories are heuristics. This supplements actual inheritance checks.
             // Exclude level-only trigger/volume components to reduce false markers.
-            if(Matches(name,{L"collision",L"trigger",L"volume",L"widget",L"component",L"preview"}))
+            if(Matches(name,{L"collision",L"trigger",L"volume",L"widget",L"component",L"preview"})) {
+                if(!name.empty())gKinds.emplace(cls,0);
                 return 0;
+            }
             if(Matches(name,{L"wolf",L"deer",L"bear",L"boar",L"animal",L"wildlife",L"npc",L"mob_",L"creature"}))
                 result=3;
             else if(Matches(name,{L"chest",L"crate",L"container",L"lootbox",L"loot_box",L"box_"}))
@@ -237,8 +539,11 @@ namespace {
             else if(Matches(name,{L"droppeditem",L"pickup",L"loot_",L"itemdrop",L"placeable",L"supply"}))
                 result=6;
         }
-        // Don't cache negative names. FNames may be unavailable while streaming new maps.
-        if(result) gKinds.emplace(cls,result);
+        // Once a UClass name resolves, its inherited class and heuristic
+        // category are stable until the world cache is invalidated. Caching
+        // non-cryptid classes too avoids repeated ancestry walks on every
+        // streamed-level scan and improves possession frame pacing.
+        if(result || !ClassName(cls).empty())gKinds.emplace(cls,result);
         return result;
     }
     bool GetObjects(int& count,uintptr_t& chunks) {
@@ -277,7 +582,14 @@ namespace {
     std::wstring SettingsPath() {
         wchar_t path[MAX_PATH]{};
         DWORD n=GetEnvironmentVariableW(L"LOCALAPPDATA",path,MAX_PATH);
-        return n&&n<MAX_PATH ? std::wstring(path)+L"\\FolkloreHunterJournal\\journal.ini" : std::wstring();
+        if(!n || n>=MAX_PATH)return {};
+#ifdef FCH_STANDALONE
+        const auto folder=std::wstring(path)+L"\\FolkloreCryptidHunt";
+        CreateDirectoryW(folder.c_str(),nullptr);
+        return folder+L"\\cryptid-hunt.ini";
+#else
+        return std::wstring(path)+L"\\FolkloreHunterJournal\\journal.ini";
+#endif
     }
     void LoadPreferences() {
         std::call_once(gEspPrefsOnce, [] {
@@ -292,6 +604,19 @@ namespace {
             gLoot.store(GetPrivateProfileIntW(L"ESP",L"Loot",1,f.c_str())!=0);
             gMaxDistanceMeters.store(std::clamp(static_cast<int>(
                 GetPrivateProfileIntW(L"ESP",L"MaxMeters",350,f.c_str())),25,750));
+            gCryptidYawSensitivity.store(std::clamp(
+                GetPrivateProfileIntW(L"CryptidCamera",L"YawMilli",120,f.c_str())*.001f,.015f,.60f));
+            gCryptidPitchSensitivity.store(std::clamp(
+                GetPrivateProfileIntW(L"CryptidCamera",L"PitchMilli",120,f.c_str())*.001f,.015f,.60f));
+            gCryptidCameraFollow.store(std::clamp(
+                static_cast<float>(GetPrivateProfileIntW(L"CryptidCamera",L"FollowRate",32,f.c_str())),
+                8.f,72.f));
+            gCryptidInvertPitch.store(
+                GetPrivateProfileIntW(L"CryptidCamera",L"InvertPitch",0,f.c_str())!=0);
+            gCryptidClearLocalBlur.store(
+                GetPrivateProfileIntW(L"CryptidCamera",L"ClearBlurWhilePossessed",1,f.c_str())!=0);
+            gMothmanReduceLocalSmoke.store(
+                GetPrivateProfileIntW(L"Mothman",L"ReduceLocalSmoke",1,f.c_str())!=0);
         });
     }
     void SavePreferences() {
@@ -389,31 +714,121 @@ namespace {
         gLastScanTick=scanTime;
         const uintptr_t world=World();
         if (gPrevWorld!=world) {
+            // A previous possession can end during level travel. Once a
+            // valid new world/player exists, restore the old local CVars.
+            if(gPossessionClarity.active && world) {
+                const auto gi=ReadPtr(world+0x1D8);
+                const auto locals=ReadPtr(gi+0x38);
+                const auto local=ReadPtr(locals);
+                const auto pc=ReadPtr(local+0x30);
+                if(pc)RestorePossessionClarity(pc);
+            }
             gPrevWorld=world;
             gScanIndex=0;
             gKinds.clear();gClassNames.clear();gFunctionCache.clear();
-            gKnown.clear();
+            gKnown.clear();gKnownSpawners.clear();
+            gSpawnClassCandidates.clear();gSpawnClassCatalog.clear();
+            gSpawnPointCatalog.clear();gSpawnClassScanCursor=0;
+            gSoundScanCursor=0;gSoundCandidates.clear();gCameraShakeCandidates.clear();
+            gMonsterAttackSoundIndex.store(-1);
             gPhysicsBackups.clear();gFallBackups.clear();gGodBackups.clear();
+            // Level transition invalidates actor pointers. Never restore input to
+            // a destroyed body; clear references and capture state instead.
             gHumanPawn=0;gHumanIndex=-1;gPossessedCryptid=false;
+            gHumanInputController=0;gHumanInputDisabled=false;
+            gHumanIgnoreMovement=false;gHumanIgnoreLook=false;
+            gMonsterModeSaved=false;
             gMonsterActive.store(false);gMonsterPawn=0;gChaseCamera=0;
+            // Old UObjects are invalid after level transition. Do not call
+            // render functions on them; the scene is destroyed by the engine.
+            gLocalMothmanSmoke=LocalMothmanSmoke{};
+            gMothRender=LocalMothmanRender{};
+            gMothFlight=NativeMothmanFlight{};
             gCameraAutoManageSaved=false;
             gMonsterIndex=-1;gCameraIndex=-1;gLastMotionTick=0;
             gMonsterAIController=0;gMonsterBrain=0;gMonsterBrainWasRunning=false;
             gMonsterMovement=0;gMonsterSpeedsSaved=false;gPuppeteering=false;
+            gGroundMovementSettings=GroundMovementSettings{};
+            gGroundDrive=GroundMovementDrive{};
+            gMonsterPathActive=false;gMonsterLastMoveRequest=0;
+            gMonsterFunctions.clear();
+            gWendigoWatchCameras.clear();gWendigoWatchCount.store(0);
+            gHuntNightCached.store(-1);gHuntNightLastRead=0;
+            gCryptidHuntMapSpecies.store(0);
+#ifdef FCH_STANDALONE
+            // Travel invalidates both controllers and pawns. Never call a
+            // reflected function on pointers retained from the old world.
+            if(gNativeRemoteRole.world)
+                FHJDiag::Log(L"CRYPTID NETWORK ROLE: level travel invalidated old handoff; no unsafe cross-world restoration attempted.");
+            gNativeRemoteRole=NativeRemoteRole{};
+            gNativeRolePlayerId.store(-1);gNativeRoleCryptidId.store(-1);
+            gClientRoleActive.store(false);gClientRolePaused.store(false);
+            gClientRoleSpecies.store(0);gClientRolePawn=0;gClientRoleIndex=-1;
+            gClientRoleHealth.store(-1.0);gClientRoleMaxHealth.store(-1.0);
+            gClientRoleAttackHeld=false;gClientRoleJumpHeld=false;
+#endif
+            gWendigoCamerasUsedToday=0;
+            gWendigoCameraDayRemaining.store(kWendigoCamerasPerDay);
+            gWendigoLastNightNum=-1;gWendigoPriorPhase=-1;
+            gWendigoDayWorld=0;gWendigoPlacingStealth=WendigoPlacingStealth{};
+            gWendigoViewIndex=-1;gWendigoPlaceKey=false;gWendigoCycleKey=false;
+            gVampireVerify=VampireInvisibilityVerification{};
+            gControlledCryptidClass=0;
+            gControlledRespawnSpawner=0;gControlledRespawnSpawnerIndex=-1;
+            gControlledExistingIds.clear();
+            gControlledRespawnStart=-1.0;gControlledRespawnRemaining=0.0;
+            gControlledSpawnRequested=false;gNextControlledRespawnScan=0;
             gHumanHUD=0;gHumanHudHidden=false;gHudRestorePending=false;
             gChaseSmoothedValid=false;
             gGravityBackup=WorldGravityBackup{};
+            gSpawnWave=SpawnWave{};
             gNoclipPawn=0;gNoclipEnabled=false;
+            gNoclipPositionValid=false;gNoclipController=0;gNoclipIgnoredMove=false;
             FHJDiag::Log(L"World changed: reset ESP and player cache.");
         }
+        AdvanceSpawnWave();
+#ifdef FCH_STANDALONE
+        MaintainServerRemoteRole(world);
+#endif
+        if(world) {
+            ScanLoadedSounds();
+            RefreshSpawnableClassCatalog();
+        }
         HunterNative::Status status{};
+        status.pendingSpawnTriggers=gSpawnWave.remaining;
+        status.confirmedSpawned=gSpawnWave.created;
         Camera cam{};
         std::vector<Marker> markers;
         std::vector<HunterNative::PlayerInfo> playersOut;
         std::vector<HunterNative::CreatureInfo> creaturesOut;
+        std::vector<HunterNative::CryptidSpawnPoint> spawnPointsOut;
         status.worldReady=world!=0;
         if(world) {
             status.host=ReadPtr(world+0x158)!=0;
+            const auto gameState=ReadPtr(world+0x160); // Engine.UWorld::GameState
+            if(gameState && IsGameStateBasedOn(gameState,L"FL_Gamestate_C")) {
+                // GameState_Lobby_C *derives* from FL_Gamestate_C.
+                // Its SelectedContract (+0x388) begins with the actual
+                // UHuntDataBase UClass pointer selected by the stock lobby.
+                const bool inLobby=IsGameStateBasedOn(gameState,L"GameState_Lobby_C");
+                status.isGameLobby=inLobby;
+                if(inLobby) {
+                    const auto contract=ReadPtr(gameState+0x388);
+                    const auto name=ObjectName(contract);
+                    if(!name.empty())
+                        status.selectedLobbyMap.assign(name.begin(),name.end());
+                    status.mapCryptid=HuntSpeciesFromName(name);
+                } else {
+                    const auto huntClass=ReadPtr(gameState+0x340);
+                    const auto name=ObjectName(huntClass);
+                    if(!name.empty())
+                        status.activeHuntName.assign(name.begin(),name.end());
+                    status.mapCryptid=HuntSpeciesFromName(name);
+                }
+            }
+#ifdef FCH_STANDALONE
+            gCryptidHuntMapSpecies.store(status.isGameLobby?0:status.mapCryptid);
+#endif
             cam=GetCamera(world);
             status.cameraReady=cam.fov>=20.f;
             const auto gi=ReadPtr(world+0x1D8);
@@ -436,7 +851,7 @@ namespace {
             // This fixes worlds where the global array contains no *live* actor of interest
             // in the current scan slice, or where stale UObject slots are common.
             const bool esp=gEsp.load(std::memory_order_relaxed);
-            const int maxScan=esp ? 700 : 180; // player list remains available when ESP is off
+            const int maxScan=esp ? 900 : 600; // quicker Mothman/cryptid roster discovery
             for(int i=0;i<maxScan && totalActors>0;++i) {
                 if(gScanIndex>=totalActors)gScanIndex=0;
                 const int slot=gScanIndex++;
@@ -448,7 +863,13 @@ namespace {
                 ++status.actorsExamined;
                 int32_t objIndex=-1;
                 if(!Read(actor+0xC,objIndex) || objIndex<0)continue;
-                const int kind=ClassKind(ReadPtr(actor+0x10));
+                const auto cls=ReadPtr(actor+0x10);
+                if(ClassName(cls)==L"BP_MobSpawner_C" &&
+                   gKnownSpawners.size()<100 &&
+                   std::none_of(gKnownSpawners.begin(),gKnownSpawners.end(),
+                       [actor](const ActorEntry& e){return e.address==actor;}))
+                    gKnownSpawners.push_back({actor,objIndex,7});
+                const int kind=ClassKind(cls);
                 if(kind && gKnown.size()<400 &&
                     std::none_of(gKnown.begin(),gKnown.end(),
                         [actor](const ActorEntry& e){return e.address==actor;}))
@@ -460,6 +881,23 @@ namespace {
                     int32_t actual=-1;
                     return !Read(a.address+0xC,actual) || actual!=a.index;
                 }),gKnown.end());
+            gKnownSpawners.erase(std::remove_if(gKnownSpawners.begin(),gKnownSpawners.end(),
+                [](const ActorEntry& a) {
+                    int32_t id=-1;
+                    return !Read(a.address+0x0C,id) || id!=a.index ||
+                        ClassName(ReadPtr(a.address+0x10))!=L"BP_MobSpawner_C";
+                }),gKnownSpawners.end());
+            status.activeMobSpawners=static_cast<int>(gKnownSpawners.size());
+            std::vector<HunterNative::CryptidSpawnPoint> points;
+            points.reserve(gKnownSpawners.size());
+            for(const auto& point:gKnownSpawners) {
+                // Avoid expensive ProcessEvent world-position reads on
+                // every scan; a large map can have many mob spawners.
+                char label[80]{};
+                snprintf(label,sizeof(label),"Current-map spawner #%d",point.index);
+                points.push_back({point.index,label});
+            }
+            spawnPointsOut=std::move(points);
             status.knownActors=static_cast<int>(gKnown.size());
             markers.reserve(kMaxActors);
             for(const auto& actor:gKnown) {
@@ -480,7 +918,21 @@ namespace {
                     auto cls=ReadPtr(actor.address+0x10);
                     creature.isPawn=IsPawnClass(cls);
                     const auto name=ClassName(cls);
-                    creature.displayName=std::string(name.begin(),name.end());
+                    if(name==L"BP_FlyingPawnTest_C") {
+                        // This is the Mothman pawn from the exact SDK. Its
+                        // 0x710/0x718 bytes are NOT Health/MaxHealth.
+                        creature.health=-1.0;creature.maxHealth=-1.0;
+                        creature.displayName="Mothman [alive / HP unavailable]";
+                    } else {
+                        // Health only belongs to BP_Cryptid_Base_C-derived actors.
+                        if(!Read(actor.address+0x710,creature.health) ||
+                           !std::isfinite(creature.health) || creature.health<0)
+                            creature.health=-1.0;
+                        if(!Read(actor.address+0x718,creature.maxHealth) ||
+                           !std::isfinite(creature.maxHealth) || creature.maxHealth<=0)
+                            creature.maxHealth=-1.0;
+                        creature.displayName=std::string(name.begin(),name.end());
+                    }
                     creaturesOut.push_back(std::move(creature));
                 } else if(actor.kind==3) ++status.activeWildlife;
                 else if(actor.kind==4) ++status.activeContainers;
@@ -499,7 +951,24 @@ namespace {
                 const double distance=std::hypot(std::hypot(loc.x-cam.pos.x,
                     loc.y-cam.pos.y),loc.z-cam.pos.z);
                 if(distance>gMaxDistanceMeters.load()*100.0)continue;
-                markers.push_back({loc,actor.kind,-1.0});
+                double actorHealth=-1.0,actorMaxHealth=-1.0;
+                if(actor.kind==2) {
+                    // Never read BP_Cryptid_Base health offsets from Mothman.
+                    if(ClassName(ReadPtr(actor.address+0x10))!=L"BP_FlyingPawnTest_C") {
+                        if(!Read(actor.address+0x710,actorHealth) ||
+                           !std::isfinite(actorHealth) || actorHealth<0)actorHealth=-1.0;
+                        if(!Read(actor.address+0x718,actorMaxHealth) ||
+                           !std::isfinite(actorMaxHealth) || actorMaxHealth<=0)actorMaxHealth=-1.0;
+                    }
+                } else if(actor.kind==1) {
+                    if(!Read(actor.address+0x8A0,actorHealth) ||
+                       !std::isfinite(actorHealth) || actorHealth<0)actorHealth=-1.0;
+                    if(!Read(actor.address+0x8A8,actorMaxHealth) ||
+                       !std::isfinite(actorMaxHealth) || actorMaxHealth<=0)actorMaxHealth=-1.0;
+                }
+                markers.push_back({loc,actor.kind,actorHealth,actorMaxHealth,
+                    actor.kind==2 &&
+                    ClassName(ReadPtr(actor.address+0x10))==L"BP_FlyingPawnTest_C"});
             }
             status.espCandidates=static_cast<int>(markers.size());
             status.fallProtectionEnabled=gProtectFall.load();
@@ -549,7 +1018,28 @@ namespace {
             gStatus=status;gCamera=cam;gMarkers=std::move(markers);
             gRoster=std::move(playersOut);
             gCreatures=std::move(creaturesOut);
+            gSpawnClassCatalog=gSpawnClassCandidates;
+            // A loaded UClass alone isn't a playable actor. Mark whether
+            // that exact species is represented by a live ULevel actor in
+            // this map. A foreign-class spawn remains experimental.
+            for(auto& spawnType:gSpawnClassCatalog) {
+                spawnType.presentAsLiveActor=false;
+                int count=0;uintptr_t chunks=0;
+                if(!GetObjects(count,chunks) ||
+                   spawnType.objectIndex>=count)continue;
+                const auto wanted=ObjectAt(spawnType.objectIndex,chunks);
+                for(const auto& actor:gKnown) {
+                    if(actor.kind==2 &&
+                       ReadPtr(actor.address+0x10)==wanted) {
+                        spawnType.presentAsLiveActor=true;
+                        break;
+                    }
+                }
+            }
+            gSpawnPointCatalog=std::move(spawnPointsOut);
             gVanityChoices=std::move(vanity);
+            gSounds=gSoundCandidates;
+            gCameraShakes=gCameraShakeCandidates;
         }
         static ULONGLONG lastReport=0;
         const auto now=GetTickCount64();
@@ -743,25 +1233,57 @@ namespace {
         // and double-precision intensity inputs. Neither is Net replicated.
         const auto flag=actor+(rain?0x300:0x390);
         const bool enabled=intensity>0.001;
-        const bool changed=TryWrite(flag,enabled);
         alignas(8) uint8_t args[0x30]{};
         std::memcpy(args,&intensity,sizeof(intensity));
         if(!Invoke(actor,func,args)) {
             FHJDiag::Log(L"WEATHER: UFunction invocation failed.");
             return false;
         }
-        if(changed && enabled) {
-            // Spawn/initialize weather particle systems when enabling rain/snow
-            // on maps whose BP_WeatherTool started with that effect disabled.
-            const auto setup=FindFunction(L"BP_WeatherTool_C",L"Weather Setup Function");
-            if(setup)Invoke(actor,setup,nullptr);
+        // The setter may turn the effect back on internally. Apply its enable
+        // flag *after* the setter, reconfigure particles on both enable/clear,
+        // then assert the final state after setup (which can rewrite flags).
+        const bool changed=TryWrite(flag,enabled);
+        const auto setup=FindFunction(L"BP_WeatherTool_C",L"Weather Setup Function");
+        if(setup)Invoke(actor,setup,nullptr);
+        if(!enabled)TryWrite(flag,false);
+        bool readFlag=!enabled;
+        const bool verified=Read(flag,readFlag) && readFlag==enabled;
+        FHJDiag::Log(changed && verified ?
+            (enabled?L"WEATHER: native intensity set and enable flag verified.":
+                     L"WEATHER: intensity zeroed, particle setup refreshed, enable flag cleared.") :
+            L"WEATHER: could not verify final Enable_Rain/Snow flag after native setter.");
+        return changed && verified;
+    }
+    bool ExecuteClearWeather() {
+        const auto actor=FindWeatherActor();
+        if(!actor) {
+            FHJDiag::Log(L"WEATHER CLEAR: active BP_WeatherTool_C not found.");return false;
         }
-        bool readFlag=false;
-        Read(flag,readFlag);
-        FHJDiag::Log(changed && readFlag==enabled?
-            L"WEATHER: live weather tool flag verified and intensity function dispatched (local visibility only).":
-            L"WEATHER: intensity dispatched, but Enable_Rain/Snow flag could not be verified.");
-        return changed;
+        const auto rain=FindFunction(L"BP_WeatherTool_C",L"Set Overall Rain Intensity");
+        const auto snow=FindFunction(L"BP_WeatherTool_C",L"Set Overall Snow Intensity");
+        if(!rain || !snow) {
+            FHJDiag::Log(L"WEATHER CLEAR: one or both native intensity setters missing.");return false;
+        }
+        alignas(8) uint8_t args[0x30]{};
+        const double zero=0.0;
+        std::memcpy(args,&zero,sizeof(zero));
+        const bool rainSent=Invoke(actor,rain,args);
+        const bool snowSent=Invoke(actor,snow,args);
+        // Atomically clear both toggles after both setters. The native setup
+        // may revive a weather flag; assert OFF again afterwards.
+        const bool a=TryWrite(actor+0x300,false);
+        const bool b=TryWrite(actor+0x390,false);
+        const auto setup=FindFunction(L"BP_WeatherTool_C",L"Weather Setup Function");
+        if(setup)Invoke(actor,setup,nullptr);
+        TryWrite(actor+0x300,false);
+        TryWrite(actor+0x390,false);
+        bool rainEnabled=true,snowEnabled=true;
+        const bool verified=Read(actor+0x300,rainEnabled) &&
+            Read(actor+0x390,snowEnabled) && !rainEnabled && !snowEnabled;
+        FHJDiag::Log(rainSent && snowSent && a && b && verified ?
+            L"WEATHER CLEAR: rain/snow intensity zeroed and BOTH enable flags verified off.":
+            L"WEATHER CLEAR: native requests sent but reset incomplete; inspect live WeatherTool.");
+        return rainSent && snowSent && a && b && verified;
     }
     bool IsVampire(uintptr_t actor) {
         auto klass=ReadPtr(actor+0x10);
@@ -829,6 +1351,105 @@ namespace {
         swprintf_s(message,L"FLASHLIGHT: invoked native component flicker on %d players (network visibility unverified).",count);
         FHJDiag::Log(message);
         return count>0;
+    }
+    void ExecuteClientCameraShake(const Action& a) {
+        if(!ReadPtr(World()+0x158)) {
+            FHJDiag::Log(L"CLIENT SCARE: authoritative host required.");return;
+        }
+        int count=0;uintptr_t chunks=0;
+        if(!GetObjects(count,chunks) || a.amount<0 || a.amount>=count)return;
+        const auto shake=ObjectAt(a.amount,chunks);
+        int32_t actual=-1;
+        const auto metaclass=ClassName(ReadPtr(shake+0x10));
+        if(!shake || !Read(shake+0x0C,actual) || actual!=a.amount ||
+           (metaclass!=L"Class" && metaclass!=L"BlueprintGeneratedClass") ||
+           !IsCameraShakeClass(shake)) {
+            FHJDiag::Log(L"CLIENT SCARE: selected camera shake subclass not loaded.");return;
+        }
+        const auto fn=FindFunction(L"PlayerController",L"ClientStartCameraShake");
+        if(!fn) {
+            FHJDiag::Log(L"CLIENT SCARE: native ClientStartCameraShake RPC missing.");return;
+        }
+        std::vector<uintptr_t> controllers;
+        const auto add=[&](uintptr_t pawn) {
+            const auto pc=ReadPtr(pawn+0x2D8);
+            if(pc && std::find(controllers.begin(),controllers.end(),pc)==controllers.end())
+                controllers.push_back(pc);
+        };
+        if(a.target>=0) {
+            const auto pawn=SelectedPawn(a.target);
+            if(pawn)add(pawn);
+        } else {
+            add(LocalPawn());
+            for(const auto& player:gKnown)if(player.kind==1)add(player.address);
+        }
+        int sent=0;
+        for(const auto pc:controllers) {
+            // UE5.5 ClientStartCameraShake(TSubclassOf, float Scale,
+            // ECameraShakePlaySpace, FRotator). FRotator is 3 doubles.
+            alignas(8) uint8_t args[0x30]{};
+            const float intensity=std::clamp(a.value,0.1f,2.f);
+            std::memcpy(args,&shake,sizeof(shake));
+            std::memcpy(args+8,&intensity,sizeof(intensity));
+            args[0xC]=0; // CameraLocal; zeroed UserPlaySpaceRot
+            if(Invoke(pc,fn,args))++sent;
+        }
+        wchar_t msg[200]{};
+        swprintf_s(msg,L"CLIENT SCARE: native camera shake sent to %d/%d selected controllers; playback awaits multiplayer test.",
+            sent,static_cast<int>(controllers.size()));
+        FHJDiag::Log(msg);
+    }
+    void ExecuteClientSound(const Action& a) {
+        if(!ReadPtr(World()+0x158)) {
+            FHJDiag::Log(L"CLIENT AUDIO: authoritative session host required.");return;
+        }
+        int count=0;uintptr_t chunks=0;
+        if(!GetObjects(count,chunks) || a.amount<0 || a.amount>=count) {
+            FHJDiag::Log(L"CLIENT AUDIO: invalid sound object index.");return;
+        }
+        const auto asset=ObjectAt(a.amount,chunks);
+        int32_t liveIndex=-1;
+        if(!asset || !Read(asset+0x0C,liveIndex) || liveIndex!=a.amount ||
+           !IsSoundAssetClass(ReadPtr(asset+0x10))) {
+            FHJDiag::Log(L"CLIENT AUDIO: sound asset unloaded or not USoundBase.");return;
+        }
+        const auto clientPlay=FindFunction(L"PlayerController",L"ClientPlaySound");
+        if(!clientPlay) {
+            FHJDiag::Log(L"CLIENT AUDIO: native PlayerController.ClientPlaySound RPC unavailable.");return;
+        }
+        std::vector<uintptr_t> targets;
+        const auto addPawn=[&](uintptr_t pawn) {
+            const auto controller=ReadPtr(pawn+0x2D8);
+            if(controller &&
+                std::find(targets.begin(),targets.end(),controller)==targets.end())
+                targets.push_back(controller);
+        };
+        if(a.target>=0) {
+            const auto pawn=SelectedPawn(a.target);
+            if(pawn)addPawn(pawn);
+        } else {
+            addPawn(LocalPawn());
+            for(const auto& actor:gKnown)if(actor.kind==1)addPawn(actor.address);
+        }
+        if(targets.empty()) {
+            FHJDiag::Log(L"CLIENT AUDIO: no live selected/roster player controller.");return;
+        }
+        int dispatched=0;
+        for(const auto controller:targets) {
+            // UE5.5 native ClientPlaySound(USoundBase*,float,float) is
+            // an owning-client RPC: server sends to each chosen controller.
+            alignas(8) uint8_t args[0x10]{};
+            const float volume=std::clamp(a.value,0.05f,2.0f);
+            const float pitch=1.0f;
+            std::memcpy(args,&asset,sizeof(asset));
+            std::memcpy(args+8,&volume,sizeof(volume));
+            std::memcpy(args+12,&pitch,sizeof(pitch));
+            if(Invoke(controller,clientPlay,args))++dispatched;
+        }
+        wchar_t msg[230]{};
+        swprintf_s(msg,L"CLIENT AUDIO: dispatched PlayerController.ClientPlaySound on %d/%d controller(s), USoundBase index %d. Client playback needs in-game verification.",
+            dispatched,static_cast<int>(targets.size()),a.amount);
+        FHJDiag::Log(msg);
     }
     void ExecuteTargetedAction(const Action& a) {
         const auto world=World();
@@ -944,8 +1565,24 @@ namespace {
                 Read(movement+0x221,gPriorMovement);
                 uint8_t flags=0;Read(pawn+0x5C,flags);
                 gPriorCollision=(flags&0x80)!=0;
+                if(!Position(pawn,gNoclipPosition)) {
+                    FHJDiag::Log(L"NOCLIP: failed to capture current location; free-flight not enabled.");
+                    return;
+                }
+                gNoclipPositionValid=true;
                 gNoclipPawn=pawn;gNoclipEnabled=true;
                 gOriginalFlyMovement=movement;
+                const auto gi=ReadPtr(world+0x1D8);
+                const auto locals=ReadPtr(gi+0x38);
+                const auto local=ReadPtr(locals);
+                gNoclipController=ReadPtr(local+0x30);
+                const auto ignore=FindFunction(L"Controller",L"SetIgnoreMoveInput");
+                if(ignore && gNoclipController) {
+                    bool preventGameInput=true;
+                    gNoclipIgnoredMove=Invoke(gNoclipController,ignore,&preventGameInput);
+                }
+                const auto stop=FindFunction(L"MovementComponent",L"StopMovementImmediately");
+                if(stop)Invoke(movement,stop,nullptr);
                 gFlySpeedSaved=Read(movement+0x274,gOriginalFlySpeed);
                 if(gFlySpeedSaved) {
                     const float speed=1150.f;
@@ -953,21 +1590,46 @@ namespace {
                 }
             }
         } else if(gNoclipPawn!=pawn) {
-            FHJDiag::Log(L"Noclip restore skipped: pawn changed. Base movement applies.");return;
+            // Do not touch a stale actor after respawn.
+            gNoclipEnabled=false;gNoclipPawn=0;
+            gNoclipPositionValid=false;gNoclipIgnoredMove=false;gNoclipController=0;
+            gFlySpeedSaved=false;gOriginalFlyMovement=0;
+            FHJDiag::Log(L"Noclip: original pawn was replaced; cleared stale free-fly state.");return;
         }
         alignas(8) unsigned char moveArgs[0x8]{};
         moveArgs[0]= enabled?5:gPriorMovement; // UE MOVE_Flying=5; restore prior mode
         moveArgs[1]=0;
         bool canCollide=enabled?false:gPriorCollision;
-        Invoke(movement,moveFunc,moveArgs);
-        Invoke(pawn,collisionFunc,&canCollide);
+        const bool modeInvoked=Invoke(movement,moveFunc,moveArgs);
+        const bool collisionInvoked=Invoke(pawn,collisionFunc,&canCollide);
+        if(enabled && (!modeInvoked || !collisionInvoked)) {
+            uint8_t restore[2]{gPriorMovement,0};
+            Invoke(movement,moveFunc,restore);
+            bool previousCollision=gPriorCollision;
+            Invoke(pawn,collisionFunc,&previousCollision);
+            if(gFlySpeedSaved)TryWrite(movement+0x274,gOriginalFlySpeed);
+            gNoclipEnabled=false;gNoclipPawn=0;gNoclipPositionValid=false;
+            if(gNoclipIgnoredMove && gNoclipController) {
+                const auto allow=FindFunction(L"Controller",L"SetIgnoreMoveInput");
+                if(allow){bool no=false;Invoke(gNoclipController,allow,&no);}
+            }
+            gNoclipController=0;gNoclipIgnoredMove=false;
+            gFlySpeedSaved=false;gOriginalFlyMovement=0;
+            FHJDiag::Log(L"Noclip: native movement/collision setup failed; original values restored.");
+            return;
+        }
         if(!enabled) {
             if(gFlySpeedSaved && gOriginalFlyMovement==movement)
                 TryWrite(movement+0x274,gOriginalFlySpeed);
+            if(gNoclipIgnoredMove && gNoclipController) {
+                const auto allow=FindFunction(L"Controller",L"SetIgnoreMoveInput");
+                if(allow){bool no=false;Invoke(gNoclipController,allow,&no);}
+            }
+            gNoclipController=0;gNoclipIgnoredMove=false;
             gFlySpeedSaved=false;gOriginalFlyMovement=0;
-            gNoclipEnabled=false;gNoclipPawn=0;
+            gNoclipEnabled=false;gNoclipPawn=0;gNoclipPositionValid=false;
         }
-        FHJDiag::Log(enabled?L"Local noclip flying/collision request dispatched.":
+        FHJDiag::Log(enabled?L"Local noclip: flying/no collision enabled; WASD uses direct world-position movement.":
             L"Local noclip disabled; movement and collision restoration requested.");
     }
 
@@ -980,13 +1642,14 @@ namespace {
     };
     static_assert(sizeof(Transform64)==0x60);
 
-    bool SetActorLocationSafe(uintptr_t actor,const Vec3& next) {
+    bool SetActorLocationSafe(uintptr_t actor,const Vec3& next,
+                              bool sweep=false,bool teleport=true) {
         const auto f=FindFunction(L"Actor",L"K2_SetActorLocation");
         if(!actor || !f)return false;
         alignas(8) uint8_t args[0x128]{};
         std::memcpy(args,&next,sizeof(next));
-        args[0x18]=0; // bSweep = false (explicit noclip/ghost movement)
-        args[0x120]=1; // bTeleport = true
+        args[0x18]=sweep?1:0; // collision sweep for cryptid fallback
+        args[0x120]=teleport?1:0; // teleport remains appropriate for camera/noclip
         if(!Invoke(actor,f,args))return false;
         return args[0x121]!=0;
     }
@@ -1013,6 +1676,234 @@ namespace {
             if(obj && ObjectName(obj)==name)return obj;
         }
         return 0;
+    }
+
+    // Sphere trace between cryptid shoulder and camera. A SpringArm collision
+    // probe is the native UE solution; here the already-spawned CameraActor
+    // gets an equivalent reflected sweep, without a guessed SpringArm offset.
+    // Exact UE5.5 FHitResult(0xE8) and SphereTraceSingle parameter layout are
+    // verified against UFunction size/return metadata before invocation.
+    bool ConstrainChaseCamera(const Vec3& pivot,const Vec3& wanted,Vec3& clipped) {
+        static uintptr_t sphere=0,line=0,defaultSystem=0;
+        static ULONGLONG lookupRetry=0;
+        const auto tick=GetTickCount64();
+        if((!sphere || !defaultSystem) && tick>=lookupRetry) {
+            lookupRetry=tick+10000;
+            if(!sphere)sphere=FindFunction(L"KismetSystemLibrary",L"SphereTraceSingle");
+            if(!line)line=FindFunction(L"KismetSystemLibrary",L"LineTraceSingle");
+            if(!defaultSystem)
+                defaultSystem=FindObjectByName(L"Default__KismetSystemLibrary");
+        }
+        const bool lineFallback=!sphere && line;
+        const auto fn=sphere?sphere:line;
+        if(!fn || !defaultSystem)return false;
+        uint16_t parmsSize=0,returnOffset=0;
+        if(!Read(fn+0xB6,parmsSize) || !Read(fn+0xB8,returnOffset) ||
+           parmsSize<0x169 || parmsSize>0x178 || returnOffset!=0x168) {
+            static bool logged=false;
+            if(!logged) {
+                logged=true;
+                FHJDiag::Log(L"CHASE CAMERA: SphereTraceSingle SDK layout differs; using close-camera fallback.");
+            }
+            return false;
+        }
+        alignas(8) uint8_t args[0x178]{};
+        const uintptr_t ctx=gMonsterPawn;
+        std::memcpy(args,&ctx,8);
+        std::memcpy(args+0x08,&pivot,sizeof(pivot));
+        std::memcpy(args+0x20,&wanted,sizeof(wanted));
+        if(lineFallback) {
+            args[0x38]=1; // TraceTypeQuery2: camera collision
+            args[0x39]=0;
+        } else {
+            const float radius=22.f;
+            std::memcpy(args+0x38,&radius,sizeof(radius));
+            args[0x3C]=1; // TraceTypeQuery2: camera collision
+            args[0x3D]=0;
+        }
+        uintptr_t ignored[1]{gMonsterPawn};
+        struct ActorArray{uintptr_t data;int32_t num,max;};
+        const ActorArray ignore{reinterpret_cast<uintptr_t>(ignored),1,1};
+        static_assert(sizeof(ActorArray)==16);
+        std::memcpy(args+0x40,&ignore,sizeof(ignore));
+        args[0x50]=0;  // DrawDebugTrace::None
+        args[0x140]=1; // bIgnoreSelf
+        if(!Invoke(defaultSystem,fn,args))return false;
+        clipped=wanted;
+        // HitResult::Time (0x04) is the trace fraction. Both the reflected
+        // return value and blocking-hit flag must be true before clamping.
+        if(args[0x168] && (args[0x58+0xAD]&1)) {
+            float impact=1.f;
+            std::memcpy(&impact,args+0x58+0x04,sizeof(impact));
+            if(!std::isfinite(impact) || impact<0.f || impact>1.f)return false;
+            const double dx=wanted.x-pivot.x,dy=wanted.y-pivot.y,
+                         dz=wanted.z-pivot.z;
+            const double distance=std::sqrt(dx*dx+dy*dy+dz*dz);
+            const double backoff=distance>1.0?26.0/distance:1.0;
+            const double alpha=std::clamp(static_cast<double>(impact)-backoff,0.0,1.0);
+            clipped={pivot.x+dx*alpha,pivot.y+dy*alpha,pivot.z+dz*alpha};
+        }
+        return true;
+    }
+    // SDK verified: KismetSystemLibrary.GetConsoleVariableIntValue has
+    // FString(0x10) + int return(0x10), ParmsSize=0x18. Console-command
+    // params are WorldContext 8 / FString 16 / PlayerController 8.
+    constexpr const wchar_t* kLocalClarityCVars[3]{
+        L"r.MotionBlurQuality",
+        L"r.DefaultFeature.MotionBlur",
+        L"r.DepthOfFieldQuality"
+    };
+    bool ReadLocalRenderCVar(const wchar_t* name,int32_t& result) {
+        const auto system=FindObjectByName(L"Default__KismetSystemLibrary");
+        const auto getter=FindFunction(L"KismetSystemLibrary",
+                                      L"GetConsoleVariableIntValue");
+        uint16_t size=0,ret=0;
+        if(!name || !system || !getter ||
+           !Read(getter+0xB6,size) || size!=0x18 ||
+           !Read(getter+0xB8,ret) || ret!=0x10)return false;
+        wchar_t variable[64]{};
+        wcscpy_s(variable,name);
+        FStringView view{variable,static_cast<int32_t>(wcslen(variable)+1),
+                         static_cast<int32_t>(wcslen(variable)+1)};
+        alignas(8) uint8_t args[0x18]{};
+        std::memcpy(args,&view,sizeof(view));
+        if(!Invoke(system,getter,args))return false;
+        std::memcpy(&result,args+0x10,sizeof(result));
+        return true;
+    }
+    bool SetLocalRenderCVar(uintptr_t pc,const wchar_t* name,int32_t value) {
+        const auto console=FindFunction(L"KismetSystemLibrary",
+                                        L"ExecuteConsoleCommand");
+        const auto system=FindObjectByName(L"Default__KismetSystemLibrary");
+        const auto world=World();
+        uint16_t size=0;
+        if(!pc || !console || !system || !world ||
+           !Read(console+0xB6,size) || size!=0x20)return false;
+        wchar_t command[96]{};
+        swprintf_s(command,L"%ls %d",name,value);
+        FStringView view{command,static_cast<int32_t>(wcslen(command)+1),
+                         static_cast<int32_t>(wcslen(command)+1)};
+        alignas(8) uint8_t args[0x20]{};
+        std::memcpy(args,&world,8);
+        std::memcpy(args+8,&view,sizeof(view));
+        std::memcpy(args+0x18,&pc,8);
+        return Invoke(system,console,args);
+    }
+    // CameraComponent.PostProcessSettings 0x300, blend weight 0x2D0.
+    // FPostProcessSettings.bOverride_MotionBlurAmount is bit 6 at 0x1C;
+    // bOverride_MotionBlurMax is bit 7 at 0x1C. Float values are 0x674
+    // and 0x678 inside the struct. All offsets from the user's exact SDK.
+    void SetCameraBlurOverrides(uintptr_t cameraComponent) {
+        if(!cameraComponent)return;
+        uint8_t flags=0;
+        if(!Read(cameraComponent+0x31C,flags))return;
+        const uint8_t enabled=static_cast<uint8_t>(flags|0xC0);
+        const float zero=0.f;
+        if(!TryWrite(cameraComponent+0x31C,enabled) ||
+           !TryWrite(cameraComponent+0x974,zero) ||
+           !TryWrite(cameraComponent+0x978,zero))return;
+        const auto weightFn=FindFunction(L"CameraComponent",
+                                         L"SetPostProcessBlendWeight");
+        uint16_t size=0;
+        float full=1.f;
+        if(weightFn && Read(weightFn+0xB6,size) && size==4)
+            Invoke(cameraComponent,weightFn,&full);
+        else TryWrite(cameraComponent+0x2D0,full);
+    }
+    void ApplyPossessionClarity(uintptr_t pc,uintptr_t cameraComponent) {
+        if(!gCryptidClearLocalBlur.load() || !pc || !cameraComponent ||
+           gPossessionClarity.active)return;
+        PossessionClarityBackup saved{};
+        saved.active=true;
+        saved.camera=cameraComponent;
+        Read(cameraComponent+0x0C,saved.cameraIndex);
+        saved.cameraSaved=
+            saved.cameraIndex>=0 &&
+            Read(cameraComponent+0x31C,saved.previousOverrides) &&
+            Read(cameraComponent+0x2D0,saved.previousWeight) &&
+            Read(cameraComponent+0x974,saved.previousBlurAmount) &&
+            Read(cameraComponent+0x978,saved.previousBlurMax);
+        // Capture the original values BEFORE changing any render state.
+        // Render CVars are local to this game's process; remote clients
+        // retain their own view and any cinematic effects.
+        for(size_t i=0;i<3;++i) {
+            saved.cvarsSaved[i]=ReadLocalRenderCVar(
+                kLocalClarityCVars[i],saved.originalCvars[i]);
+            // Unknown/missing CVars may report sentinel values. Never
+            // overwrite or later restore a setting we cannot validate.
+            const int32_t v=saved.originalCvars[i];
+            if(v<0 || v>8 || (i==1 && v>1))
+                saved.cvarsSaved[i]=false;
+        }
+        gPossessionClarity=saved;
+        SetCameraBlurOverrides(cameraComponent);
+        int requested=0,verified=0;
+        for(size_t i=0;i<3;++i) {
+            if(!saved.cvarsSaved[i])continue;
+            if(SetLocalRenderCVar(pc,kLocalClarityCVars[i],0)) {
+                ++requested;
+                int32_t readback=-1;
+                if(ReadLocalRenderCVar(kLocalClarityCVars[i],readback) &&
+                   readback==0)++verified;
+            }
+        }
+        wchar_t result[260]{};
+        swprintf_s(result,L"CRYPTID CAMERA: local blur clarity enabled; camera snapshot=%s, CVars dispatched=%d/3, immediate zero readback=%d/3. Originals are restored when possession ends; actual rendering must be checked in game.",
+            saved.cameraSaved?L"YES":L"NO",requested,verified);
+        FHJDiag::Log(result);
+    }
+    void RestorePossessionClarity(uintptr_t pc) {
+        if(!gPossessionClarity.active || !pc || !World())return;
+        const auto saved=gPossessionClarity;
+        // Idempotent and never touch a recycled component on a new level.
+        int32_t index=-1;
+        if(saved.cameraSaved && saved.camera &&
+           Read(saved.camera+0x0C,index) && index==saved.cameraIndex) {
+            TryWrite(saved.camera+0x31C,saved.previousOverrides);
+            TryWrite(saved.camera+0x974,saved.previousBlurAmount);
+            TryWrite(saved.camera+0x978,saved.previousBlurMax);
+            const auto weight=FindFunction(L"CameraComponent",
+                                          L"SetPostProcessBlendWeight");
+            uint16_t size=0;
+            float originalWeight=saved.previousWeight;
+            if(weight && Read(weight+0xB6,size) && size==4)
+                Invoke(saved.camera,weight,&originalWeight);
+            else TryWrite(saved.camera+0x2D0,originalWeight);
+        }
+        for(size_t i=0;i<3;++i)
+            if(saved.cvarsSaved[i])
+                SetLocalRenderCVar(pc,kLocalClarityCVars[i],
+                                   saved.originalCvars[i]);
+        gPossessionClarity=PossessionClarityBackup{};
+        FHJDiag::Log(L"CRYPTID CAMERA: restored original local motion-blur / DOF console values and camera post-process settings.");
+    }
+    void RefreshPossessionClarity(uintptr_t pc) {
+        if(!gCryptidClearLocalBlur.load()) {
+            RestorePossessionClarity(pc);
+            return;
+        }
+        if(!gPossessionClarity.active) {
+            if(gChaseCamera) {
+                const auto cameraComponent=ReadPtr(gChaseCamera+0x2B0);
+                ApplyPossessionClarity(pc,cameraComponent);
+            }
+            return;
+        }
+        // Check every ~600ms, not every frame. Some camera systems may
+        // reset camera blend weight during chase camera updates.
+        const auto component=gPossessionClarity.camera;
+        int32_t id=-1;
+        if(!component || !Read(component+0x0C,id) ||
+           id!=gPossessionClarity.cameraIndex)return;
+        uint8_t flags=0;
+        float amount=0.f,maxBlur=0.f,weight=0.f;
+        if(Read(component+0x31C,flags) &&
+           Read(component+0x974,amount) &&
+           Read(component+0x978,maxBlur) &&
+           Read(component+0x2D0,weight) &&
+           ((flags&0xC0)!=0xC0 || amount!=0.f ||
+            maxBlur!=0.f || weight<0.99f))
+            SetCameraBlurOverrides(component);
     }
     bool CreateMonsterCamera(uintptr_t pc,const Vec3& position) {
         const auto world=World();
@@ -1074,15 +1965,346 @@ namespace {
             float angle=86.0f;
             Invoke(comp,fov,&angle);
         }
+        ApplyPossessionClarity(pc,comp);
         FHJDiag::Log(L"Created camera actor and switched view target for monster mode.");
         return true;
     }
+    // Mothman's BP_FlyingPawnTest_C::Smoke is the Niagara component at
+    // +0x3A8. SceneComponent::bHiddenInGame (+0x189 bit 3) is NOT a Net
+    // property in the supplied SDK. Its bVisible flag (+0x188 bit 5)
+    // IS replicated, so NEVER use SceneComponent.SetVisibility here.
+    // This suppresses only the host's local Smoke rendering while they
+    // pilot Mothman. Other players retain the usual effect.
+    bool SetLocalSmokeHidden(uintptr_t component,bool hidden) {
+        const auto fn=FindFunction(L"SceneComponent",L"SetHiddenInGame");
+        uint16_t params=0;
+        if(!component || !fn || !Read(fn+0xB6,params) || params!=2)
+            return false;
+        uint8_t args[2]{static_cast<uint8_t>(hidden?1:0),0};
+        return Invoke(component,fn,args);
+    }
+    void RestoreLocalMothmanSmoke() {
+        const auto saved=gLocalMothmanSmoke;
+        gLocalMothmanSmoke=LocalMothmanSmoke{};
+        if(!saved.pawn || !saved.component)return;
+        int32_t pawnId=-1,componentId=-1;
+        if(!Read(saved.pawn+0x0C,pawnId) || pawnId!=saved.pawnIndex ||
+           !Read(saved.component+0x0C,componentId) ||
+           componentId!=saved.componentIndex ||
+           ReadPtr(saved.pawn+0x3A8)!=saved.component)return;
+        if(!SetLocalSmokeHidden(saved.component,saved.previouslyHidden))
+            FHJDiag::Log(L"MOTHMAN LOCAL SMOKE: could not restore original visibility.");
+    }
+    void SyncLocalMothmanSmoke() {
+        const bool controllingMothman=gMonsterActive.load() &&
+            ClassName(ReadPtr(gMonsterPawn+0x10))==L"BP_FlyingPawnTest_C";
+        if(!controllingMothman || !gMothmanReduceLocalSmoke.load()) {
+            if(gLocalMothmanSmoke.component)RestoreLocalMothmanSmoke();
+            return;
+        }
+        const auto smoke=ReadPtr(gMonsterPawn+0x3A8);
+        if(!smoke)return;
+        int32_t pawnId=-1,smokeId=-1;
+        if(!Read(gMonsterPawn+0x0C,pawnId) || pawnId!=gMonsterIndex ||
+           !Read(smoke+0x0C,smokeId) || smokeId<0)return;
+        if(gLocalMothmanSmoke.pawn==gMonsterPawn &&
+           gLocalMothmanSmoke.component==smoke &&
+           gLocalMothmanSmoke.componentIndex==smokeId)return;
+        if(gLocalMothmanSmoke.component)RestoreLocalMothmanSmoke();
+        uint8_t componentFlags=0;
+        if(!Read(smoke+0x189,componentFlags))return;
+        const bool wasHidden=(componentFlags&0x08)!=0;
+        if(!SetLocalSmokeHidden(smoke,true)) {
+            FHJDiag::Log(L"MOTHMAN LOCAL SMOKE: native nonreplicated SetHiddenInGame unavailable.");
+            return;
+        }
+        gLocalMothmanSmoke={gMonsterPawn,smoke,pawnId,smokeId,wasHidden};
+        FHJDiag::Log(L"MOTHMAN LOCAL SMOKE: hid only the local Smoke Niagara renderer; eyes, moths, wings and remote player visuals are unchanged.");
+    }
+    void RestoreLocalMothmanRender() {
+        const auto saved=gMothRender;
+        gMothRender=LocalMothmanRender{};
+        int32_t live=-1;
+        if(!saved.pawn || !Read(saved.pawn+0xC,live) ||
+           live!=saved.pawnId)return;
+        constexpr uintptr_t expectedOffsets[3]{0x3D0,0x3B8,0x3C0};
+        for(size_t i=0;i<3;++i) {
+            const auto& part=saved.visibleParts[i];
+            int32_t id=-1;
+            if(part.modified && part.component &&
+               ReadPtr(saved.pawn+expectedOffsets[i])==part.component &&
+               Read(part.component+0xC,id) && id==part.id)
+                SetLocalSmokeHidden(part.component,part.originallyHidden);
+        }
+        int32_t postId=-1;
+        if(saved.postModified && saved.postProcess &&
+           ReadPtr(saved.pawn+0x340)==saved.postProcess &&
+           Read(saved.postProcess+0xC,postId) && postId==saved.postId) {
+            uint8_t flags=0;
+            if(Read(saved.postProcess+0x94C,flags)) {
+                const uint8_t restored=saved.postEnabled?
+                    static_cast<uint8_t>(flags|1):
+                    static_cast<uint8_t>(flags&~1);
+                TryWrite(saved.postProcess+0x94C,restored);
+            }
+        }
+        FHJDiag::Log(L"MOTHMAN LOCAL VISION: restored pre-possession body/wing visibility and post-process state.");
+    }
+    void SyncLocalMothmanRender() {
+        if(!gMonsterActive.load() ||
+           ClassName(ReadPtr(gMonsterPawn+0x10))!=L"BP_FlyingPawnTest_C") {
+            if(gMothRender.pawn)RestoreLocalMothmanRender();
+            return;
+        }
+        int32_t id=-1;
+        if(!Read(gMonsterPawn+0xC,id) || id!=gMonsterIndex)return;
+        if(gMothRender.pawn!=gMonsterPawn || gMothRender.pawnId!=id) {
+            if(gMothRender.pawn)RestoreLocalMothmanRender();
+            gMothRender.pawn=gMonsterPawn;
+            gMothRender.pawnId=id;
+        }
+        // IsStealthed (+0x431) is a replicated gameplay state: it MUST NOT
+        // be altered just to make the local camera easier to use.
+        bool stealth=false;
+        if(Read(gMonsterPawn+0x431,stealth) &&
+           (!gMothRender.stealthLogged || stealth!=gMothRender.lastStealthed)) {
+            gMothRender.lastStealthed=stealth;
+            gMothRender.stealthLogged=true;
+            FHJDiag::Log(stealth?
+                L"MOTHMAN VISIBILITY: native replicated IsStealthed=TRUE; local renderer is compensated without changing stealth for other players.":
+                L"MOTHMAN VISIBILITY: native replicated IsStealthed=FALSE; local render visibility rechecked.");
+        }
+        constexpr uintptr_t offsets[3]{0x3D0,0x3B8,0x3C0};
+        for(size_t i=0;i<3;++i) {
+            const auto partPtr=ReadPtr(gMonsterPawn+offsets[i]);
+            if(!partPtr)continue;
+            auto& part=gMothRender.visibleParts[i];
+            int32_t partIndex=-1;
+            if(!Read(partPtr+0xC,partIndex))continue;
+            if(part.component!=partPtr || part.id!=partIndex) {
+                part=LocalMothmanRender::Part{};
+                part.component=partPtr;
+                part.id=partIndex;
+                uint8_t flags=0;
+                if(Read(partPtr+0x189,flags))
+                    part.originallyHidden=(flags&0x08)!=0;
+            }
+            uint8_t flags=0;
+            if(Read(partPtr+0x189,flags) && (flags&0x08)) {
+                if(SetLocalSmokeHidden(partPtr,false))
+                    part.modified=true;
+            }
+        }
+        // BP_FlyingPawnTest_C.PostProcess is a separate local
+        // UPostProcessComponent, whose bEnabled (+0x94C bit 0) is NOT
+        // replicated in UE5.5. Suppress only its local darkening/
+        // blur effect while the hunter is piloting the creature.
+        const auto post=ReadPtr(gMonsterPawn+0x340);
+        int32_t postId=-1;
+        if(post && Read(post+0xC,postId)) {
+            if(gMothRender.postProcess!=post ||
+               gMothRender.postId!=postId) {
+                gMothRender.postProcess=post;
+                gMothRender.postId=postId;
+                uint8_t flags=0;
+                if(Read(post+0x94C,flags))
+                    gMothRender.postEnabled=(flags&1)!=0;
+            }
+            uint8_t flags=0;
+            if(Read(post+0x94C,flags) && (flags&1) &&
+               TryWrite(post+0x94C,static_cast<uint8_t>(flags&~1)))
+                gMothRender.postModified=true;
+        }
+    }
+    void UpdateWendigoCameraQuota(int phase) {
+#ifdef FCH_STANDALONE
+        const auto world=World();
+        if(world!=gWendigoDayWorld) {
+            gWendigoDayWorld=world;
+            gWendigoPriorPhase=-1;
+            gWendigoCamerasUsedToday=0;
+            gWendigoCameraDayRemaining.store(kWendigoCamerasPerDay);
+        }
+        // The replicated FL_Gamestate.IsNight transition night -> day
+        // marks a new in-game day, including on host and connected clients.
+        if(gWendigoPriorPhase==1 && phase==0) {
+            gWendigoCamerasUsedToday=0;
+            gWendigoCameraDayRemaining.store(kWendigoCamerasPerDay);
+            FHJDiag::Log(L"CRYPTID HUNT WENDIGO: sunrise; replenished two camera placements for the new day.");
+        }
+        if(phase>=0)gWendigoPriorPhase=phase;
+#else
+        (void)phase;
+#endif
+    }
+    bool SetWendigoActorHidden(uintptr_t pawn,bool hidden) {
+        const auto fn=FindFunction(L"Actor",L"SetActorHiddenInGame");
+        uint16_t bytes=0;
+        if(!pawn || !fn || !Read(fn+0xB6,bytes) ||
+           bytes!=1)return false;
+        const uint8_t flag=hidden?1:0;
+        return Invoke(pawn,fn,const_cast<uint8_t*>(&flag));
+    }
+    void RestoreWendigoPlacementStealth() {
+        const auto old=gWendigoPlacingStealth;
+        gWendigoPlacingStealth=WendigoPlacingStealth{};
+        if(!old.pawn || old.world!=World())return;
+        int32_t id=-1;
+        if(!Read(old.pawn+0xC,id) || id!=old.id)return;
+        if(!SetWendigoActorHidden(old.pawn,old.wasHidden))
+            FHJDiag::Log(L"WENDIGO PLACEMENT STEALTH: restore of prior hidden state failed.");
+        const auto net=FindFunction(L"Actor",L"ForceNetUpdate");
+        if(net)Invoke(old.pawn,net,nullptr);
+    }
+    void FinishWendigoStealthIfDue(ULONGLONG now) {
+        if(gWendigoPlacingStealth.pawn &&
+           now>=gWendigoPlacingStealth.restoreAt)
+            RestoreWendigoPlacementStealth();
+    }
+    void BeginWendigoPlacementStealth(ULONGLONG now) {
+        RestoreWendigoPlacementStealth();
+        if(!gMonsterPawn)return;
+        int32_t id=-1;
+        uint8_t flags=0;
+        if(!Read(gMonsterPawn+0xC,id) ||
+           !Read(gMonsterPawn+0x58,flags))return;
+        // Engine.AActor.bHidden is replicated bit 7 at +0x58.
+        // Use the actual Actor.SetActorHiddenInGame method, never
+        // mesh-only local visibility that survivors would still see.
+        const bool original=(flags&0x80)!=0;
+        if(!SetWendigoActorHidden(gMonsterPawn,true))return;
+        gWendigoPlacingStealth={
+            gMonsterPawn,World(),id,original,now+1600
+        };
+        const auto net=FindFunction(L"Actor",L"ForceNetUpdate");
+        if(net)Invoke(gMonsterPawn,net,nullptr);
+        FHJDiag::Log(L"WENDIGO PLACEMENT STEALTH: temporarily hidden for camera placement; previous replicated visibility will be restored.");
+    }
+    bool IsControllingWendigo() {
+        if(!gMonsterActive.load() || gControlledRespawnStart>=0.)return false;
+        if(ClassName(ReadPtr(gMonsterPawn+0x10))!=L"BP_Wendigo_C")return false;
+        int32_t live=-1;
+        return Read(gMonsterPawn+0xC,live) && live==gMonsterIndex;
+    }
+    void ClearWendigoWatchCameras() {
+        // Only destroy the independent CameraActor instances created by
+        // this mode. Never inspect, take over or remove ACamera_C survivor
+        // equipment or the survivor CameraFeed_C widget.
+        const auto destroy=FindFunction(L"Actor",L"K2_DestroyActor");
+        const auto world=World();
+        for(const auto& cam:gWendigoWatchCameras) {
+            int32_t live=-1;
+            if(cam.world==world && cam.object && destroy &&
+               Read(cam.object+0xC,live) && live==cam.objectId)
+                Invoke(cam.object,destroy,nullptr);
+        }
+        gWendigoWatchCameras.clear();
+        gWendigoWatchCount.store(0);
+        gWendigoViewIndex=-1;
+    }
+    bool CycleWendigoWatchCamera(bool returnToChase) {
+#ifdef FCH_STANDALONE
+        if(!gCryptidHuntOptedIn.load() ||
+           gCryptidHuntMapSpecies.load()!=3 ||
+           !IsControllingWendigo() || !gHumanInputController ||
+           !gChaseCamera)return false;
+        const int count=static_cast<int>(gWendigoWatchCameras.size());
+        if(returnToChase || count==0 || gWendigoViewIndex+1>=count) {
+            gWendigoViewIndex=-1;
+            return SetCameraViewTarget(gHumanInputController,gChaseCamera);
+        }
+        const int next=gWendigoViewIndex+1;
+        const auto& cam=gWendigoWatchCameras[static_cast<size_t>(next)];
+        int32_t live=-1;
+        if(!cam.object || cam.world!=World() ||
+           !Read(cam.object+0xC,live) || live!=cam.objectId)return false;
+        if(!SetCameraViewTarget(gHumanInputController,cam.object))return false;
+        gWendigoViewIndex=next;
+        FHJDiag::Log(L"WENDIGO CAMERAS: switched to private Wendigo-owned surveillance viewpoint. Survivor cameras are untouched.");
+        return true;
+#else
+        (void)returnToChase;
+        return false;
+#endif
+    }
+    bool PlaceWendigoWatchCamera() {
+#ifdef FCH_STANDALONE
+        if(!IsControllingWendigo() || !ReadPtr(World()+0x158))
+            return false;
+        if(!gCryptidHuntOptedIn.load() ||
+           gCryptidHuntMapSpecies.load()!=3)return false;
+        UpdateWendigoCameraQuota(NativeHuntNightState());
+        if(gWendigoCamerasUsedToday>=kWendigoCamerasPerDay) {
+            FHJDiag::Log(L"WENDIGO CAMERAS: all two daily camera placements used; resets after next sunrise.");
+            return false;
+        }
+        if(gWendigoWatchCameras.size()>=4) {
+            FHJDiag::Log(L"WENDIGO CAMERAS: maximum of four active watchpoints. Press V to cycle views.");
+            return false;
+        }
+        const auto cls=FindObjectByName(L"CameraActor");
+        const auto context=FindObjectByName(L"Default__GameplayStatics");
+        const auto begin=FindFunction(L"GameplayStatics",L"BeginDeferredActorSpawnFromClass");
+        const auto finish=FindFunction(L"GameplayStatics",L"FinishSpawningActor");
+        const auto world=World();
+        if(!cls || ClassName(ReadPtr(cls+0x10))!=L"Class" ||
+           !context || !begin || !finish || !world)return false;
+        Vec3 origin{};
+        if(!Position(gMonsterPawn,origin))return false;
+        const double radians=gMonsterYaw*kPi/180.0;
+        Transform64 tx{};
+        // Place an independent camera node slightly ahead of Wendigo.
+        // No use of PlayerCharacter.CurrentCamera or CameraFeed_C.
+        tx.location.x=origin.x+std::cos(radians)*180.;
+        tx.location.y=origin.y+std::sin(radians)*180.;
+        tx.location.z=origin.z+140.;
+        alignas(8) uint8_t beginArgs[0x90]{};
+        std::memcpy(beginArgs,&world,8);
+        std::memcpy(beginArgs+8,&cls,8);
+        std::memcpy(beginArgs+0x10,&tx,sizeof(tx));
+        beginArgs[0x70]=1;
+        if(!Invoke(context,begin,beginArgs))return false;
+        uintptr_t cam=0;
+        std::memcpy(&cam,beginArgs+0x88,sizeof(cam));
+        if(!cam)return false;
+        alignas(8) uint8_t finishArgs[0x80]{};
+        std::memcpy(finishArgs,&cam,8);
+        std::memcpy(finishArgs+0x10,&tx,sizeof(tx));
+        if(!Invoke(context,finish,finishArgs))return false;
+        std::memcpy(&cam,finishArgs+0x78,sizeof(cam));
+        int32_t id=-1;
+        if(!cam || !Read(cam+0xC,id) || id<0)return false;
+        // Own controller view only; never put the camera in the game's
+        // replicated Camera_C equipment list or spectator feeds.
+        SetActorRotationSafe(cam,{std::clamp(gMonsterPitch-8.0,-60.0,35.0),
+                                  gMonsterYaw,0.0});
+        gWendigoWatchCameras.push_back({cam,world,id});
+        ++gWendigoCamerasUsedToday;
+        gWendigoCameraDayRemaining.store(
+            std::max(0,kWendigoCamerasPerDay-gWendigoCamerasUsedToday));
+        BeginWendigoPlacementStealth(GetTickCount64());
+        gWendigoWatchCount.store(
+            static_cast<int>(gWendigoWatchCameras.size()));
+        if(gHumanInputController &&
+           SetCameraViewTarget(gHumanInputController,cam))
+            gWendigoViewIndex=static_cast<int>(gWendigoWatchCameras.size())-1;
+        FHJDiag::Log(L"WENDIGO CAMERAS: created an independent private UE CameraActor watchpoint; C places, V cycles, F11 returns human. This does not use survivor cameras.");
+        return true;
+#else
+        return false;
+#endif
+    }
     void ReleaseMonsterCamera(uintptr_t pc,uintptr_t destination) {
+        RestoreWendigoPlacementStealth();
+        RestorePossessionClarity(pc);
+        RestoreLocalMothmanSmoke();
+        RestoreLocalMothmanRender();
         if(pc && gCameraAutoManageSaved) {
             TryWrite(pc+0x370,gOriginalCameraAutoManage);
             gCameraAutoManageSaved=false;
         }
         if(pc && destination)SetCameraViewTarget(pc,destination);
+        ClearWendigoWatchCameras();
         if(gChaseCamera) {
             int32_t live=-1;
             if(Read(gChaseCamera+0x0C,live) && live==gCameraIndex) {
@@ -1095,7 +2317,15 @@ namespace {
     }
     void UpdateMonsterHUD() {
         if(!gMonsterActive.load())return;
-        HunterNative::CreatureInfo dummy;
+        if(gControlledRespawnStart>=0.0) {
+            std::lock_guard<std::mutex> lock(gMonsterStatusMutex);
+            gMonsterHUD.respawning=true;
+            gMonsterHUD.respawnSeconds=static_cast<float>(
+                std::max(0.0,gControlledRespawnRemaining));
+            gMonsterHUD.health=0.0;
+            gMonsterHUD.cameraReady=gChaseCamera!=0;
+            return;
+        }
         std::string name;
         auto cls=ReadPtr(gMonsterPawn+0x10);
         auto wide=ClassName(cls);
@@ -1105,16 +2335,29 @@ namespace {
         if(lower.find(L"moth")!=std::wstring::npos || lower.find(L"flying")!=std::wstring::npos)species=1;
         else if(lower.find(L"vamp")!=std::wstring::npos)species=2;
         else if(lower.find(L"wend")!=std::wstring::npos)species=3;
-        double health=0,maxHealth=0;
-        Read(gMonsterPawn+0x710,health);
-        Read(gMonsterPawn+0x718,maxHealth);
+        double health=-1.0,maxHealth=-1.0;
+        // Mothman does not declare Health/MaxHealth at the base-cryptid
+        // offsets; health remains unknown rather than displaying garbage.
+        if(species!=1) {
+            Read(gMonsterPawn+0x710,health);
+            Read(gMonsterPawn+0x718,maxHealth);
+        }
         std::lock_guard<std::mutex> lock(gMonsterStatusMutex);
         gMonsterHUD.label=name.empty()?"UNKNOWN CRYPTID":name;
         gMonsterHUD.species=species;
         gMonsterHUD.health=health;
         gMonsterHUD.maxHealth=maxHealth;
         gMonsterHUD.cameraReady=gChaseCamera!=0;
+        if(species==1)Read(gMonsterPawn+0x431,gMonsterHUD.mothmanStealthed);
+        if(species==2)Read(gMonsterPawn+0x7D0,gMonsterHUD.vampireInvisible);
         gMonsterHUD.possessConfirmed=true;
+        gMonsterHUD.respawning=false;
+        gMonsterHUD.respawnSeconds=0.f;
+        for(int slot=0;slot<5;++slot) {
+            const auto fn=CreatureSkillFunction(species,slot);
+            gMonsterHUD.available[static_cast<size_t>(slot)]=fn!=0;
+            gMonsterHUD.skills[static_cast<size_t>(slot)]=CreatureSkillLabel(species,slot,fn);
+        }
     }
     // UE5.5 SDK Engine.Pawn.AddMovementInput: FVector (0x18), float, bool.
     // CharacterMovement consumes this input on its own tick and updates
@@ -1181,15 +2424,67 @@ namespace {
         if(fn && Invoke(widget,fn,&current) && current!=1)
             SetHUDVisibility(widget,1); // ESlateVisibility::Collapsed
     }
+    void RestoreHumanControls() {
+        if(!gHumanInputController)return;
+        int32_t live=-1;
+        if(gHumanPawn && Read(gHumanPawn+0x0C,live) && live==gHumanIndex &&
+           gHumanInputDisabled) {
+            const auto fn=FindFunction(L"Actor",L"EnableInput");
+            if(fn)Invoke(gHumanPawn,fn,&gHumanInputController);
+        }
+        if(gHumanIgnoreMovement) {
+            const auto fn=FindFunction(L"Controller",L"SetIgnoreMoveInput");
+            if(fn) {bool ignored=false;Invoke(gHumanInputController,fn,&ignored);}
+        }
+        if(gHumanIgnoreLook) {
+            const auto fn=FindFunction(L"Controller",L"SetIgnoreLookInput");
+            if(fn) {bool ignored=false;Invoke(gHumanInputController,fn,&ignored);}
+        }
+        gHumanInputController=0;gHumanInputDisabled=false;
+        gHumanIgnoreMovement=false;gHumanIgnoreLook=false;
+        FHJDiag::Log(L"Monster Mode: human input bindings and controller movement restored.");
+    }
+    void SuspendHumanControls(uintptr_t pc) {
+        if(!pc || !gHumanPawn || gHumanInputController)return;
+        gHumanInputController=pc;
+        // Disable the *human pawn's* gameplay InputComponent without destroying
+        // or unpossessing it; the avatar remains in the expedition.
+        const auto disable=FindFunction(L"Actor",L"DisableInput");
+        if(disable)gHumanInputDisabled=Invoke(gHumanPawn,disable,&pc);
+        const auto ignoreMove=FindFunction(L"Controller",L"SetIgnoreMoveInput");
+        if(ignoreMove) {
+            bool ignored=true;
+            gHumanIgnoreMovement=Invoke(pc,ignoreMove,&ignored);
+        }
+        const auto ignoreLook=FindFunction(L"Controller",L"SetIgnoreLookInput");
+        if(ignoreLook) {
+            bool ignored=true;
+            gHumanIgnoreLook=Invoke(pc,ignoreLook,&ignored);
+        }
+        FHJDiag::Log(gHumanInputDisabled ?
+            L"Monster Mode: human pawn input disabled; controller motion/look blocked.":
+            L"Monster Mode: WARNING pawn DisableInput failed; weapon input may remain active.");
+    }
     void StopMonsterAI() {
         const auto ai=ReadPtr(gMonsterPawn+0x2D8); // APawn.Controller
         if(!ai)return;
+        gMonsterAIController=ai;
+        // Stop active path following as well as the behavior tree. Stopping
+        // BrainComponent alone leaves the last MoveTo request running.
+        const auto stopPath=FindFunction(L"AIController",L"StopMovement");
+        if(stopPath)Invoke(ai,stopPath,nullptr);
+        // For Mothman, 0x330 is BP_StuckDetector, NOT CharacterMovement.
+        const auto creatureClass=ClassName(ReadPtr(gMonsterPawn+0x10));
+        if(creatureClass!=L"BP_FlyingPawnTest_C") {
+            const auto movement=ReadPtr(gMonsterPawn+0x330);
+            const auto stopVelocity=FindFunction(L"MovementComponent",L"StopMovementImmediately");
+            if(movement && stopVelocity)Invoke(movement,stopVelocity,nullptr);
+        }
         const auto brain=ReadPtr(ai+0x388); // SDK AIModule.AAIController.BrainComponent
         if(!brain)return;
         const auto state=FindFunction(L"BrainComponent",L"IsRunning");
         bool running=false;
         if(state)Invoke(brain,state,&running);
-        gMonsterAIController=ai;
         gMonsterBrain=brain;
         gMonsterBrainWasRunning=running;
         const auto stop=FindFunction(L"BrainComponent",L"StopLogic");
@@ -1202,14 +2497,316 @@ namespace {
             FHJDiag::Log(L"Monster Mode: AI brain paused; animation graph remains active.");
         }
     }
+
+    // In UE5.5, AAIController::MoveToLocation is a reflected UFUNCTION.
+    // CharacterMovement applies navigation-requested velocity and drives
+    // AnimBlueprint locomotion, unlike ignored player AddMovementInput.
+    bool MoveCryptidWithAI(const Vec3& input,ULONGLONG now) {
+        if(!gMonsterAIController || !gMonsterPawn)return false;
+        const auto fn=FindFunction(L"AIController",L"MoveToLocation");
+        if(!fn)return false;
+        // Check UFunction::ParmsSize/ReturnValueOffset before relying on this
+        // UE5.5 layout. Never issue a speculative ProcessEvent signature.
+        uint16_t size=0,returnOffset=0;
+        if(!Read(fn+0xB6,size) || !Read(fn+0xB8,returnOffset) ||
+           size<0x2A || size>0x38 || returnOffset!=0x29) {
+            static ULONGLONG last=0;
+            if(now-last>10000) {
+                last=now;
+                FHJDiag::Log(L"CRYPTID MOVE: MoveToLocation reflected signature differs; using swept fallback.");
+            }
+            return false;
+        }
+        Vec3 origin{};
+        if(!Position(gMonsterPawn,origin))return false;
+        const double alignment=input.x*gMonsterMoveDirX+
+                               input.y*gMonsterMoveDirY;
+        const double remaining=std::hypot(
+            gMonsterMoveGoal.x-origin.x,gMonsterMoveGoal.y-origin.y);
+        if(gMonsterPathActive && alignment>.972 && remaining>150.0 &&
+           now-gMonsterLastMoveRequest<1250)
+            return true; // use native path for up to 1.25s, then refresh
+        if(gMonsterPathActive && now-gMonsterLastMoveRequest<85)
+            return true; // short directional debounce keeps animation continuous
+        // Project farther ahead so the AI follows a continuous path until
+        // approaching its goal; repath only near the target or upon turning.
+        const Vec3 target{origin.x+input.x*900.0,
+                          origin.y+input.y*900.0,origin.z};
+        alignas(8) uint8_t args[0x38]{};
+        std::memcpy(args,&target,sizeof(target));
+        const float acceptance=50.0f;
+        std::memcpy(args+0x18,&acceptance,sizeof(acceptance));
+        args[0x1C]=0; // StopOnOverlap: disabled, use explicit acceptance radius
+        args[0x1D]=1; // bUsePathfinding
+        args[0x1E]=1; // bProjectDestinationToNavigation
+        args[0x1F]=1; // bCanStrafe
+        args[0x28]=1; // bAllowPartialPath
+        if(!Invoke(gMonsterAIController,fn,args))return false;
+        // EPathFollowingRequestResult: Failed=0, AlreadyAtGoal=1,
+        // RequestSuccessful=2. Do not equate ProcessEvent success with motion.
+        if(args[0x29]==0)return false;
+        gMonsterLastMoveRequest=now;
+        gMonsterMoveDirX=input.x;gMonsterMoveDirY=input.y;
+        gMonsterMoveGoal=target;
+        gMonsterPathActive=true;
+        return true;
+    }
+    void StopCryptidPath() {
+        if(!gMonsterPathActive)return;
+        if(gMonsterAIController) {
+            const auto stop=FindFunction(L"AIController",L"StopMovement");
+            if(stop)Invoke(gMonsterAIController,stop,nullptr);
+        }
+        gMonsterPathActive=false;
+        gMonsterLastMoveRequest=0;
+    }
+    void CacheCryptidActions() {
+        gMonsterFunctions.clear();
+        auto cls=ReadPtr(gMonsterPawn+0x10);
+        std::vector<uintptr_t> hierarchy;
+        for(int n=0;n<25 && cls;++n) {
+            hierarchy.push_back(cls);
+            const auto next=ReadPtr(cls+0x40);
+            if(!next || next==cls)break;
+            cls=next;
+        }
+        int count=0;uintptr_t chunks=0;
+        if(!GetObjects(count,chunks))return;
+        // Visit derived class first so its own attack/ability implementation
+        // wins over an inherited method with the same UFunction name.
+        for(const auto owner:hierarchy) {
+            for(int i=0;i<count;++i) {
+                const auto obj=ObjectAt(i,chunks);
+                if(!obj || ReadPtr(obj+0x20)!=owner ||
+                   ClassName(ReadPtr(obj+0x10))!=L"Function")continue;
+                const auto name=ObjectName(obj);
+                if(!name.empty())gMonsterFunctions.emplace(name,obj);
+            }
+        }
+        wchar_t msg[160]{};
+        swprintf_s(msg,L"CRYPTID: indexed %u reflected functions from creature class hierarchy.",
+            static_cast<unsigned>(gMonsterFunctions.size()));
+        FHJDiag::Log(msg);
+        // A method name alone does not prove a callable signature. Log the
+        // actual reflected ParmSize for attacks, invisibility and stance.
+        for(const auto& [name,method]:gMonsterFunctions) {
+            const auto lower=Lower(name);
+            if(lower.find(L"attack")==std::wstring::npos &&
+               lower.find(L"melee")==std::wstring::npos &&
+               lower.find(L"sound")==std::wstring::npos &&
+               lower.find(L"invis")==std::wstring::npos &&
+               lower.find(L"stance")==std::wstring::npos &&
+               lower.find(L"scream")==std::wstring::npos)continue;
+            uint16_t params=0;
+            if(!Read(method+0xB6,params))continue;
+            wchar_t detail[240]{};
+            swprintf_s(detail,L"CRYPTID SDK METHOD: %s / ParmSize=%u",name.c_str(),params);
+            FHJDiag::Log(detail);
+        }
+    }
+    uintptr_t NoArgCryptidAction(std::initializer_list<const wchar_t*> candidates) {
+        for(const wchar_t* name:candidates) {
+            const auto it=gMonsterFunctions.find(name);
+            if(it==gMonsterFunctions.end())continue;
+            uint16_t params=0;
+            if(Read(it->second+0xB6,params) && params==0)return it->second;
+        }
+        return 0;
+    }
+    // The species is detected from the live inherited Blueprint class.
+    // Expose a skill only if its UFunction exists and has a compatible
+    // parameter layout. No generic vampire skills are assigned to Wendigo.
+    uintptr_t CreatureSkillFunction(int species,int slot) {
+        switch(slot) {
+            case 0:
+                // Mothman is an APawn: the three-map SDK declares NO
+                // standard melee UFunction. DarknessAttack is a separate
+                // special attack, NOT LMB. Do not activate it on click.
+                if(species==1)return 0;
+                // Ground cryptids are native ACharacters; use the
+                // authoritative base attack that selects native montages.
+                return NoArgCryptidAction({
+                    L"Server_Attack",L"Melee"});
+            case 1:
+                if(species==1) return NoArgCryptidAction({
+                    L"ForceScreech",L"RetriggerScreech"});
+                if(species==3) return NoArgCryptidAction({
+                    L"AUTH_Scream",L"Howl",L"AUTH_Howl",L"Roar",
+                    L"Server_Scream",L"Scream"});
+                return NoArgCryptidAction({
+                    L"AUTH_Scream",L"Server_Scream",L"Scream",
+                    L"Roar",L"DoScream",L"PlayRoar"});
+            case 2:
+                if(species==1) return NoArgCryptidAction({
+                    L"RetriggerScreech"});
+                if(species==3) return NoArgCryptidAction({
+                    L"Lunge",L"AUTH_Lunge",L"Charge",
+                    L"AUTH_Charge",L"Pounce",L"LeapAttack"});
+                if(species!=2)return 0;
+                if(const auto fn=NoArgCryptidAction({
+                    L"Invisible",L"AUTH_Invisible",L"GoInvisible",
+                    L"ToggleInvisible",L"ActivateInvisibility"}))return fn;
+                for(const wchar_t* name:{L"SetInvisible",L"SetInvisibility",
+                                         L"AUTH_SetInvisible",L"SetIsInvisible"}) {
+                    const auto it=gMonsterFunctions.find(name);
+                    uint16_t size=0;
+                    if(it!=gMonsterFunctions.end() && Read(it->second+0xB6,size) &&
+                       (size==1 || size==2))return it->second;
+                }
+                return 0;
+            case 3:
+                if(species==1)return NoArgCryptidAction({
+                    L"DarknessAttack"}); // special power on R, never LMB
+                if(species==3)return NoArgCryptidAction({
+                    L"Rage",L"AUTH_Rage",L"Enrage",L"AUTH_Enrage",
+                    L"Frenzy",L"FeralRoar"});
+                if(species!=2)return 0;
+                if(const auto fn=NoArgCryptidAction({
+                    L"CycleStance",L"ChangeStance",L"SwitchStance"}))return fn;
+                for(const wchar_t* name:{L"SetStance",L"AUTH_SetStance"}) {
+                    const auto it=gMonsterFunctions.find(name);
+                    uint16_t size=0;
+                    if(it!=gMonsterFunctions.end() && Read(it->second+0xB6,size) &&
+                       (size==1 || size==4 || size==8))return it->second;
+                }
+                return 0;
+            case 4:
+                return species==2 ? NoArgCryptidAction({
+                    L"All_ScreamSound",L"ScreamSound",L"PlayScreamSound",
+                    L"PlayScream"}):0;
+            default:return 0;
+        }
+    }
+    std::string CreatureSkillLabel(int species,int slot,uintptr_t fn) {
+        if(!fn)return {};
+        if(slot==0)return "LMB NATIVE MELEE";
+        // Show the *actual* reflected method, not a guessed gameplay power.
+        const auto method=ObjectName(fn);
+        const std::string name(method.begin(),method.end());
+        const char* key=slot==1?"Q":slot==2?"E":slot==3?"R":"AUDIO";
+        return std::string(key)+" "+name;
+    }
+
+    void RestoreGroundMovementSettings() {
+        const auto backup=gGroundMovementSettings;
+        gGroundMovementSettings=GroundMovementSettings{};
+        gGroundDrive=GroundMovementDrive{};
+        if(!backup.saved || !backup.pawn || !backup.movement)return;
+        int32_t id=-1;
+        if(!Read(backup.pawn+0xC,id) || id!=backup.pawnId ||
+           ReadPtr(backup.pawn+0x330)!=backup.movement)return;
+        uint8_t rotation=0,path=0,yaw=0;
+        if(Read(backup.movement+0x2D8,rotation)) {
+            // CharacterMovement: orient-to-velocity bit 4;
+            // use-controller-desired-yaw bit 3.
+            const uint8_t bits=static_cast<uint8_t>(0x18);
+            const uint8_t restored=static_cast<uint8_t>(
+                (rotation&~bits) | (backup.rotationBefore&bits));
+            TryWrite(backup.movement+0x2D8,restored);
+        }
+        if(Read(backup.movement+0x546,path)) {
+            // bRequestedMoveUseAcceleration bit 6.
+            const uint8_t restored=static_cast<uint8_t>(
+                (path&~0x40) | (backup.pathBefore&0x40));
+            TryWrite(backup.movement+0x546,restored);
+        }
+        if(Read(backup.pawn+0x2B0,yaw)) {
+            // APawn::bUseControllerRotationYaw bit 1.
+            const uint8_t restored=static_cast<uint8_t>(
+                (yaw&~0x02) | (backup.pawnYawBefore&0x02));
+            TryWrite(backup.pawn+0x2B0,restored);
+        }
+        FHJDiag::Log(L"GROUND CRYPTID: restored original native movement orientation/acceleration flags.");
+    }
+    void EnableGroundMovementSettings() {
+        if(!gMonsterPawn || !gMonsterMovement)return;
+        uint8_t turn=0,path=0,yaw=0;
+        int32_t id=-1;
+        if(!Read(gMonsterPawn+0xC,id) ||
+           !Read(gMonsterMovement+0x2D8,turn) ||
+           !Read(gMonsterMovement+0x546,path) ||
+           !Read(gMonsterPawn+0x2B0,yaw))return;
+        gGroundMovementSettings={true,gMonsterPawn,gMonsterMovement,id,turn,path,yaw};
+        // Native CharacterMovement now rotates in the velocity direction,
+        // accelerates into nav moves, and does not snap to controller yaw.
+        const uint8_t newTurn=static_cast<uint8_t>((turn|0x10)&~0x08);
+        const uint8_t newPath=static_cast<uint8_t>(path|0x40);
+        const uint8_t newYaw=static_cast<uint8_t>(yaw&~0x02);
+        TryWrite(gMonsterMovement+0x2D8,newTurn);
+        TryWrite(gMonsterMovement+0x546,newPath);
+        TryWrite(gMonsterPawn+0x2B0,newYaw);
+        FHJDiag::Log(L"GROUND CRYPTID: native orient-to-velocity and acceleration-based movement enabled.");
+    }
+    // AI pathing is useful where NPC movement input is intentionally
+    // ignored, but its repeated path requests make manual WASD feel
+    // delayed. Try UE CharacterMovement input first, then switch to
+    // native AI navigation only if the actor genuinely remains stuck.
+    void DriveGroundCryptid(const Vec3& desired,bool boost,ULONGLONG now) {
+        int32_t id=-1;
+        Vec3 position{};
+        if(!gMonsterPawn || !Read(gMonsterPawn+0xC,id) ||
+           !Position(gMonsterPawn,position))return;
+        if(gGroundDrive.pawn!=gMonsterPawn || gGroundDrive.pawnId!=id) {
+            gGroundDrive=GroundMovementDrive{};
+            gGroundDrive.pawn=gMonsterPawn;
+            gGroundDrive.pawnId=id;
+        }
+        if(!gGroundDrive.sampleValid) {
+            gGroundDrive.sampleValid=true;
+            gGroundDrive.sampleAt=now;
+            gGroundDrive.samplePosition=position;
+        }
+        if(!gGroundDrive.useNavFallback) {
+            StopCryptidPath();
+            const bool invoked=AddSmoothMovement(gMonsterPawn,desired,1.f);
+            if(!invoked) {
+                gGroundDrive.useNavFallback=true;
+                FHJDiag::Log(L"GROUND CRYPTID: native movement input unavailable; using AI navigation fallback.");
+            } else if(now-gGroundDrive.sampleAt>=480) {
+                const double movement=std::hypot(
+                    position.x-gGroundDrive.samplePosition.x,
+                    position.y-gGroundDrive.samplePosition.y);
+                if(movement<5.0) {
+                    gGroundDrive.useNavFallback=true;
+                    FHJDiag::Log(L"GROUND CRYPTID: movement input was accepted but character stayed stationary; switching to game AI path following.");
+                }
+                gGroundDrive.sampleAt=now;
+                gGroundDrive.samplePosition=position;
+            }
+        }
+        if(gGroundDrive.useNavFallback)
+            MoveCryptidWithAI(desired,now);
+    }
     void RestoreMonsterAI() {
-        if(gMonsterMovement && gMonsterSpeedsSaved) {
+        RestoreGroundMovementSettings();
+        gVampireVerify=VampireInvisibilityVerification{};
+        int32_t actorId=-1;
+        const bool actorLive=gMonsterPawn &&
+            Read(gMonsterPawn+0xC,actorId) && actorId==gMonsterIndex;
+        const bool movementLive=actorLive && gMonsterMovement &&
+            ReadPtr(gMonsterPawn+0x330)==gMonsterMovement;
+        const bool controllerLive=actorLive && gMonsterAIController &&
+            ReadPtr(gMonsterPawn+0x2D8)==gMonsterAIController;
+        if(controllerLive)StopCryptidPath();
+        else {gMonsterPathActive=false;gMonsterLastMoveRequest=0;}
+        gMonsterFunctions.clear();
+        if(movementLive && gMonsterSpeedsSaved) {
             TryWrite(gMonsterMovement+0x268,gMonsterOriginalWalkSpeed);
             TryWrite(gMonsterMovement+0x274,gMonsterOriginalFlySpeed);
         }
+        if(movementLive && gMonsterModeSaved) {
+            const auto setMode=FindFunction(L"CharacterMovementComponent",L"SetMovementMode");
+            if(setMode) {
+                uint8_t args[2]{gMonsterPriorMovement,0};
+                Invoke(gMonsterMovement,setMode,args);
+            }
+        }
         gMonsterMovement=0;
-        gMonsterSpeedsSaved=false;
-        if(gMonsterBrain && gMonsterBrainWasRunning) {
+        gMonsterSpeedsSaved=false;gMonsterModeSaved=false;
+        gMonsterNativeWalkSpeed=0.f;gMonsterNativeRunSpeed=0.f;
+        gMonsterFlightActive=false;gGroundJumpHeld=false;
+        gMothFlight=NativeMothmanFlight{};
+        if(controllerLive && gMonsterBrain && gMonsterBrainWasRunning) {
             const auto restart=FindFunction(L"BrainComponent",L"RestartLogic");
             if(restart)Invoke(gMonsterBrain,restart,nullptr);
             FHJDiag::Log(L"Monster Mode: previous AI behavior restored.");
@@ -1217,70 +2814,675 @@ namespace {
         gMonsterBrain=0;gMonsterAIController=0;gMonsterBrainWasRunning=false;
     }
     void ConfigureMonsterMovement() {
+        gGroundMovementSettings=GroundMovementSettings{};
+        gGroundDrive=GroundMovementDrive{};
+        gMothFlight=NativeMothmanFlight{};
+        if(ClassName(ReadPtr(gMonsterPawn+0x10))==L"BP_FlyingPawnTest_C") {
+            // The exact SDK says Mothman is APawn; its 0x330 is a
+            // StuckDetector component. Never treat it as CharacterMovement.
+            gMonsterMovement=0;gMonsterSpeedsSaved=false;gMonsterModeSaved=false;
+            gMonsterFlightActive=true;
+            FHJDiag::Log(L"MOTHMAN: native flying APawn recognized; skipping ACharacter movement offsets.");
+            return;
+        }
         gMonsterMovement=ReadPtr(gMonsterPawn+0x330); // ACharacter.CharacterMovement
         if(!gMonsterMovement)return;
+        const int species=gMonsterHUD.species;
+        // Flight is a species ability, NOT a universal possession cheat.
+        // Wendigo, Vampire and unknown cryptids never enter MOVE_Flying.
+        gMonsterFlightActive=(species==1);
+        gGroundJumpHeld=false;
+        gMonsterModeSaved=Read(gMonsterMovement+0x221,gMonsterPriorMovement);
+        const auto setMode=FindFunction(L"CharacterMovementComponent",L"SetMovementMode");
+        if(setMode) {
+            // Native physics & AnimBP stay active. Mothman flies; ground
+            // cryptids walk (the AI's previous mode is restored on exit).
+            uint8_t args[2]{static_cast<uint8_t>(species==1?5:1),0};
+            if(!Invoke(gMonsterMovement,setMode,args))
+                FHJDiag::Log(L"Monster Mode: could not set native movement mode.");
+        }
         gMonsterSpeedsSaved=Read(gMonsterMovement+0x268,gMonsterOriginalWalkSpeed) &&
             Read(gMonsterMovement+0x274,gMonsterOriginalFlySpeed);
         if(!gMonsterSpeedsSaved)return;
-        const int species=gMonsterHUD.species;
-        const float walk=species==2?610.f:species==3?540.f:700.f;
-        const float fly=species==1?1200.f:850.f;
-        TryWrite(gMonsterMovement+0x268,walk);
-        TryWrite(gMonsterMovement+0x274,fly);
-        FHJDiag::Log(L"Monster Mode: native CharacterMovement speed profile enabled.");
+        // SDK BP_Cryptid_Base_C.WalkSpeed and RunSpeed are double
+        // properties at 0x698 and 0x6A0. Respect each species' own
+        // locomotion tuning instead of forcing arbitrary 540/610/700.
+        double naturalWalk=0.,naturalRun=0.;
+        if(Read(gMonsterPawn+0x698,naturalWalk) &&
+           std::isfinite(naturalWalk) && naturalWalk>=50. && naturalWalk<=1800.)
+            gMonsterNativeWalkSpeed=static_cast<float>(naturalWalk);
+        else gMonsterNativeWalkSpeed=gMonsterOriginalWalkSpeed;
+        if(Read(gMonsterPawn+0x6A0,naturalRun) &&
+           std::isfinite(naturalRun) && naturalRun>=50. && naturalRun<=2500.)
+            gMonsterNativeRunSpeed=static_cast<float>(naturalRun);
+        else gMonsterNativeRunSpeed=gMonsterNativeWalkSpeed*1.45f;
+        TryWrite(gMonsterMovement+0x268,gMonsterNativeWalkSpeed);
+        EnableGroundMovementSettings();
+        FHJDiag::Log(L"GROUND CRYPTID: live BP_Cryptid_Base WalkSpeed/RunSpeed now drive native CharacterMovement and species locomotion.");
     }
+    void PlayControlledMeleeAudio() {
+        // Default: no additional audio. The creature's Server_Attack,
+        // Melee/DarknessAttack and montage/notifies own their animation
+        // and native sound cues. The previous filename-based auto matcher
+        // accidentally selected unrelated loaded weather/thunder effects
+        // for every species, so it MUST NOT choose audio automatically.
+        const int selected=gMonsterAttackSoundIndex.load();
+        if(selected<0)return;
+        // Optional explicit sound selection only, for diagnostics. This
+        // cannot fire by accident and never changes the native attack.
+        int total=0;uintptr_t chunks=0;
+        if(!GetObjects(total,chunks) || selected>=total)return;
+        const auto asset=ObjectAt(selected,chunks);
+        if(!asset || !IsSoundAssetClass(ReadPtr(asset+0x10)))return;
+        const auto pc=gHumanInputController;
+        const auto play=FindFunction(L"PlayerController",L"ClientPlaySound");
+        if(!pc || !play)return;
+        uint16_t size=0;
+        if(!Read(play+0xB6,size) || size!=0x10)return;
+        alignas(8) uint8_t args[0x10]{};
+        constexpr float volume=1.f,pitch=1.f;
+        std::memcpy(args,&asset,8);
+        std::memcpy(args+8,&volume,4);
+        std::memcpy(args+12,&pitch,4);
+        if(!Invoke(pc,play,args))
+            FHJDiag::Log(L"CRYPTID AUDIO: user-selected diagnostic sound failed; native attack remains unchanged.");
+    }
+    int HuntSpeciesFromName(const std::wstring& name) {
+        const auto lowered=Lower(name);
+        // The three loaded HuntData classes and contract names from the
+        // complete user-supplied Dumper-7 map snapshots.
+        if(lowered.find(L"wendigo")!=std::wstring::npos)return 3;
+        if(lowered.find(L"bloodfang")!=std::wstring::npos ||
+           lowered.find(L"vampire")!=std::wstring::npos)return 2;
+        if(lowered.find(L"mothman")!=std::wstring::npos ||
+           lowered.find(L"blackwing")!=std::wstring::npos ||
+           lowered.find(L"flyingpawntest")!=std::wstring::npos)return 1;
+        return 0;
+    }
+    bool IsGameStateBasedOn(uintptr_t obj,const wchar_t* baseName) {
+        auto cls=ReadPtr(obj+0x10);
+        for(int depth=0;cls && depth<20;++depth) {
+            if(ClassName(cls)==baseName)return true;
+            const auto parent=ReadPtr(cls+0x40);
+            if(!parent || parent==cls)break;
+            cls=parent;
+        }
+        return false;
+    }
+    int NativeHuntNightState() {
+#ifdef FCH_STANDALONE
+        // FL_Gamestate_C.IsNight (+0x33C) IS replicated in the exact
+        // SDK. Prefer it: it also gives spectators and remote clients
+        // the server's phase without inventing a local daylight clock.
+        const auto world=World();
+        const auto state=ReadPtr(world+0x160);
+        if(state && IsGameStateBasedOn(state,L"FL_Gamestate_C") &&
+           !IsGameStateBasedOn(state,L"GameState_Lobby_C")) {
+            bool night=false;
+            if(Read(state+0x33C,night))return night?1:0;
+        }
+        // Host-only fallback if game state has not initialized yet.
+        const auto gm=ReadPtr(world+0x158);
+        const auto director=ReadPtr(gm+0x348);
+        if(!director || ClassName(ReadPtr(director+0x10))!=L"Director_C")
+            return -1;
+        bool night=false;
+        return Read(director+0xB0,night)?(night?1:0):-1;
+#else
+        return -1;
+#endif
+    }
+
+#ifdef FCH_STANDALONE
+    void TickOwningClientRole(uintptr_t world,ULONGLONG now) {
+        // This branch is for the owning *remote* client only. The host uses
+        // its original human-preserving puppet mode instead.
+        const bool remote=!ReadPtr(world+0x158);
+        const auto gi=ReadPtr(world+0x1D8);
+        const auto locals=ReadPtr(gi+0x38);
+        const auto local=ReadPtr(locals);
+        const auto pc=ReadPtr(local+0x30);
+        const auto pawn=ReadPtr(pc+0x350);
+        int32_t id=-1;
+        const bool matched=remote && gCryptidHuntOptedIn.load() &&
+            !gMonsterActive.load() && gCryptidHuntMapSpecies.load()!=0 &&
+            pawn && Read(pawn+0xC,id) && id>=0 &&
+            ClassKind(ReadPtr(pawn+0x10))==2 && IsPawnClass(ReadPtr(pawn+0x10)) &&
+            HuntSpeciesFromName(ClassName(ReadPtr(pawn+0x10)))==
+                gCryptidHuntMapSpecies.load();
+        if(!matched) {
+            if(gClientRoleActive.exchange(false))
+                FHJDiag::Log(L"CRYPTID CLIENT: native owning pawn no longer matches this hunt. Released local cryptid input bridge.");
+            gClientRoleSpecies.store(0);gClientRolePawn=0;gClientRoleIndex=-1;
+            gClientRoleHealth.store(-1.0);gClientRoleMaxHealth.store(-1.0);
+            gClientRolePaused.store(false);
+            gClientRoleAttackHeld=false;gClientRoleJumpHeld=false;
+            return;
+        }
+        if(!gClientRoleActive.load() || pawn!=gClientRolePawn ||
+           id!=gClientRoleIndex) {
+            gClientRolePawn=pawn;gClientRoleIndex=id;
+            gClientRoleSpecies.store(gCryptidHuntMapSpecies.load());
+            gClientRolePaused.store(false);
+            gClientRoleAttackHeld=false;gClientRoleJumpHeld=false;
+            gClientRoleActive.store(true);
+            FHJDiag::Log(L"CRYPTID CLIENT: native server possession replicated to this owning PlayerController. Starting guarded local input bridge; remote attack/flight still require live tests.");
+        }
+        if(gClientRolePaused.load() || gJournalOpen.load() ||
+           !gWindow || GetForegroundWindow()!=gWindow)return;
+        const int species=gClientRoleSpecies.load();
+        if(species==1) {
+            gClientRoleHealth.store(-1.0);gClientRoleMaxHealth.store(-1.0);
+        } else {
+            double hp=-1.0,maxHp=-1.0;
+            if(!Read(pawn+0x710,hp) || !std::isfinite(hp) || hp<0)hp=-1.0;
+            if(!Read(pawn+0x718,maxHp) || !std::isfinite(maxHp) || maxHp<=0)maxHp=-1.0;
+            gClientRoleHealth.store(hp);gClientRoleMaxHealth.store(maxHp);
+        }
+        auto down=[](int vk)->bool {
+            return (GetAsyncKeyState(vk)&0x8000)!=0;
+        };
+        // CharacterMovement on the owning client can consume the native
+        // AddMovementInput accumulator and generate its normal movement RPCs.
+        // The unrelated Mothman APawn uses FlightTarget and needs a separate
+        // server-authoritative movement contract; never write its FlightTarget
+        // speculatively from the client.
+        if(species!=1) {
+            const auto cam=GetCamera(world);
+            const double yaw=cam.rot.yaw*kPi/180.0;
+            const double f=static_cast<double>(down('W'))-static_cast<double>(down('S'));
+            const double s=static_cast<double>(down('D'))-static_cast<double>(down('A'));
+            const double len=std::hypot(f,s);
+            if(len>0.01 && std::isfinite(yaw)) {
+                const double cy=std::cos(yaw),sy=std::sin(yaw);
+                Vec3 input{(cy*f-sy*s)/len,(sy*f+cy*s)/len,0.0};
+                AddSmoothMovement(pawn,input);
+            }
+            const bool jump=down(VK_SPACE);
+            if(jump && !gClientRoleJumpHeld) {
+                const auto fn=FindFunction(L"Character",L"Jump");
+                uint16_t params=0;
+                if(fn && Read(fn+0xB6,params) && params==0)
+                    Invoke(pawn,fn,nullptr);
+            }
+            gClientRoleJumpHeld=jump;
+        }
+        const bool attack=down(VK_LBUTTON);
+        if(attack && !gClientRoleAttackHeld &&
+           (species!=2 && species!=3 || NativeHuntNightState()!=0)) {
+            // Do not invoke host-only Blueprint ability events on clients.
+            // Server_Attack is an owned Server RPC only if actual reflected
+            // flags confirm FUNC_Net | FUNC_NetServer and no parameters.
+            const auto fn=FindFunction(L"BP_Cryptid_Base_C",L"Server_Attack");
+            uint16_t params=0;uint32_t flags=0;
+            if(species!=1 && fn && Read(fn+0xB6,params) &&
+               Read(fn+0xB0,flags) && params==0 &&
+               (flags&0x60u)==0x60u) {
+                if(!Invoke(pawn,fn,nullptr))
+                    FHJDiag::Log(L"CRYPTID CLIENT: Server_Attack RPC dispatch failed.");
+            } else if(now-gClientRoleLastWarning>6000) {
+                gClientRoleLastWarning=now;
+                FHJDiag::Log(L"CRYPTID CLIENT: no verified zero-param Server_Attack RPC for this pawn; attack suppressed. Q/E/R and Mothman flight need a validated owned RPC.");
+            }
+        }
+        gClientRoleAttackHeld=attack;
+    }
+#endif
+
     void ExecuteMonsterAbility(int slot) {
-        if(!gMonsterActive.load() || !ReadPtr(World()+0x158))return;
+        if(slot<0 || slot>=static_cast<int>(gAbilityTicks.size()) ||
+           !gMonsterActive.load() || !ReadPtr(World()+0x158) ||
+           gControlledRespawnStart>=0.0)return;
         int32_t index=-1;
         if(!Read(gMonsterPawn+0x0C,index) || index!=gMonsterIndex)return;
         const auto now=GetTickCount64();
-        if(now-gLastAbilityTick<650)return; // bound ability spam
-        const auto cls=ReadPtr(gMonsterPawn+0x10);
-        bool vampire=false,cryptid=false;
-        uintptr_t parent=cls;
-        for(int depth=0;parent && depth<25;++depth) {
-            const auto n=ClassName(parent);
-            if(n==L"BP_VampireBase_C")vampire=true;
-            if(n==L"BP_Cryptid_Base_C")cryptid=true;
-            const auto next=ReadPtr(parent+0x40);
-            if(!next || next==parent)break;
-            parent=next;
+        const auto minInterval=slot==0?430ULL:280ULL;
+        if(now-gAbilityTicks[static_cast<size_t>(slot)]<minInterval)return;
+        int species=0;
+        {
+            std::lock_guard<std::mutex> guard(gMonsterStatusMutex);
+            species=gMonsterHUD.species;
         }
-        uintptr_t fn=0;
-        alignas(8) uint8_t args[0x20]{};
-        switch(slot) {
-            case 0:
-                // Native melee method preserves the creature's anim montage chain.
-                fn=FindFunction(vampire?L"BP_VampireBase_C":L"BP_Cryptid_Base_C",L"Melee");
-                break;
-            case 1: if(vampire)fn=FindFunction(L"BP_VampireBase_C",L"AUTH_Scream");break;
-            case 2: if(vampire)fn=FindFunction(L"BP_VampireBase_C",L"Invisible");break;
-            case 3: if(vampire) {
-                fn=FindFunction(L"BP_VampireBase_C",L"SetStance");
-                gVampireStance=(gVampireStance+1)%3;
-                std::memcpy(args,&gVampireStance,4);
-                break;
-            }
-            case 4: if(vampire)fn=FindFunction(L"BP_VampireBase_C",L"All_ScreamSound");break;
-            default:break;
-        }
-        if(!fn && slot==0 && cryptid)fn=FindFunction(L"BP_Cryptid_Base_C",L"Server_Attack");
-        if(!fn) {
-            FHJDiag::Log(L"Monster ability unavailable: no verified no-arg native function for this species.");
+        if(gMonsterFunctions.empty())CacheCryptidActions();
+#ifdef FCH_STANDALONE
+        if(!gCryptidHuntOptedIn.load() ||
+           gCryptidHuntMapSpecies.load()!=species) {
+            FHJDiag::Log(L"CRYPTID HUNT: rejected ability outside opt-in custom mode or matching live map.");
             return;
         }
+        if((species==3 || (species==2 && (slot==0 || slot==1))) &&
+           NativeHuntNightState()==0) {
+            static ULONGLONG lastWarning=0;
+            if(now-lastWarning>2200) {
+                lastWarning=now;
+                FHJDiag::Log(L"CRYPTID HUNT DAYTIME: Wendigo cannot attack/use offensive skills; Vampire cannot attack/use offensive skills until replicated IsNight becomes true.");
+            }
+            return;
+        }
+#endif
+        const auto fn=CreatureSkillFunction(species,slot);
+        alignas(8) uint8_t args[0x20]{};
+        bool advanceStance=false;
+        // Only Vampire supports the reflected invisibility/stance setters.
+        // Ground Wendigo cannot inherit either skill or Mothman's flying.
+        bool vampireWasInvisible=false;
+        bool verifyVampire=false;
+        if(species==2 && slot==2 && fn) {
+            // BP_VampireBase_C.IsInvisible at 0x7D0 is the real
+            // replicated gameplay flag. Never trust an internal toggle
+            // that can diverge from actual character state.
+            verifyVampire=Read(gMonsterPawn+0x7D0,vampireWasInvisible);
+            const auto name=ObjectName(fn);
+            if(name==L"SetInvisible" || name==L"SetInvisibility" ||
+               name==L"AUTH_SetInvisible" || name==L"SetIsInvisible")
+                args[0]=vampireWasInvisible?0:1;
+        }
+        if(species==2 && slot==3 && fn) {
+            const auto name=ObjectName(fn);
+            if(name==L"SetStance" || name==L"AUTH_SetStance") {
+                const int stance=(gVampireStance+1)%3;
+                std::memcpy(args,&stance,sizeof(stance));
+                advanceStance=true;
+            }
+        }
+        if(!fn) {
+            // Mothman has no ordinary APawn melee function in any of the
+            // three dumps. A click must not fire DarknessAttack or any
+            // other skill (the R key owns DarknessAttack now).
+            if(species==1 && slot==0)return;
+            if(now-gLastCreatureMethodWarning>3200) {
+                gLastCreatureMethodWarning=now;
+                wchar_t msg[192]{};
+                swprintf_s(msg,L"CRYPTID ABILITY slot %d: no compatible reflected method; inspect CRYPTID SDK METHOD ParmSize logs.",slot);
+                FHJDiag::Log(msg);
+            }
+            return;
+        }
+        const auto name=ObjectName(fn);
         if(Invoke(gMonsterPawn,fn,args)) {
-            gLastAbilityTick=now;
-            FHJDiag::Log(L"Monster ability dispatched on existing cryptid actor; animation/effect subject to game authority.");
-        } else FHJDiag::Log(L"Monster ability reflection dispatch failed.");
+            gAbilityTicks[static_cast<size_t>(slot)]=now;
+            if(slot==0)PlayControlledMeleeAudio();
+            if(species==2 && slot==2 && verifyVampire) {
+                const bool wanted=!vampireWasInvisible;
+                // Blueprint Invisible() can run a timeline; recheck
+                // state after it has had time to finish, not instantly.
+                gVampireVerify={gMonsterPawn,gMonsterIndex,wanted,now+1100};
+                gVampireInvisible=vampireWasInvisible;
+                FHJDiag::Log(L"VAMPIRE INVISIBILITY: native Invisible invoked; awaiting replicated IsInvisible state verification.");
+            }
+            if(advanceStance)gVampireStance=(gVampireStance+1)%3;
+            wchar_t msg[220]{};
+            swprintf_s(msg,L"CRYPTID ABILITY slot %d: invoked native %s; effects must be verified on the host.",slot,name.c_str());
+            FHJDiag::Log(msg);
+        } else {
+            wchar_t msg[160]{};
+            swprintf_s(msg,L"CRYPTID ABILITY: ProcessEvent failed for %s.",name.c_str());
+            FHJDiag::Log(msg);
+        }
+    }
+    void VerifyVampireInvisibility(ULONGLONG now) {
+        if(!gVampireVerify.verifyAt || now<gVampireVerify.verifyAt)return;
+        const auto pending=gVampireVerify;
+        gVampireVerify=VampireInvisibilityVerification{};
+        if(!gMonsterActive.load() || !ReadPtr(World()+0x158) ||
+           !pending.pawn || gMonsterPawn!=pending.pawn)return;
+        int32_t currentId=-1;
+        bool actual=false;
+        if(!Read(pending.pawn+0xC,currentId) ||
+           currentId!=pending.actorIndex ||
+           !Read(pending.pawn+0x7D0,actual))return;
+        if(actual==pending.wanted) {
+            gVampireInvisible=actual;
+            FHJDiag::Log(actual?
+                L"VAMPIRE INVISIBILITY: native function confirmed replicated IsInvisible=true.":
+                L"VAMPIRE INVISIBILITY: native function confirmed replicated IsInvisible=false.");
+            return;
+        }
+        // The native no-arg Invisible() sometimes fires without
+        // changing the replicated field. The SDK supplies matching
+        // multicast appearance functions and the exact server-owned
+        // replicated bool at 0x7D0. Use those as a guarded fallback.
+        const auto visual=NoArgCryptidAction(pending.wanted?
+            std::initializer_list<const wchar_t*>{L"All_Disapear"}:
+            std::initializer_list<const wchar_t*>{L"All_Reappear"});
+        if(!visual) {
+            FHJDiag::Log(L"VAMPIRE INVISIBILITY: native state unchanged; no verified multicast appearance function available.");
+            return;
+        }
+        if(!TryWrite(pending.pawn+0x7D0,pending.wanted)) {
+            FHJDiag::Log(L"VAMPIRE INVISIBILITY: replicated flag write rejected; no appearance effect invoked.");
+            return;
+        }
+        bool readback=false;
+        if(!Read(pending.pawn+0x7D0,readback) ||
+           readback!=pending.wanted)return;
+        const bool dispatched=Invoke(pending.pawn,visual,nullptr);
+        // OnRep updates local materials; other clients get the property
+        // through normal replication and multicast appearance event.
+        const auto onRep=NoArgCryptidAction({L"OnRep_IsInvisiblie"});
+        if(onRep)Invoke(pending.pawn,onRep,nullptr);
+        ForceActorNetUpdate(pending.pawn);
+        gVampireInvisible=readback;
+        FHJDiag::Log(dispatched?
+            L"VAMPIRE INVISIBILITY: fallback applied replicated IsInvisible and native All_Disapear/All_Reappear + OnRep. Verify with second player.":
+            L"VAMPIRE INVISIBILITY: replicated IsInvisible changed but native appearance multicast failed. Check runtime.");
+    }
+    void ResetControlledRespawnSession() {
+        gControlledCryptidClass=0;
+        gControlledRespawnSpawner=0;gControlledRespawnSpawnerIndex=-1;
+        gControlledExistingIds.clear();
+        gControlledRespawnStart=-1.0;gControlledRespawnRemaining=0.0;
+        gControlledSpawnRequested=false;gNextControlledRespawnScan=0;
+    }
+    // World game time is supplied by an Unreal UFunction (pauses with the
+    // actual world). Only use the OS clock if this UE reflection is absent.
+    double ControlledWorldSeconds(uintptr_t world) {
+        static uintptr_t timeFn=0,system=0;
+        static ULONGLONG retry=0;
+        const auto now=GetTickCount64();
+        if(!timeFn && now>=retry) {
+            retry=now+10000;
+            timeFn=FindFunction(L"KismetSystemLibrary",L"GetGameTimeInSeconds");
+            system=FindObjectByName(L"Default__KismetSystemLibrary");
+        }
+        if(timeFn && system) {
+            uint16_t size=0,ret=0;
+            if(Read(timeFn+0xB6,size) && Read(timeFn+0xB8,ret) &&
+               ret==8 && (size==12 || size==16)) {
+                alignas(8) uint8_t args[0x18]{};
+                std::memcpy(args,&world,8);
+                if(Invoke(system,timeFn,args)) {
+                    double value=0;
+                    if(size==16)std::memcpy(&value,args+8,8);
+                    else {float v=0;std::memcpy(&v,args+8,4);value=v;}
+                    if(std::isfinite(value) && value>=0)return value;
+                }
+            }
+        }
+        return static_cast<double>(now)*.001;
+    }
+    void CaptureControlledCryptidSession() {
+        ResetControlledRespawnSession();
+        gControlledCryptidClass=ReadPtr(gMonsterPawn+0x10);
+        Position(gMonsterPawn,gControlledLastPosition);
+        const auto world=World();
+        double bestDistance=1e30;
+        int total=0;
+        for(const auto& level:GetWorldLevels(world,total))
+            for(int i=0;i<level.count;++i) {
+                const auto actor=ReadPtr(level.data+static_cast<size_t>(i)*8);
+                if(!actor)continue;
+                const auto cls=ReadPtr(actor+0x10);
+                if(cls==gControlledCryptidClass) {
+                    int32_t id=-1;
+                    if(Read(actor+0xC,id)&&id>=0)
+                        gControlledExistingIds.insert(id);
+                }
+                if(ClassName(cls)==L"BP_MobSpawner_C") {
+                    Vec3 pos{};
+                    if(!Position(actor,pos))continue;
+                    const double dist=std::hypot(
+                        std::hypot(pos.x-gControlledLastPosition.x,
+                                   pos.y-gControlledLastPosition.y),
+                        pos.z-gControlledLastPosition.z);
+                    if(dist<bestDistance) {
+                        bestDistance=dist;
+                        gControlledRespawnSpawner=actor;
+                        Read(actor+0xC,gControlledRespawnSpawnerIndex);
+                    }
+                }
+            }
+        FHJDiag::Log(gControlledRespawnSpawner?
+            L"CRYPTID RESPAWN: captured creature class and nearest native map spawner.":
+            L"CRYPTID RESPAWN: no native map spawner found; will follow an existing game respawn only.");
+    }
+    bool RebindControlledCryptid(uintptr_t newPawn) {
+        RestoreLocalMothmanSmoke(); // restore the old actor before reassignment
+        RestoreLocalMothmanRender();
+        int32_t id=-1;
+        if(!newPawn || ReadPtr(newPawn+0x10)!=gControlledCryptidClass ||
+           !Read(newPawn+0xC,id) || id<0)return false;
+        // An old AI/controller pointer must never be accessed after the old
+        // cryptid has been destroyed. The new pawn supplies fresh components.
+        gMonsterBrain=0;gMonsterAIController=0;gMonsterBrainWasRunning=false;
+        gMonsterMovement=0;gMonsterSpeedsSaved=false;gMonsterModeSaved=false;
+        gMonsterPathActive=false;gMonsterLastMoveRequest=0;
+        gMonsterPawn=newPawn;gMonsterIndex=id;
+        gControlledExistingIds.insert(id);
+        gControlledRespawnStart=-1.0;gControlledRespawnRemaining=0.0;
+        gControlledSpawnRequested=false;
+        gChaseSmoothedValid=false;gLastMotionTick=0;
+        UpdateMonsterHUD();
+        StopMonsterAI();ConfigureMonsterMovement();CacheCryptidActions();
+        UpdateMonsterHUD(); // respawned creature's exact abilities replace the previous HUD
+        const auto world=World();
+        const auto gi=ReadPtr(world+0x1D8);
+        const auto locals=ReadPtr(gi+0x38);
+        const auto local=ReadPtr(locals);
+        const auto pc=ReadPtr(local+0x30);
+        if(pc && gChaseCamera)SetCameraViewTarget(pc,gChaseCamera);
+        HideHumanHUD();
+        FHJDiag::Log(L"CRYPTID RESPAWN: rebound creature, camera, HUD, AI movement and ability functions; human pawn preserved.");
+        return true;
+    }
+    bool MonitorControlledRespawn(uintptr_t world,ULONGLONG now) {
+        if(!gMonsterActive.load())return true;
+        int32_t liveId=-1;
+        double hp=-1.0;
+        const bool valid=gMonsterPawn &&
+            Read(gMonsterPawn+0xC,liveId) && liveId==gMonsterIndex &&
+            ReadPtr(gMonsterPawn+0x10)==gControlledCryptidClass;
+        const bool isMothman=ClassName(gControlledCryptidClass)==L"BP_FlyingPawnTest_C";
+        // Engine.Actor.IsActorBeingDestroyed is native and returns a bool;
+        // it provides a safer Mothman liveness signal than reading invalid
+        // base-cryptid health bytes from this unrelated APawn subtype.
+        bool beingDestroyed=false;
+        if(valid) {
+            static uintptr_t isDestroying=0;
+            if(!isDestroying)
+                isDestroying=FindFunction(L"Actor",L"IsActorBeingDestroyed");
+            uint16_t size=0;
+            if(isDestroying && Read(isDestroying+0xB6,size) && size==1)
+                Invoke(gMonsterPawn,isDestroying,&beingDestroyed);
+        }
+        const bool alive=valid && !beingDestroyed &&
+            (isMothman || (Read(gMonsterPawn+0x710,hp) &&
+                           std::isfinite(hp) && hp>0));
+        if(alive) {
+            if(gControlledRespawnStart>=0.0)RebindControlledCryptid(gMonsterPawn);
+            else Position(gMonsterPawn,gControlledLastPosition);
+            return true;
+        }
+        const double worldNow=ControlledWorldSeconds(world);
+        if(gControlledRespawnStart<0.0) {
+            gControlledRespawnStart=worldNow;
+            gControlledSpawnRequested=false;
+            gNextControlledRespawnScan=0;
+            StopCryptidPath();
+            FHJDiag::Log(L"CRYPTID RESPAWN: death/despawn detected; host countdown started. Camera and human HUD ownership preserved.");
+        }
+        constexpr double kRespawnDelay=15.0;
+        const double elapsed=std::max(0.0,worldNow-gControlledRespawnStart);
+        gControlledRespawnRemaining=std::max(0.0,kRespawnDelay-elapsed);
+        if(now>=gNextControlledRespawnScan) {
+            gNextControlledRespawnScan=now+350;
+            int total=0;
+            for(const auto& level:GetWorldLevels(world,total)) {
+                for(int i=0;i<level.count;++i) {
+                    const auto actor=ReadPtr(level.data+static_cast<size_t>(i)*8);
+                    if(!actor || ReadPtr(actor+0x10)!=gControlledCryptidClass)
+                        continue;
+                    int32_t id=-1;
+                    if(!Read(actor+0xC,id)||id<0)continue;
+                    if(valid && actor==gMonsterPawn)continue;
+                    if(gControlledExistingIds.count(id))continue;
+                    double candidateHp=0.0;
+                    if(!isMothman && (!Read(actor+0x710,candidateHp) ||
+                       !std::isfinite(candidateHp)||candidateHp<=0.0))continue;
+                    if(RebindControlledCryptid(actor))return true;
+                }
+            }
+        }
+        if(elapsed>=kRespawnDelay && !gControlledSpawnRequested) {
+            gControlledSpawnRequested=true; // one request; no spawn flood
+            int32_t spawnerId=-1;
+            const bool spawnerValid=gControlledRespawnSpawner &&
+                Read(gControlledRespawnSpawner+0xC,spawnerId) &&
+                spawnerId==gControlledRespawnSpawnerIndex &&
+                ClassName(ReadPtr(gControlledRespawnSpawner+0x10))==L"BP_MobSpawner_C";
+            if(!spawnerValid || !ReadPtr(world+0x158)) {
+                FHJDiag::Log(L"CRYPTID RESPAWN: host native spawner unavailable; waiting for game's own respawn without forcing an actor.");
+            } else {
+                const auto fn=FindFunction(L"BP_MobSpawner_C",L"TriggerSpawn");
+                const auto spawner=gControlledRespawnSpawner;
+                const auto saved=ReadPtr(spawner+0x2B8);
+                bool overridden=false;
+                if(saved && saved!=gControlledCryptidClass)
+                    overridden=TryWrite(spawner+0x2B8,gControlledCryptidClass);
+                alignas(8) uint8_t args[0xA0]{};
+                const bool requested=fn && Invoke(spawner,fn,args);
+                if(overridden && !TryWrite(spawner+0x2B8,saved))
+                    FHJDiag::Log(L"CRYPTID RESPAWN WARNING: map spawner MobClass restore failed.");
+                FHJDiag::Log(requested?
+                    L"CRYPTID RESPAWN: invoked native map TriggerSpawn after 15-second world countdown; tracking replacement actor.":
+                    L"CRYPTID RESPAWN: TriggerSpawn unavailable or rejected; continue monitoring the map for game respawn.");
+            }
+        }
+        UpdateMonsterHUD();
+        return false; // camera and human control stay in cryptid mode
+    }
+    void TickNativeMothmanFlight(uintptr_t pawn,const Vec3& desiredInput,
+                                  bool boosting,double dt,ULONGLONG now) {
+        // Exact SDK: BP_FlyingPawnTest_C inherits APawn and exposes
+        // FlightTarget at 0x400. This path drives its own ReceiveTick /
+        // physics and MothmanCreature_...AnimBlueprint rather than invoking
+        // K2_SetActorLocation on every movement frame.
+        int32_t id=-1;
+        Vec3 current{};
+        if(!pawn || !Read(pawn+0x0C,id) || !Position(pawn,current))return;
+        if(gMothFlight.pawn!=pawn || gMothFlight.objectIndex!=id) {
+            gMothFlight=NativeMothmanFlight{};
+            gMothFlight.pawn=pawn;
+            gMothFlight.objectIndex=id;
+            gMothFlight.lastPosition=current;
+            gMothFlight.lastMotionSeen=now;
+            gMothFlight.positionValid=true;
+            FHJDiag::Log(L"MOTHMAN FLIGHT: switched to native FlightTarget steering and actual-velocity animation blending.");
+        }
+        const double speed=boosting?1100.0:690.0;
+        const double gain=1.0-std::exp(-std::clamp(5.5*dt,0.0,1.0));
+        gMothFlight.smoothedVelocity.x+=(desiredInput.x*speed-
+            gMothFlight.smoothedVelocity.x)*gain;
+        gMothFlight.smoothedVelocity.y+=(desiredInput.y*speed-
+            gMothFlight.smoothedVelocity.y)*gain;
+        gMothFlight.smoothedVelocity.z+=(desiredInput.z*speed-
+            gMothFlight.smoothedVelocity.z)*gain;
+        const double commanded=std::hypot(std::hypot(
+            gMothFlight.smoothedVelocity.x,gMothFlight.smoothedVelocity.y),
+            gMothFlight.smoothedVelocity.z);
+        // Look ahead from the real current location while keeping the flight
+        // target continuous as input accelerates/decelerates. Idle targets the
+        // current position to avoid drifting after releasing the keys.
+        const double leadSeconds=1.10;
+        const Vec3 target{
+            current.x+gMothFlight.smoothedVelocity.x*leadSeconds,
+            current.y+gMothFlight.smoothedVelocity.y*leadSeconds,
+            current.z+gMothFlight.smoothedVelocity.z*leadSeconds};
+        const bool targetAccepted=TryWrite(pawn+0x400,target);
+        double nativeSpeed=0.0;
+        if(Read(pawn+0x420,nativeSpeed) &&
+           (!std::isfinite(nativeSpeed)||nativeSpeed<=1.0)) {
+            const double initial=690.0;
+            TryWrite(pawn+0x420,initial);
+        }
+        // Derive anim blend parameters from observed actor motion, rather
+        // than moving the mesh with an artificial animation montage.
+        const double observationDt=std::max(dt,0.005);
+        const Vec3 delta{current.x-gMothFlight.lastPosition.x,
+                         current.y-gMothFlight.lastPosition.y,
+                         current.z-gMothFlight.lastPosition.z};
+        const double progress=std::hypot(std::hypot(delta.x,delta.y),delta.z);
+        const double measuredH=std::clamp(std::hypot(delta.x,delta.y)/
+            observationDt,0.0,2500.0);
+        const double measuredFull=std::clamp(progress/observationDt,
+            0.0,2500.0);
+        if(progress>2.0 || commanded<30.0)gMothFlight.lastMotionSeen=now;
+        if(!targetAccepted)gMothFlight.lastMotionSeen=now;
+        if(targetAccepted && commanded>120.0 &&
+           now-gMothFlight.lastMotionSeen>650) {
+            // Only a bounded emergency swept move is used if the game never
+            // consumes FlightTarget. This is not the normal animation path.
+            const Vec3 fallback{
+                current.x+gMothFlight.smoothedVelocity.x*dt,
+                current.y+gMothFlight.smoothedVelocity.y*dt,
+                current.z+gMothFlight.smoothedVelocity.z*dt};
+            SetActorLocationSafe(pawn,fallback,true,false);
+            if(!gMothFlight.loggedFallback) {
+                gMothFlight.loggedFallback=true;
+                FHJDiag::Log(L"MOTHMAN FLIGHT: native pawn stalled; swept recovery engaged. Inspect FlightTarget/ReceiveTick in live dump.");
+            }
+        }
+        gMothFlight.lastPosition=current;
+
+        // Exact Mothman SDK: USkeletalMeshComponent at Pawn+0x3D0,
+        // AnimScriptInstance +0x8A0, AnimBlueprint IsFlying 0x1310,
+        // HSpeed 0x1314, FSpeed 0x1318. These feed the original blend graph;
+        // keep wings/physical animation and native character visuals intact.
+        const auto mesh=ReadPtr(pawn+0x3D0);
+        const auto anim=ReadPtr(mesh+0x8A0);
+        if(anim && ClassName(ReadPtr(anim+0x10))==
+           L"MothmanCreature_Body_Skeleton_AnimBlueprint_C") {
+            const bool isFlying=true;
+            const float h=static_cast<float>(measuredH);
+            const float v=static_cast<float>(measuredFull);
+            TryWrite(anim+0x1310,isFlying);
+            TryWrite(anim+0x1314,h);
+            TryWrite(anim+0x1318,v);
+        }
     }
     void FreeflightTick() {
         const ULONGLONG now=GetTickCount64();
+#ifdef FCH_STANDALONE
+        // A remote owner sees the new pawn via Unreal's replicated possession,
+        // without relying on the host's in-process selected-player UI.
+        const auto roleWorld=World();
+        if(roleWorld && roleWorld==gPrevWorld)
+            TickOwningClientRole(roleWorld,now);
+#endif
+#ifdef FCH_STANDALONE
+        FinishWendigoStealthIfDue(now);
+        if(now-gHuntNightLastRead>450) {
+            gHuntNightLastRead=now;
+            const auto phase=NativeHuntNightState();
+            gHuntNightCached.store(phase);
+            UpdateWendigoCameraQuota(phase);
+        }
+#endif
+        VerifyVampireInvisibility(now);
         const ULONGLONG elapsed=gLastMotionTick?now-gLastMotionTick:16;
         gLastMotionTick=now;
-        if(!gWindow || gJournalOpen.load() || GetForegroundWindow()!=gWindow)return;
         const auto world=World();
         if(!world || world!=gPrevWorld)return;
+        // Respawn must keep progressing even with the journal open.
+        if(gMonsterActive.load() && !MonitorControlledRespawn(world,now))return;
+        if(gMonsterActive.load() || gLocalMothmanSmoke.component)
+            SyncLocalMothmanSmoke();
+        if(gMonsterActive.load() || gMothRender.pawn)
+            SyncLocalMothmanRender();
+        if(now-gLastPossessionClarityRefresh>=600) {
+            gLastPossessionClarityRefresh=now;
+            if(gMonsterActive.load() || gPossessionClarity.active) {
+                const auto instance=ReadPtr(world+0x1D8);
+                const auto locals=ReadPtr(instance+0x38);
+                const auto local=ReadPtr(locals);
+                const auto pc=ReadPtr(local+0x30);
+                if(pc) {
+                    if(gMonsterActive.load())RefreshPossessionClarity(pc);
+                    else RestorePossessionClarity(pc);
+                }
+            }
+        }
+        if(!gWindow || gJournalOpen.load() || GetForegroundWindow()!=gWindow)return;
         const bool monster=gMonsterActive.load();
         const auto pawn=monster?gMonsterPawn:LocalPawn();
         if(!pawn || (!monster && !gNoclipEnabled))return;
@@ -1288,14 +3490,20 @@ namespace {
         if(!Read(pawn+0x0C,index) || (monster && index!=gMonsterIndex)) {
             if(monster) {
                 gMonsterActive.store(false);
+                const auto local=ReadPtr(ReadPtr(world+0x1D8)+0x38);
+                const auto pc=ReadPtr(ReadPtr(local)+0x30);
+                RestoreHumanControls();
                 RestoreHumanHUD();
-                FHJDiag::Log(L"Monster actor invalidated; removed monster overlay.");
+                ReleaseMonsterCamera(pc,gHumanPawn);
+                RestoreMonsterAI();
+                gMonsterPawn=0;gMonsterIndex=-1;
+                FHJDiag::Log(L"Monster actor invalidated; human controls and camera restored.");
             }
             return;
         }
-        // Native character input is accumulated for CharacterMovement::Tick.
-        // The old K2_SetActorLocation teleport-per-frame method was causing
-        // both jitter and a permanently idle AnimBlueprint locomotion state.
+        // AI-owned cryptids are driven by AIController::MoveToLocation so the
+        // CharacterMovement / AnimBlueprint locomotion receives a real path.
+        // Local noclip is separate and uses world-space movement.
         const double dt=std::clamp(static_cast<double>(elapsed)*.001,0.0,.045);
         const auto camera=GetCamera(world);
         const double yaw=(monster?gMonsterYaw:camera.rot.yaw)*kPi/180.0;
@@ -1306,41 +3514,145 @@ namespace {
         const double front=static_cast<double>(down('W'))-static_cast<double>(down('S'));
         const double strafe=static_cast<double>(down('D'))-static_cast<double>(down('A'));
         const bool boost=down(VK_SHIFT);
+        if(monster) {
+            // Windows messages are consumed to suppress human-pawn actions.
+            // Detect key-down edges ourselves, including raw-input bindings.
+            constexpr int keys[3]{'Q','E','R'};
+            for(int i=0;i<3;++i) {
+                const bool pressed=down(keys[i]);
+                if(pressed && !gAbilityKeyDown[static_cast<size_t>(i)])
+                    ExecuteMonsterAbility(i+1);
+                gAbilityKeyDown[static_cast<size_t>(i)]=pressed;
+            }
+        }
         int species=0;
         if(monster) {
             std::lock_guard<std::mutex> guard(gMonsterStatusMutex);
             species=gMonsterHUD.species;
         }
-        const bool flying=!monster || species==1; // Mothman uses flight; ground cryptids run.
+#ifdef FCH_STANDALONE
+        if(monster && species==3) {
+            const bool placeKey=down('C'),cycleKey=down('V');
+            if(placeKey && !gWendigoPlaceKey)PlaceWendigoWatchCamera();
+            if(cycleKey && !gWendigoCycleKey)
+                CycleWendigoWatchCamera(false);
+            gWendigoPlaceKey=placeKey;
+            gWendigoCycleKey=cycleKey;
+        } else {
+            gWendigoPlaceKey=false;gWendigoCycleKey=false;
+        }
+#endif
+        // Only the human's independent noclip and Mothman's verified
+        // winged-control profile may ascend/descend. Wendigo must stay grounded.
+        const bool flying=!monster || species==1;
         const double ascend=flying?
-            static_cast<double>(down(VK_SPACE))-static_cast<double>(down(VK_CONTROL)):0.0;
+            static_cast<double>(down(VK_SPACE))-
+            static_cast<double>(down(VK_CONTROL)):0.0;
         Vec3 input{cy*front-sy*strafe,sy*front+cy*strafe,ascend};
-        if(flying) {
+        if(monster && flying) {
+            // Mothman follows camera pitch. Noclip intentionally stays on the
+            // XY plane for WASD so looking up/down never kills forward motion.
             input.x*=cp; input.y*=cp;
             input.z+=sp*front;
         }
         const double length=std::sqrt(input.x*input.x+input.y*input.y+input.z*input.z);
         if(length>1e-3) {
             input.x/=length;input.y/=length;input.z/=length;
-            if(!AddSmoothMovement(pawn,input,1.f)) {
-                static ULONGLONG warned=0;
-                if(now-warned>8000) {
-                    warned=now;
-                    FHJDiag::Log(L"Movement input could not be dispatched. No teleport fallback used.");
+        }
+        if(!monster) {
+            if(pawn!=gNoclipPawn) {
+                if(gNoclipIgnoredMove && gNoclipController) {
+                    const auto allow=FindFunction(L"Controller",L"SetIgnoreMoveInput");
+                    if(allow){bool no=false;Invoke(gNoclipController,allow,&no);}
+                }
+                gNoclipController=0;gNoclipIgnoredMove=false;
+                gNoclipEnabled=false;gNoclipPawn=0;gNoclipPositionValid=false;
+                gFlySpeedSaved=false;gOriginalFlyMovement=0;
+                FHJDiag::Log(L"NOCLIP: player changed; restored controller input and stopped free-flight safely.");
+                return;
+            }
+            if(!gNoclipPositionValid)
+                gNoclipPositionValid=Position(pawn,gNoclipPosition);
+            if(gNoclipPositionValid) {
+                // No keys => exact position hold, never float or sink.
+                const double speed=boost?1850.0:1150.0;
+                gNoclipPosition.x+=input.x*speed*dt;
+                gNoclipPosition.y+=input.y*speed*dt;
+                gNoclipPosition.z+=input.z*speed*dt;
+                const auto movement=ReadPtr(pawn+0x330);
+                const auto stop=FindFunction(L"MovementComponent",L"StopMovementImmediately");
+                if(movement && stop)Invoke(movement,stop,nullptr);
+                if(!SetActorLocationSafe(pawn,gNoclipPosition)) {
+                    static ULONGLONG warned=0;
+                    if(now-warned>5000) {
+                        warned=now;
+                        FHJDiag::Log(L"NOCLIP: engine rejected world-position hold; inspect host authority.");
+                    }
+                }
+            }
+        } else {
+            // Mothman is the only aerial cryptid in this control profile.
+            // Ground species never receive direct no-clip or vertical movement.
+            gMonsterFlightActive=(species==1);
+            if(gMonsterFlightActive) {
+                StopCryptidPath();
+                TickNativeMothmanFlight(pawn,input,boost,dt,now);
+            } else {
+                // Space invokes Character.Jump rather than enabling flight.
+                // This uses normal walk physics and leaves collision intact.
+                const bool jump=down(VK_SPACE);
+                if(jump && !gGroundJumpHeld) {
+                    const auto jumpFn=FindFunction(L"Character",L"Jump");
+                    uint16_t params=0;
+                    if(jumpFn && Read(jumpFn+0xB6,params) && params==0)
+                        Invoke(pawn,jumpFn,nullptr);
+                }
+                gGroundJumpHeld=jump;
+                Vec3 horizontal{input.x,input.y,0.0};
+                const double lenXY=std::hypot(horizontal.x,horizontal.y);
+                if(lenXY>1e-3) {
+                    horizontal.x/=lenXY;horizontal.y/=lenXY;
+                    DriveGroundCryptid(horizontal,boost,now);
+                } else {
+                    StopCryptidPath();
+                    // On release, try direct native input again rather
+                    // than being locked in navigation fallback forever.
+                    gGroundDrive.sampleValid=false;
+                    gGroundDrive.useNavFallback=false;
                 }
             }
         }
-        const auto movement=ReadPtr(pawn+0x330);
+        const auto movement=monster && species==1 ? 0 : ReadPtr(pawn+0x330);
         if(movement) {
-            if(monster && gMonsterSpeedsSaved) {
-                const float speed=boost?1.7f:1.f;
-                const float walk=(species==2?610.f:species==3?540.f:700.f)*speed;
-                const float fly=(species==1?1200.f:850.f)*speed;
-                float current=0;
-                if(Read(movement+0x268,current) && std::fabs(current-walk)>.5f)
-                    TryWrite(movement+0x268,walk);
-                if(Read(movement+0x274,current) && std::fabs(current-fly)>.5f)
-                    TryWrite(movement+0x274,fly);
+            if(!monster && gNoclipEnabled) {
+                uint8_t mode=0;
+                if(Read(movement+0x221,mode) && mode!=5) {
+                    const auto setMode=FindFunction(L"CharacterMovementComponent",L"SetMovementMode");
+                    if(setMode) {
+                        uint8_t flight[2]{5,0};
+                        Invoke(movement,setMode,flight);
+                    }
+                }
+            }
+            if(monster && species!=1) {
+                // If the game or a previous build left a ground cryptid in
+                // MOVE_Flying, force it back into normal ground physics.
+                uint8_t mode=0;
+                if(Read(movement+0x221,mode) && mode==5) {
+                    const auto set=FindFunction(L"CharacterMovementComponent",L"SetMovementMode");
+                    if(set) {
+                        uint8_t walking[2]{1,0};
+                        Invoke(movement,set,walking);
+                    }
+                }
+            }
+            if(monster && species!=1 && gMonsterSpeedsSaved) {
+                const float authentic=boost?
+                    gMonsterNativeRunSpeed:gMonsterNativeWalkSpeed;
+                float current=0.f;
+                if(authentic>0.f && Read(movement+0x268,current) &&
+                   std::fabs(current-authentic)>1.f)
+                    TryWrite(movement+0x268,authentic);
             } else if(!monster && gFlySpeedSaved && movement==gOriginalFlyMovement) {
                 const float wanted=boost?1850.f:1150.f;
                 float current=0;
@@ -1357,8 +3669,12 @@ namespace {
         const auto pc=ReadPtr(local+0x30);
         if(!pc || ReadPtr(pc+0x350)!=gHumanPawn) {
             gMonsterActive.store(false);
+            RestoreHumanControls();
             RestoreHumanHUD();
-            FHJDiag::Log(L"Monster control stopped: original player pawn changed externally.");
+            ReleaseMonsterCamera(pc,ReadPtr(pc+0x350));
+            RestoreMonsterAI();
+            gMonsterPawn=0;gMonsterIndex=-1;
+            FHJDiag::Log(L"Monster control stopped: human controls restored after pawn replacement.");
             return;
         }
         static ULONGLONG hudTick=0;
@@ -1366,37 +3682,62 @@ namespace {
             hudTick=now;
             HideHumanHUD();
         }
-        // Rotate the creature itself so its mesh and melee hit direction face the view.
-        const Rot desired{0.0,gMonsterYaw,0.0};
-        const auto turn=FindFunction(L"Actor",L"K2_SetActorRotation");
-        if(turn) SetActorRotationSafe(pawn,desired);
+        // Ground cryptids face camera yaw. Mothman's native
+        // TorqueTowardsVelocity and wing animation need control of its
+        // orientation: never hard-snap the aerial pawn to camera yaw.
+        if(species!=1 && length<1e-3) {
+            // While navigating, let AIController/path-following rotate the
+            // creature naturally. Only face the camera while stationary;
+            // per-frame hard yaw writes interfere with native turning.
+            const Rot desired{0.0,gMonsterYaw,0.0};
+            if(FindFunction(L"Actor",L"K2_SetActorRotation"))
+                SetActorRotationSafe(pawn,desired);
+        }
         if(gChaseCamera) {
             Vec3 location{};
             if(Position(pawn,location)) {
-                double distance=340.0,height=175.0;
-                if(species==1){distance=540; height=260;}
-                else if(species==2){distance=315;height=170;}
-                else if(species==3){distance=410;height=235;}
+                double distance=650.0,height=245.0;
+                if(species==1){distance=810; height=340;}
+                else if(species==2){distance=625;height=225;}
+                else if(species==3){distance=735;height=290;}
+                const Vec3 pivot{location.x,location.y,location.z+height};
                 const Vec3 goal{
-                    location.x-cy*distance,
-                    location.y-sy*distance,
-                    location.z+height-std::sin(pitch)*distance*.18
+                    pivot.x-cy*distance,
+                    pivot.y-sy*distance,
+                    pivot.z-std::sin(pitch)*distance*.18
                 };
+                Vec3 safeGoal{};
+                if(!ConstrainChaseCamera(pivot,goal,safeGoal)) {
+                    // Trace unavailable: avoid burying the camera in the
+                    // creature. Collision is not guaranteed in this fallback.
+                    const double close=420.0;
+                    safeGoal={pivot.x-cy*close,pivot.y-sy*close,
+                              pivot.z-std::sin(pitch)*close*.18};
+                }
                 if(!gChaseSmoothedValid) {
-                    gChaseSmoothedPos=goal;
+                    gChaseSmoothedPos=safeGoal;
                     gChaseSmoothedValid=true;
                 } else {
-                    const double alpha=1.-std::exp(-12.*dt);
-                    gChaseSmoothedPos.x+=(goal.x-gChaseSmoothedPos.x)*alpha;
-                    gChaseSmoothedPos.y+=(goal.y-gChaseSmoothedPos.y)*alpha;
-                    gChaseSmoothedPos.z+=(goal.z-gChaseSmoothedPos.z)*alpha;
+                    // Shorter interpolation tail reduces perceived ghosting
+                    // and the camera visibly lagging behind moving cryptids.
+                    const double alpha=1.-std::exp(
+                    -static_cast<double>(gCryptidCameraFollow.load())*dt);
+                    gChaseSmoothedPos.x+=(safeGoal.x-gChaseSmoothedPos.x)*alpha;
+                    gChaseSmoothedPos.y+=(safeGoal.y-gChaseSmoothedPos.y)*alpha;
+                    gChaseSmoothedPos.z+=(safeGoal.z-gChaseSmoothedPos.z)*alpha;
                 }
+                // A smoothed trajectory can pass through a wall around a
+                // corner even when its destination was trace-safe. Re-probe
+                // the actual interpolated position before every camera move.
+                Vec3 actual=gChaseSmoothedPos;
+                if(ConstrainChaseCamera(pivot,actual,actual))
+                    gChaseSmoothedPos=actual;
                 SetActorLocationSafe(gChaseCamera,gChaseSmoothedPos);
                 SetActorRotationSafe(gChaseCamera,{gMonsterPitch,gMonsterYaw,0.0});
             }
         }
         UpdateMonsterHUD();
-        if(down(VK_LBUTTON) && now-gLastAttackTick>=700) {
+        if(species!=1 && down(VK_LBUTTON) && now-gLastAttackTick>=700) {
             gLastAttackTick=now;
             ExecuteMonsterAbility(0);
         }
@@ -1417,6 +3758,194 @@ namespace {
         return pawn && Read(pawn+0x0C,index) && index>=0 &&
             ClassKind(ReadPtr(pawn+0x10))==1;
     }
+
+#ifdef FCH_STANDALONE
+    bool RemoteRoleObjectLive(uintptr_t obj,int32_t id) {
+        int32_t actual=-1;
+        return obj && id>=0 && Read(obj+0xC,actual) && actual==id;
+    }
+    bool RemoteRoleControllerIs(uintptr_t controller,const wchar_t* base) {
+        auto klass=ReadPtr(controller+0x10);
+        for(int depth=0;klass && depth<24;++depth) {
+            if(ClassName(klass)==base)return true;
+            const auto parent=ReadPtr(klass+0x40);
+            if(!parent || parent==klass)break;
+            klass=parent;
+        }
+        return false;
+    }
+    uintptr_t RemoteRolePossessMethod() {
+        const auto fn=FindFunction(L"Controller",L"Possess");
+        uint16_t size=0;
+        // UE5.5 AController.Possess(APawn*) has one 8-byte pointer argument;
+        // fail closed if this game's live UFunction is different.
+        return fn && Read(fn+0xB6,size) && size==sizeof(uintptr_t)?fn:0;
+    }
+    void ClearServerRemoteRole() {
+        gNativeRemoteRole=NativeRemoteRole{};
+        gNativeRolePlayerId.store(-1);
+        gNativeRoleCryptidId.store(-1);
+    }
+    bool RestoreServerRemoteRole() {
+        const auto role=gNativeRemoteRole;
+        if(!role.world)return false;
+        if(role.world!=World()) {
+            ClearServerRemoteRole();
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: remote return skipped after world change.");
+            return false;
+        }
+        if(!RemoteRoleObjectLive(role.playerController,role.controllerId) ||
+           !RemoteRoleObjectLive(role.human,role.humanId)) {
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: original controller or human pawn is gone; cannot promise safe restoration. Inspect native hunt respawn.");
+            return false;
+        }
+        const auto possess=RemoteRolePossessMethod();
+        if(!possess) {
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: Controller.Possess(APawn*) reflection unavailable; restoration blocked.");
+            return false;
+        }
+        const auto current=ReadPtr(role.playerController+0x350);
+        if(current!=role.human && current!=role.cryptid && current!=0) {
+            // The game may have already put the player in a fresh pawn.
+            // Never seize an unrelated pawn away from its controller.
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: base game already replaced remote pawn; leaving new gameplay ownership intact.");
+            ClearServerRemoteRole();
+            return true;
+        }
+        if(current!=role.human) {
+            uintptr_t human=role.human;
+            if(!Invoke(role.playerController,possess,&human) ||
+               ReadPtr(role.playerController+0x350)!=human) {
+                FHJDiag::Log(L"CRYPTID NETWORK ROLE: remote human return not confirmed; handoff retained for retry.");
+                return false;
+            }
+        }
+        const bool cryptidLive=RemoteRoleObjectLive(role.cryptid,role.cryptidId);
+        const bool aiLive=RemoteRoleObjectLive(role.ai,role.aiId) &&
+                          RemoteRoleControllerIs(role.ai,L"AIController");
+        if(cryptidLive && aiLive && !ReadPtr(role.ai+0x350)) {
+            uintptr_t cryptid=role.cryptid;
+            if(!Invoke(role.ai,possess,&cryptid) ||
+               ReadPtr(role.cryptid+0x2D8)!=role.ai)
+                FHJDiag::Log(L"CRYPTID NETWORK ROLE: human restored, but original AI could not repossess cryptid; inspect native controller.");
+        }
+        ForceActorNetUpdate(role.human);
+        if(cryptidLive)ForceActorNetUpdate(role.cryptid);
+        ClearServerRemoteRole();
+        FHJDiag::Log(L"CRYPTID NETWORK ROLE: remote PlayerController repointed to original human; native handoff cleared.");
+        return true;
+    }
+    void AssignServerRemoteRole(int playerPawnIndex,int cryptidPawnIndex) {
+        const auto world=World();
+        if(!world || !ReadPtr(world+0x158) ||
+           world!=gPrevWorld || !gCryptidHuntOptedIn.load() ||
+           gCryptidHuntMapSpecies.load()==0 || gMonsterActive.load() ||
+           gNativeRemoteRole.world) {
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: requires a single, opted-in authoritative host hunt without another active handoff.");
+            return;
+        }
+        uintptr_t human=0,cryptid=0;
+        for(const auto& a:gKnown) {
+            int32_t id=-1;
+            if(!a.address || !Read(a.address+0xC,id) || id!=a.index)continue;
+            if(a.kind==1 && a.index==playerPawnIndex)human=a.address;
+            if(a.kind==2 && a.index==cryptidPawnIndex)cryptid=a.address;
+        }
+        int32_t humanId=-1,cryptidId=-1;
+        if(!ValidPlayerPawn(human,humanId) || humanId!=playerPawnIndex ||
+           !cryptid || !Read(cryptid+0xC,cryptidId) ||
+           cryptidId!=cryptidPawnIndex || !IsPawnClass(ReadPtr(cryptid+0x10)) ||
+           HuntSpeciesFromName(ClassName(ReadPtr(cryptid+0x10)))!=
+               gCryptidHuntMapSpecies.load()) {
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: selected world actors missing, invalid or incompatible with stock map.");
+            return;
+        }
+        const auto pc=ReadPtr(human+0x2D8);
+        const auto ai=ReadPtr(cryptid+0x2D8);
+        int32_t pcId=-1,aiId=-1;
+        const auto instance=ReadPtr(world+0x1D8);
+        const auto locals=ReadPtr(instance+0x38);
+        const auto local=ReadPtr(locals);
+        const auto ownPc=ReadPtr(local+0x30);
+        if(!pc || pc==ownPc || !Read(pc+0xC,pcId) ||
+           !RemoteRoleControllerIs(pc,L"PlayerController") ||
+           ReadPtr(pc+0x350)!=human ||
+           (ai && (!Read(ai+0xC,aiId) ||
+                   !RemoteRoleControllerIs(ai,L"AIController"))) ||
+           (ai && ReadPtr(ai+0x350)!=cryptid)) {
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: target is not an authoritative remote PlayerController owning its human, or cryptid is not AI-owned.");
+            return;
+        }
+        const auto possess=RemoteRolePossessMethod();
+        if(!possess) {
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: no validated Controller.Possess(APawn*) UFunction; refusing unsafe swap.");
+            return;
+        }
+        gNativeRemoteRole={world,pc,human,cryptid,ai,pcId,humanId,
+                           cryptidId,aiId,GetTickCount64()};
+        // Native authority-side possession triggers UE's existing Pawn owner
+        // replication. Does not imply that a remote ASI or its input is ready.
+        uintptr_t target=cryptid;
+        const bool invoked=Invoke(pc,possess,&target);
+        const bool attached=invoked && ReadPtr(pc+0x350)==cryptid &&
+                            ReadPtr(cryptid+0x2D8)==pc;
+        if(!attached) {
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: native possess unconfirmed. Attempting immediate human rollback.");
+            if(ReadPtr(pc+0x350)!=human) {
+                uintptr_t original=human;
+                Invoke(pc,possess,&original);
+            }
+            if(ReadPtr(pc+0x350)==human)ClearServerRemoteRole();
+            else {
+                gNativeRolePlayerId.store(humanId);
+                gNativeRoleCryptidId.store(cryptidId);
+                FHJDiag::Log(L"CRYPTID NETWORK ROLE: rollback not confirmed. Use host RESTORE REMOTE HUMAN; session still tracked.");
+            }
+            return;
+        }
+        gNativeRolePlayerId.store(humanId);
+        gNativeRoleCryptidId.store(cryptidId);
+        ForceActorNetUpdate(human);
+        ForceActorNetUpdate(cryptid);
+        FHJDiag::Log(L"CRYPTID NETWORK ROLE: server PlayerController.Possess verified against live pawn and controller. Client camera/input, controls and survivor visibility require two-client verification.");
+    }
+    void MaintainServerRemoteRole(uintptr_t world) {
+        const auto role=gNativeRemoteRole;
+        if(!role.world)return;
+        if(world!=role.world) {
+            ClearServerRemoteRole();
+            return;
+        }
+        if(!RemoteRoleObjectLive(role.playerController,role.controllerId)) {
+            ClearServerRemoteRole();
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: original remote controller no longer exists.");
+            return;
+        }
+        const auto owned=ReadPtr(role.playerController+0x350);
+        if(owned==role.human) {
+            ClearServerRemoteRole();
+            return;
+        }
+        if(owned!=role.cryptid && owned!=0) {
+            FHJDiag::Log(L"CRYPTID NETWORK ROLE: player switched to game-owned replacement pawn; not overriding the game.");
+            ClearServerRemoteRole();
+            return;
+        }
+        if(!RemoteRoleObjectLive(role.cryptid,role.cryptidId)) {
+            RestoreServerRemoteRole();
+            return;
+        }
+        // The base cryptids have replicated HP, but Mothman is unrelated
+        // APawn and must never read the 0x710 health offset.
+        if(ClassName(ReadPtr(role.cryptid+0x10))!=L"BP_FlyingPawnTest_C") {
+            double health=-1.0;
+            if(Read(role.cryptid+0x710,health) &&
+               std::isfinite(health) && health<=0)
+                RestoreServerRemoteRole();
+        }
+    }
+#endif
+
     bool ApplyGodProtection(uintptr_t pawn,bool enabled) {
         if(!ReadPtr(World()+0x158)) {
             FHJDiag::Log(L"God Mode rejected: requires authoritative host GameMode.");
@@ -1727,39 +4256,255 @@ namespace {
                 L"World gravity changed locally; remote players not targeted.");
         } else FHJDiag::Log(L"WorldGravityZ update failed.");
     }
+    bool VerifyAndInitializeSpawnedCryptid(uintptr_t spawned,uintptr_t wantedClass) {
+        if(!spawned || ReadPtr(spawned+0x10)!=wantedClass)return false;
+        const bool isMothman=ClassName(wantedClass)==L"BP_FlyingPawnTest_C";
+        const auto mesh=ReadPtr(spawned+(isMothman?0x3D0:0x328));
+        // Engine.USkinnedMeshComponent::SkeletalMesh and SkinnedAsset are
+        // +0x520 and +0x528. Engine.USkeletalMeshComponent::AnimClass is
+        // +0x898; an AnimScriptInstance is +0x8A0. Don't report success
+        // for a bare APawn with no cooked model or animation.
+        const bool hasMesh=mesh &&
+            (ReadPtr(mesh+0x520) || ReadPtr(mesh+0x528));
+        const bool hasAnimation=mesh &&
+            (ReadPtr(mesh+0x898) || ReadPtr(mesh+0x8A0));
+        if(!hasMesh || !hasAnimation) {
+            FHJDiag::Log(L"CRYPTID SPAWN: rejected missing skeletal mesh or AnimBlueprint. Species resources are not loaded in this map.");
+            return false;
+        }
+        auto controller=ReadPtr(spawned+0x2D8);
+        if(!controller && ReadPtr(spawned+0x2C0)) {
+            const auto createAI=FindFunction(L"Pawn",L"SpawnDefaultController");
+            uint16_t parms=0;
+            if(createAI && Read(createAI+0xB6,parms) && parms==0)
+                Invoke(spawned,createAI,nullptr);
+            controller=ReadPtr(spawned+0x2D8);
+        }
+        if(!controller) {
+            FHJDiag::Log(L"CRYPTID SPAWN: rejected actor with no AIController after native SpawnDefaultController; map prerequisites may be unloaded.");
+            return false;
+        }
+        // No claim of multiplayer replication merely because the model
+        // and AI pointers exist locally; validate remotely in a private hunt.
+        return true;
+    }
+    bool SpawnNativeCryptid(uintptr_t spawner,uintptr_t species,int ordinal,
+                             int* createdObjectId=nullptr) {
+        if(!spawner || !species || ClassKind(species)!=2 || !IsPawnClass(species))
+            return false;
+        const auto context=FindObjectByName(L"Default__GameplayStatics");
+        const auto begin=FindFunction(L"GameplayStatics",L"BeginDeferredActorSpawnFromClass");
+        const auto finish=FindFunction(L"GameplayStatics",L"FinishSpawningActor");
+        const auto world=World();
+        if(!context || !begin || !finish || !world)return false;
+        Vec3 location{};
+        if(!Position(spawner,location))return false;
+        // Space adjacent requested creatures so they do not overlap the
+        // spawner or each other; locations are UE5 world units (centimeters).
+        const double theta=static_cast<double>(ordinal)*2.399963229728653;
+        const double radius=300.0+static_cast<double>(ordinal/6)*140.0;
+        Transform64 transform{};
+        transform.location.x=location.x+std::cos(theta)*radius;
+        transform.location.y=location.y+std::sin(theta)*radius;
+        transform.location.z=location.z+75.0;
+        alignas(8) uint8_t beginArgs[0x90]{};
+        std::memcpy(beginArgs,&world,8);
+        std::memcpy(beginArgs+8,&species,8);
+        std::memcpy(beginArgs+0x10,&transform,sizeof(transform));
+        beginArgs[0x70]=1; // ESpawnActorCollisionHandlingMethod AlwaysSpawn
+        if(!Invoke(context,begin,beginArgs))return false;
+        uintptr_t spawned=0;
+        std::memcpy(&spawned,beginArgs+0x88,sizeof(spawned));
+        if(!spawned)return false;
+        alignas(8) uint8_t finishArgs[0x80]{};
+        std::memcpy(finishArgs,&spawned,sizeof(spawned));
+        std::memcpy(finishArgs+0x10,&transform,sizeof(transform));
+        if(!Invoke(context,finish,finishArgs))return false;
+        uintptr_t returned=0;
+        std::memcpy(&returned,finishArgs+0x78,sizeof(returned));
+        int32_t id=-1;
+        if(returned && Read(returned+0x0C,id) && id>=0 &&
+           ClassKind(ReadPtr(returned+0x10))==2) {
+            if(!VerifyAndInitializeSpawnedCryptid(returned,species)) {
+                // Avoid leaving an invisible model-less or controller-less
+                // actor behind; it cannot be safely possessed.
+                const auto destroy=FindFunction(L"Actor",L"K2_DestroyActor");
+                if(destroy)Invoke(returned,destroy,nullptr);
+                return false;
+            }
+            if(gKnown.size()<400 &&
+               std::none_of(gKnown.begin(),gKnown.end(),
+                   [returned](const ActorEntry& e){return e.address==returned;}))
+                gKnown.push_back({returned,id,2});
+            if(createdObjectId)*createdObjectId=id;
+            ForceActorNetUpdate(returned);
+            return true;
+        }
+        return false;
+    }
+    void AdvanceSpawnWave() {
+        if(gSpawnWave.remaining<=0)return;
+        const auto now=GetTickCount64();
+        if(now<gSpawnWave.nextTick)return;
+        const auto world=World();
+        if(!world || !ReadPtr(world+0x158)) {
+            FHJDiag::Log(L"CRYPTID SPAWN: host authority lost; cancelled.");
+            gSpawnWave=SpawnWave{};return;
+        }
+        std::vector<uintptr_t> spawners;
+        int total=0;
+        for(const auto& level:GetWorldLevels(world,total))
+            for(int i=0;i<level.count;++i) {
+                const auto actor=ReadPtr(level.data+static_cast<size_t>(i)*8);
+                if(!actor || ClassName(ReadPtr(actor+0x10))!=L"BP_MobSpawner_C")
+                    continue;
+                int32_t id=-1;
+                if(!Read(actor+0x0C,id))continue;
+                if(gSpawnWave.spawnerObjectIndex<0 ||
+                   id==gSpawnWave.spawnerObjectIndex)
+                    spawners.push_back(actor);
+            }
+        if(gSpawnWave.spawnerObjectIndex>=0 && spawners.empty()) {
+            FHJDiag::Log(L"CRYPTID SPAWN: requested map spawner isn't present in this loaded hunt; cancelled.");
+            gSpawnWave=SpawnWave{};return;
+        }
+        // Only an explicitly selected loaded class may fall back to the
+        // host's position when a map has no native BP_MobSpawner_C actor.
+        const auto anchor=spawners.empty() ?
+            (gSpawnWave.classObjectIndex>=0?LocalPawn():0) :
+            spawners[static_cast<size_t>(gSpawnWave.dispatched)%spawners.size()];
+        if(!anchor) {
+            FHJDiag::Log(L"CRYPTID SPAWN: no usable spawner or host pawn.");
+            gSpawnWave=SpawnWave{};return;
+        }
+        uintptr_t species=0;
+        if(gSpawnWave.classObjectIndex>=0) {
+            int objectCount=0;uintptr_t chunks=0;
+            if(GetObjects(objectCount,chunks) &&
+               gSpawnWave.classObjectIndex<objectCount) {
+                const auto klass=ObjectAt(gSpawnWave.classObjectIndex,chunks);
+                int32_t id=-1;
+                const auto meta=ClassName(ReadPtr(klass+0x10));
+                if(klass && Read(klass+0x0C,id) &&
+                   id==gSpawnWave.classObjectIndex &&
+                   (meta==L"Class" || meta==L"BlueprintGeneratedClass") &&
+                   ClassKind(klass)==2 && IsPawnClass(klass))
+                    species=klass;
+            }
+            if(!species) {
+                FHJDiag::Log(L"CRYPTID SPAWN: selected cryptid UClass unloaded or changed; no spawn attempted.");
+                gSpawnWave=SpawnWave{};return;
+            }
+        } else {
+            for(const auto& found:gKnown)
+                if(found.kind==2 && found.index==gSpawnWave.speciesIndex) {
+                    int32_t id=-1;
+                    if(Read(found.address+0xC,id) && id==found.index)
+                        species=ReadPtr(found.address+0x10);
+                    break;
+                }
+            if(!species && !spawners.empty())
+                species=ReadPtr(anchor+0x2B8); // map's own MobClass
+        }
+        if(!species || ClassKind(species)!=2) {
+            FHJDiag::Log(L"CRYPTID SPAWN: no loaded cryptid class selected by map or user.");
+            gSpawnWave=SpawnWave{};return;
+        }
+        int createdId=-1;
+        const bool created=SpawnNativeCryptid(anchor,species,gSpawnWave.dispatched,
+                                               &createdId);
+        bool dispatched=created;
+        if(!created && !spawners.empty()) {
+            const auto original=ReadPtr(anchor+0x2B8);
+            if(original==species) {
+                // Only the map's own species can use the native TriggerSpawn
+                // fallback. Its Blueprint graph can override MobClass when
+                // handling cross-map requests, spawning an invisible/default
+                // creature; never report that as the requested species.
+                const auto trigger=FindFunction(L"BP_MobSpawner_C",L"TriggerSpawn");
+                if(trigger) {
+                    alignas(8) uint8_t args[0xA0]{};
+                    dispatched=Invoke(anchor,trigger,args);
+                }
+            } else {
+                FHJDiag::Log(L"CRYPTID SPAWN: selected off-map class failed model/AI verification; refused TriggerSpawn fallback to prevent default or invisible actor.");
+            }
+        }
+        if(!dispatched) {
+            FHJDiag::Log(L"CRYPTID SPAWN: native deferred spawn and map spawner dispatch failed; stopping wave.");
+            gSpawnWave=SpawnWave{};return;
+        }
+        ++gSpawnWave.dispatched;
+        if(created)++gSpawnWave.created;
+        --gSpawnWave.remaining;
+        gSpawnWave.nextTick=now+550;
+        wchar_t msg[224]{};
+        swprintf_s(msg,L"CRYPTID SPAWN: requested %d/%d, verified direct actors %d, pending %d. Spawner dispatch alone is not a verified actor.",
+            gSpawnWave.dispatched,gSpawnWave.requested,
+            gSpawnWave.created,gSpawnWave.remaining);
+        FHJDiag::Log(msg);
+        if(created && createdId>=0 && gSpawnWave.controlFirst) {
+            gSpawnWave.controlFirst=false;
+            PossessCreature(createdId,false);
+        }
+    }
+    void SetNativeMapSpawnerEnabled(int spawnerIndex,bool enabled) {
+        if(!ReadPtr(World()+0x158) || spawnerIndex<0)return;
+        for(const auto& actor:gKnownSpawners) {
+            if(actor.index!=spawnerIndex)continue;
+            int32_t id=-1;
+            if(!Read(actor.address+0x0C,id) || id!=spawnerIndex ||
+               ClassName(ReadPtr(actor.address+0x10))!=L"BP_MobSpawner_C")
+                break;
+            const auto fn=FindFunction(L"BP_MobSpawner_C",L"SetSpawningEnabled");
+            if(!fn)break;
+            alignas(8) uint8_t args[0x40]{};
+            args[0]=enabled?1:0; // SDK native first bool parameter
+            if(!Invoke(actor.address,fn,args))break;
+            bool active=false;
+            if(Read(actor.address+0x308,active) && active==enabled)
+                FHJDiag::Log(enabled?
+                    L"MAP SPAWNER: SetSpawningEnabled(true) reflected state confirmed.":
+                    L"MAP SPAWNER: SetSpawningEnabled(false) reflected state confirmed.");
+            else
+                FHJDiag::Log(L"MAP SPAWNER: native toggle dispatched but state change not confirmed.");
+            return;
+        }
+        FHJDiag::Log(L"MAP SPAWNER: selected live map spawner or native method not found.");
+    }
+    void SpawnSelectedClassWave(int count,int classObjectIndex,
+                                 int mapSpawnerIndex,bool autoControl) {
+        if(!ReadPtr(World()+0x158) || count<1 || count>10 || classObjectIndex<0)
+            return;
+        int total=0;uintptr_t chunks=0;
+        if(!GetObjects(total,chunks) || classObjectIndex>=total)return;
+        const auto klass=ObjectAt(classObjectIndex,chunks);
+        int32_t id=-1;
+        const auto speciesName=ObjectName(klass);
+        const bool concrete=speciesName==L"BP_FlyingPawnTest_C" ||
+            speciesName==L"BP_Vampire_C" || speciesName==L"BP_Wendigo_C";
+        if(!klass || !Read(klass+0xC,id) || id!=classObjectIndex ||
+           !concrete || ClassKind(klass)!=2 || !IsPawnClass(klass)) {
+            FHJDiag::Log(L"CRYPTID SPAWN: rejected object that isn't a currently loaded cryptid UClass.");
+            return;
+        }
+        gSpawnWave=SpawnWave{};
+        gSpawnWave.remaining=count;gSpawnWave.requested=count;
+        gSpawnWave.classObjectIndex=classObjectIndex;
+        gSpawnWave.spawnerObjectIndex=mapSpawnerIndex;
+        gSpawnWave.controlFirst=autoControl;
+        FHJDiag::Log(L"CRYPTID SPAWN: queued selected species in active hunt; will verify each direct actor.");
+    }
     void SpawnCreatureWave(int count,int liveCryptidIndex) {
         const auto world=World();
         if(!world || !ReadPtr(world+0x158)) {
             FHJDiag::Log(L"Creature spawn rejected: host GameMode required.");return;
         }
-        const auto spawn=FindFunction(L"BP_MobSpawner_C",L"TriggerSpawn");
-        if(!spawn) {FHJDiag::Log(L"BP_MobSpawner_C.TriggerSpawn not loaded.");return;}
-        // Optional type override uses a real currently loaded CryptidBase-derived
-        // UClass, selected from a live actor. The source MobClass is restored.
-        uintptr_t species=0;
-        for(const auto& found:gKnown)
-            if(found.kind==2 && found.index==liveCryptidIndex)
-                species=ReadPtr(found.address+0x10);
-        int total=0,sent=0;
-        const auto levels=GetWorldLevels(world,total);
-        for(const auto& level:levels) {
-            for(int i=0;i<level.count && sent<count;++i) {
-                const auto actor=ReadPtr(level.data+static_cast<size_t>(i)*8);
-                if(!actor || ClassName(ReadPtr(actor+0x10))!=L"BP_MobSpawner_C")continue;
-                // This spawn tool chooses the species configured on the map spawner.
-                uintptr_t originalClass=0;
-                const bool overrideClass=species && Read(actor+0x2B8,originalClass) &&
-                    TryWrite(actor+0x2B8,species); // BP_MobSpawner_C::MobClass
-                alignas(8) unsigned char args[0xA0]{};
-                if(Invoke(actor,spawn,args))++sent;
-                if(overrideClass && !TryWrite(actor+0x2B8,originalClass))
-                    FHJDiag::Log(L"Spawner MobClass could not be restored; check world state.");
-            }
-            if(sent>=count)break;
+        if(!FindFunction(L"BP_MobSpawner_C",L"TriggerSpawn")) {
+            FHJDiag::Log(L"Creature spawn rejected: TriggerSpawn not loaded.");return;
         }
-        wchar_t msg[190]{};
-        swprintf_s(msg,L"Spawn dispatches: %d (species and spawn count follow level MobClass/SpawnCount)",sent);
-        FHJDiag::Log(msg);
+        gSpawnWave={count,count,0,liveCryptidIndex,0};
+        FHJDiag::Log(L"CRYPTID SPAWN: queued paced native spawn wave; a single map spawner can receive multiple calls.");
     }
     void PossessCreature(int index,bool restore) {
         const auto world=World();
@@ -1772,17 +4517,26 @@ namespace {
         const auto local=ReadPtr(players);
         const auto pc=ReadPtr(local+0x30);
         if(!pc)return;
+#ifdef FCH_STANDALONE
+        if(!restore && (!gCryptidHuntOptedIn.load() ||
+                        gCryptidHuntMapSpecies.load()==0)) {
+            FHJDiag::Log(L"CRYPTID HUNT: select custom mode first and enter a supported hunt through the normal lobby.");
+            return;
+        }
+#endif
         // No possession swaps: PlayerCharacter_C.ReceiveUnpossessed and
         // GameMode's singleplayer restart logic may destroy/restart the hunt.
         // Instead the controller stays on the human and its ViewTarget
         // switches to a camera chasing the independently driven cryptid.
         if(restore) {
+            RestoreHumanControls();
             RestoreHumanHUD();
             ReleaseMonsterCamera(pc,gHumanPawn?gHumanPawn:ReadPtr(pc+0x350));
             RestoreMonsterAI();
             gMonsterActive.store(false);
             gPuppeteering=false;gPossessedCryptid=false;
             gMonsterPawn=0;gMonsterIndex=-1;gChaseSmoothedValid=false;
+            ResetControlledRespawnSession();
             gHumanPawn=0;gHumanIndex=-1;
             FHJDiag::Log(L"Restore Human: camera/HUD/AI reset without Controller.Possess; hunt remains active.");
             return;
@@ -1798,6 +4552,13 @@ namespace {
             FHJDiag::Log(L"Monster Mode: selected cryptid not a live APawn/ACharacter.");
             return;
         }
+#ifdef FCH_STANDALONE
+        const auto clsName=ClassName(ReadPtr(selected+0x10));
+        if(HuntSpeciesFromName(clsName)!=gCryptidHuntMapSpecies.load()) {
+            FHJDiag::Log(L"CRYPTID HUNT: selected pawn does not match the cryptid assigned by the stock lobby's chosen map.");
+            return;
+        }
+#endif
         const auto human=ReadPtr(pc+0x350);
         int32_t humanIndex=-1;
         if(!human || !Read(human+0x0C,humanIndex)) {
@@ -1806,6 +4567,7 @@ namespace {
         }
         if(gMonsterActive.load()) {
             if(selected==gMonsterPawn)return;
+            RestoreHumanControls();
             RestoreHumanHUD();
             ReleaseMonsterCamera(pc,gHumanPawn);
             RestoreMonsterAI();
@@ -1815,16 +4577,18 @@ namespace {
         gHumanIndex=humanIndex;
         gMonsterPawn=selected;
         gMonsterIndex=index;
+        CaptureControlledCryptidSession();
         gChaseSmoothedValid=false;
         const Camera previous=GetCamera(world);
         gMonsterYaw=std::isfinite(previous.rot.yaw)?previous.rot.yaw:0.;
         gMonsterPitch=std::clamp(std::isfinite(previous.rot.pitch)?previous.rot.pitch:0.,-80.,80.);
         gLastMotionTick=0;
-        gLastAbilityTick=0;
-        gVampireStance=0;
+        gLastAbilityTick=0;gAbilityTicks.fill(0);gAbilityKeyDown.fill(false);
+        gVampireStance=0;gVampireInvisible=false;
         Vec3 pos{};
         if(!Position(selected,pos) || !CreateMonsterCamera(pc,pos)) {
             gMonsterPawn=0;gMonsterIndex=-1;
+            ResetControlledRespawnSession();
             ReleaseMonsterCamera(pc,gHumanPawn);
             FHJDiag::Log(L"Monster Mode cancelled: chase-camera setup failed; human still possessed.");
             return;
@@ -1834,6 +4598,9 @@ namespace {
         UpdateMonsterHUD();
         StopMonsterAI();
         ConfigureMonsterMovement();
+        CacheCryptidActions();
+        UpdateMonsterHUD(); // refresh HUD after the selected species' function cache is built
+        SuspendHumanControls(pc);
         HideHumanHUD();
         FHJDiag::Log(L"Monster puppet mode: human controller remains possessed. WASD native movement, Q/E/R ability, F11 restore.");
     }
@@ -1854,8 +4621,19 @@ namespace {
             ApplyWorldGravity(a.value,a.amount!=0);
         else if(a.type==ActionType::SpawnMob)
             SpawnCreatureWave(a.amount,a.target);
+        else if(a.type==ActionType::SpawnSpecies)
+            SpawnSelectedClassWave(a.amount,a.target,
+                static_cast<int>(a.precise),a.value>0.5f);
+        else if(a.type==ActionType::SpawnerToggle)
+            SetNativeMapSpawnerEnabled(a.target,a.amount!=0);
         else if(a.type==ActionType::PossessCryptid || a.type==ActionType::RestoreHuman)
             PossessCreature(a.target,a.type==ActionType::RestoreHuman);
+#ifdef FCH_STANDALONE
+        else if(a.type==ActionType::AssignRemoteRole)
+            AssignServerRemoteRole(a.amount,a.target);
+        else if(a.type==ActionType::RestoreRemoteRole)
+            RestoreServerRemoteRole();
+#endif
     }
 
     void EquipVanity(const Action& a) {
@@ -1899,18 +4677,27 @@ namespace {
     void ExecuteAction(const Action& a) {
         if(a.type==ActionType::EquipVanity) {EquipVanity(a);return;}
         if(a.type==ActionType::MonsterAbility) {ExecuteMonsterAbility(a.amount);return;}
+        if(a.type==ActionType::WendigoPlaceCamera) {PlaceWendigoWatchCamera();return;}
+        if(a.type==ActionType::WendigoCycleCamera) {CycleWendigoWatchCamera(false);return;}
+        if(a.type==ActionType::WendigoCloseCamera) {CycleWendigoWatchCamera(true);return;}
         if (a.type==ActionType::FallProtection ||
             a.type==ActionType::SpeedChange ||
             a.type==ActionType::JumpBoost ||
             a.type==ActionType::GravityChange ||
             a.type==ActionType::SpawnMob ||
+            a.type==ActionType::SpawnSpecies ||
+            a.type==ActionType::SpawnerToggle ||
             a.type==ActionType::PossessCryptid ||
-            a.type==ActionType::RestoreHuman) {
+            a.type==ActionType::RestoreHuman ||
+            a.type==ActionType::AssignRemoteRole ||
+            a.type==ActionType::RestoreRemoteRole) {
             ExecutePhysics(a); return;
         }
         if(a.type==ActionType::NoclipOn || a.type==ActionType::NoclipOff) {
             ExecuteNoclip(a.type==ActionType::NoclipOn);return;
         }
+        if(a.type==ActionType::TargetSound) {ExecuteClientSound(a);return;}
+        if(a.type==ActionType::TargetCameraShake) {ExecuteClientCameraShake(a);return;}
         if(a.type==ActionType::TargetHealth || a.type==ActionType::TargetNoise ||
            a.type==ActionType::TargetRevive || a.type==ActionType::TargetKill ||
            a.type==ActionType::TargetKick || a.type==ActionType::TargetGodMode) {
@@ -1941,12 +4728,16 @@ namespace {
             case ActionType::Snow:
                 ExecuteWeather(a);
                 return;
+            case ActionType::ClearWeather:
+                ExecuteClearWeather();
+                return;
             case ActionType::BeanMode:fn=L"EnableBeanMode";break;
             case ActionType::RangerMode:fn=L"EnableRangerMode";break;
             case ActionType::SmoreMode:fn=L"EnableSmoreMode";break;
             case ActionType::GiveItem:fn=L"GiveItem";break;
             case ActionType::GodMode:fn=L"ToggleGodMode";break;
             case ActionType::AddXP:fn=L"AddXP";break;
+            case ActionType::AddLevels:fn=L"AddLevels";break;
             case ActionType::Time:fn=L"SetTime";break;
             case ActionType::TimeScale:fn=L"SetTimeScale";break;
             case ActionType::AddSilver:fn=L"Cheat_AddSilver";owner=L"FL_Gamemode_C";break;
@@ -1962,6 +4753,8 @@ namespace {
             case ActionType::TargetKill:
             case ActionType::TargetKick:
             case ActionType::TargetGodMode:
+            case ActionType::TargetSound:
+            case ActionType::TargetCameraShake:
             case ActionType::NoclipOn:
             case ActionType::NoclipOff:
             case ActionType::FallProtection:
@@ -1969,9 +4762,16 @@ namespace {
             case ActionType::JumpBoost:
             case ActionType::GravityChange:
             case ActionType::SpawnMob:
+            case ActionType::SpawnSpecies:
+            case ActionType::SpawnerToggle:
             case ActionType::PossessCryptid:
             case ActionType::RestoreHuman:
+            case ActionType::AssignRemoteRole:
+            case ActionType::RestoreRemoteRole:
             case ActionType::MonsterAbility:
+            case ActionType::WendigoPlaceCamera:
+            case ActionType::WendigoCycleCamera:
+            case ActionType::WendigoCloseCamera:
             case ActionType::EquipVanity: return;
         }
         // FL_Gamemode_C overrides GiveItem/SetTime/SetTimeScale in this SDK.
@@ -1982,7 +4782,7 @@ namespace {
             function=FindFunction(L"FolkloreGamemode",fn);
         } else if(a.type==ActionType::GiveItem || a.type==ActionType::Time ||
                   a.type==ActionType::TimeScale || a.type==ActionType::RangerMode ||
-                  a.type==ActionType::SmoreMode) {
+                  a.type==ActionType::SmoreMode || a.type==ActionType::AddLevels) {
             function=FindFunction(L"FL_Gamemode_C",fn);
         }
         if (!function) function=FindFunction(owner,fn);
@@ -2025,7 +4825,11 @@ void HunterNative::AttachWindow(HWND window) { gWindow=window; }
 void HunterNative::RequestTick() {
     if (!gWindow) return;
     const ULONGLONG now=GetTickCount64();
-    const DWORD desiredInterval = (gNoclipEnabled || gMonsterActive.load()) ? 16 : kScanIntervalMs;
+    const DWORD desiredInterval = (gNoclipEnabled || gMonsterActive.load()
+#ifdef FCH_STANDALONE
+        || gClientRoleActive.load()
+#endif
+        ) ? 16 : kScanIntervalMs;
     if (now-gLastTick<desiredInterval) return;
     gLastTick=now;
     if (!gTickPending.exchange(true,std::memory_order_acq_rel))
@@ -2054,6 +4858,62 @@ std::vector<HunterNative::PlayerInfo> HunterNative::GetPlayers() {
 std::vector<HunterNative::CreatureInfo> HunterNative::GetCreatures() {
     std::lock_guard<std::mutex> lock(gMutex);
     return gCreatures;
+}
+std::vector<HunterNative::SoundInfo> HunterNative::GetSounds() {
+    std::lock_guard<std::mutex> lock(gMutex);
+    return gSounds;
+}
+std::vector<HunterNative::CameraShakeInfo> HunterNative::GetCameraShakes() {
+    std::lock_guard<std::mutex> lock(gMutex);
+    return gCameraShakes;
+}
+std::vector<HunterNative::CryptidSpawnClass> HunterNative::GetSpawnableCryptidClasses() {
+    std::lock_guard<std::mutex> lock(gMutex);
+    return gSpawnClassCatalog;
+}
+std::vector<HunterNative::CryptidSpawnPoint> HunterNative::GetActiveMapSpawners() {
+    std::lock_guard<std::mutex> lock(gMutex);
+    return gSpawnPointCatalog;
+}
+HunterNative::CryptidCameraSettings HunterNative::GetCryptidCameraSettings() {
+    LoadPreferences();
+    return {gCryptidYawSensitivity.load(),gCryptidPitchSensitivity.load(),
+            gCryptidCameraFollow.load(),gCryptidInvertPitch.load(),
+            gCryptidClearLocalBlur.load()};
+}
+void HunterNative::SetCryptidCameraSettings(const CryptidCameraSettings& value) {
+    if(!std::isfinite(value.yawSensitivity) ||
+       !std::isfinite(value.pitchSensitivity) ||
+       !std::isfinite(value.followRate))return;
+    gCryptidYawSensitivity.store(std::clamp(value.yawSensitivity,.015f,.60f));
+    gCryptidPitchSensitivity.store(std::clamp(value.pitchSensitivity,.015f,.60f));
+    gCryptidCameraFollow.store(std::clamp(value.followRate,8.f,72.f));
+    gCryptidInvertPitch.store(value.invertPitch);
+    gCryptidClearLocalBlur.store(value.clearBlurDuringPossession);
+    auto file=SettingsPath();
+    if(file.empty())return;
+    wchar_t buf[32]{};
+    swprintf_s(buf,L"%d",static_cast<int>(gCryptidYawSensitivity.load()*1000.f+.5f));
+    WritePrivateProfileStringW(L"CryptidCamera",L"YawMilli",buf,file.c_str());
+    swprintf_s(buf,L"%d",static_cast<int>(gCryptidPitchSensitivity.load()*1000.f+.5f));
+    WritePrivateProfileStringW(L"CryptidCamera",L"PitchMilli",buf,file.c_str());
+    swprintf_s(buf,L"%d",static_cast<int>(gCryptidCameraFollow.load()+.5f));
+    WritePrivateProfileStringW(L"CryptidCamera",L"FollowRate",buf,file.c_str());
+    WritePrivateProfileStringW(L"CryptidCamera",L"InvertPitch",
+        value.invertPitch?L"1":L"0",file.c_str());
+    WritePrivateProfileStringW(L"CryptidCamera",L"ClearBlurWhilePossessed",
+        value.clearBlurDuringPossession?L"1":L"0",file.c_str());
+}
+bool HunterNative::MothmanLocalSmokeReduction() {
+    LoadPreferences();
+    return gMothmanReduceLocalSmoke.load();
+}
+void HunterNative::SetMothmanLocalSmokeReduction(bool enabled) {
+    gMothmanReduceLocalSmoke.store(enabled);
+    const auto file=SettingsPath();
+    if(!file.empty())
+        WritePrivateProfileStringW(L"Mothman",L"ReduceLocalSmoke",
+            enabled?L"1":L"0",file.c_str());
 }
 std::vector<HunterNative::VanityItem> HunterNative::GetVanityItems() {
     std::lock_guard<std::mutex> lock(gMutex);
@@ -2093,16 +4953,39 @@ void HunterNative::DrawESP(ImVec2 display) {
         double meters=0;
         ImVec2 pt{};
         if(!Project(marker.pos,camera,display,pt,meters))continue;
+        // Mothman uses the same red ESP treatment as every other cryptid.
         const ImU32 color=colors[marker.kind];
         const float radius=std::clamp(14.f-static_cast<float>(meters)*.018f,4.f,14.f);
         dl->AddCircle(pt,radius,color,12,1.4f);
         dl->AddLine({pt.x-5,pt.y},{pt.x+5,pt.y},color,1.2f);
         dl->AddLine({pt.x,pt.y-5},{pt.x,pt.y+5},color,1.2f);
         char label[160]{};
-        if(marker.health>=0 && std::isfinite(marker.health))
-            snprintf(label,sizeof(label),"%s %.0fm HP %.0f",names[marker.kind],meters,marker.health);
-        else snprintf(label,sizeof(label),"%s %.0fm",names[marker.kind],meters);
-        dl->AddText({pt.x+radius+4,pt.y-9},color,label);
+        const bool showHealth=marker.kind==1 || marker.kind==2;
+        const char* category=marker.mothman?"MOTHMAN":names[marker.kind];
+        if(marker.mothman)
+            snprintf(label,sizeof(label),"MOTHMAN %.0fm | HP not exposed",
+                meters);
+        else if(showHealth && marker.health>=0 && marker.maxHealth>0)
+            snprintf(label,sizeof(label),"%s %.0fm | HP %.0f / %.0f",
+                category,meters,marker.health,marker.maxHealth);
+        else if(showHealth && marker.health>=0)
+            snprintf(label,sizeof(label),"%s %.0fm | HP %.0f",
+                category,meters,marker.health);
+        else if(showHealth)
+            snprintf(label,sizeof(label),"%s %.0fm | HP ?",category,meters);
+        else
+            snprintf(label,sizeof(label),"%s %.0fm",category,meters);
+        const float left=pt.x+radius+4;
+        dl->AddText({left,pt.y-11},color,label);
+        if(showHealth && marker.health>=0 && marker.maxHealth>0) {
+            constexpr float width=94.f;
+            const float ratio=std::clamp(
+                static_cast<float>(marker.health/marker.maxHealth),0.f,1.f);
+            dl->AddRectFilled({left,pt.y+7},{left+width,pt.y+13},
+                IM_COL32(34,37,33,210),2.f);
+            dl->AddRectFilled({left,pt.y+7},{left+width*ratio,pt.y+13},
+                color,2.f);
+        }
     }
 }
 void HunterNative::DrawESPSettings() {
@@ -2135,6 +5018,10 @@ bool HunterNative::RequestGiveItem(const std::string& item,int n) {
 }
 bool HunterNative::RequestGodMode() {return Enqueue({ActionType::GodMode,"",0,0});}
 bool HunterNative::RequestAddXP(int xp) {return xp>0 && xp<=100000?Enqueue({ActionType::AddXP,"",xp,0}):false;}
+bool HunterNative::RequestAddLevels(int levels) {
+    return levels>0 && levels<=100 ?
+        Enqueue({ActionType::AddLevels,"",levels,0}):false;
+}
 bool HunterNative::RequestTime(float hour) {return std::isfinite(hour)?Enqueue({ActionType::Time,"",0,hour}):false;}
 bool HunterNative::RequestTimeScale(float scale) {return std::isfinite(scale) && scale>0.05f && scale<10.f?Enqueue({ActionType::TimeScale,"",0,scale}):false;}
 bool HunterNative::RequestAddSilver(int n) {return n>0&&n<=100000?Enqueue({ActionType::AddSilver,"",n,0}):false;}
@@ -2154,6 +5041,9 @@ bool HunterNative::RequestRain(double amount) {
 bool HunterNative::RequestSnow(double amount) {
     return std::isfinite(amount) && amount>=0.0 && amount<=1.0 ?
         Enqueue({ActionType::Snow,"",0,static_cast<float>(amount)}):false;
+}
+bool HunterNative::RequestClearWeather() {
+    return Enqueue({ActionType::ClearWeather,"",0,0});
 }
 
 bool HunterNative::RequestVampireScream() {return Enqueue({ActionType::VampireScream,"",0,0});}
@@ -2176,6 +5066,16 @@ bool HunterNative::RequestTargetNoise(int index,double loudness,double maxRangeM
     if(index<0 || !std::isfinite(loudness) || loudness<0 || loudness>100 ||
         !std::isfinite(maxRangeMeters) || maxRangeMeters<1 || maxRangeMeters>2000) return false;
     return Enqueue({ActionType::TargetNoise,"",0,static_cast<float>(maxRangeMeters),index,loudness});
+}
+bool HunterNative::RequestTargetSound(int playerIndex,int soundIndex,float volume) {
+    if(playerIndex< -1 || soundIndex<0 || !std::isfinite(volume) ||
+       volume<0.05f || volume>2.0f)return false;
+    return Enqueue({ActionType::TargetSound,"",soundIndex,volume,playerIndex,0});
+}
+bool HunterNative::RequestTargetCameraShake(int playerIndex,int shakeClassIndex,float scale) {
+    if(playerIndex< -1 || shakeClassIndex<0 || !std::isfinite(scale) ||
+       scale<0.1f || scale>2.0f)return false;
+    return Enqueue({ActionType::TargetCameraShake,"",shakeClassIndex,scale,playerIndex,0});
 }
 
 bool HunterNative::RequestTargetRevive(int id) {
@@ -2210,11 +5110,90 @@ bool HunterNative::RequestSpawnMobWave(int amount,int selectedLiveCryptidIndex) 
     return amount>=1&&amount<=10 ?
         Enqueue({ActionType::SpawnMob,"",amount,0,selectedLiveCryptidIndex,0}):false;
 }
+bool HunterNative::RequestSpawnCryptidClass(int classObjectIndex,int count,
+                                            int mapSpawnerIndex,bool autoControl) {
+    if(classObjectIndex<0 || count<1 || count>10 || mapSpawnerIndex< -1)
+        return false;
+    return Enqueue({ActionType::SpawnSpecies,"",count,autoControl?1.f:0.f,
+                    classObjectIndex,static_cast<double>(mapSpawnerIndex)});
+}
+bool HunterNative::RequestSetMapSpawnerEnabled(int mapSpawnerIndex,bool enabled) {
+    return mapSpawnerIndex>=0 ?
+        Enqueue({ActionType::SpawnerToggle,"",enabled?1:0,0.f,mapSpawnerIndex,0}):false;
+}
 bool HunterNative::RequestPossessCryptid(int index) {
+#ifdef FCH_STANDALONE
+    if(!gCryptidHuntOptedIn.load() ||
+       gCryptidHuntMapSpecies.load()==0)return false;
+#endif
     return index>=0?Enqueue({ActionType::PossessCryptid,"",0,0,index,0}):false;
 }
 bool HunterNative::RequestRestoreHuman() {
+#ifdef FCH_STANDALONE
+    // A remote owning client cannot run the host-only Controller.Possess.
+    // F11 pauses its local input; the host owns actual return/rollback.
+    if(gClientRoleActive.load()) {
+        gClientRolePaused.store(true);
+        FHJDiag::Log(L"CRYPTID CLIENT: F11 paused local input only. Host must restore the original human pawn.");
+        return true;
+    }
+#endif
     return Enqueue({ActionType::RestoreHuman,"",0,0,-1,0});
+}
+bool HunterNative::RequestAssignRemoteCryptid(int playerPawnIndex,int cryptidPawnIndex) {
+#ifdef FCH_STANDALONE
+    if(playerPawnIndex<0 || cryptidPawnIndex<0 ||
+       !gCryptidHuntOptedIn.load() || !gCryptidHuntMapSpecies.load())
+        return false;
+    return Enqueue({ActionType::AssignRemoteRole,"",playerPawnIndex,0.f,cryptidPawnIndex,0.});
+#else
+    (void)playerPawnIndex;(void)cryptidPawnIndex;return false;
+#endif
+}
+bool HunterNative::RequestRestoreRemoteHuman() {
+#ifdef FCH_STANDALONE
+    return gNativeRolePlayerId.load()>=0 ?
+        Enqueue({ActionType::RestoreRemoteRole,"",0,0.f,-1,0.}):false;
+#else
+    return false;
+#endif
+}
+int HunterNative::ActiveRemoteRolePlayerIndex() {
+#ifdef FCH_STANDALONE
+    return gNativeRolePlayerId.load();
+#else
+    return -1;
+#endif
+}
+int HunterNative::ActiveRemoteRoleCryptidIndex() {
+#ifdef FCH_STANDALONE
+    return gNativeRoleCryptidId.load();
+#else
+    return -1;
+#endif
+}
+bool HunterNative::LocalNetworkCryptidRoleActive() {
+#ifdef FCH_STANDALONE
+    return gClientRoleActive.load();
+#else
+    return false;
+#endif
+}
+bool HunterNative::LocalNetworkCryptidRolePaused() {
+#ifdef FCH_STANDALONE
+    return gClientRoleActive.load() && gClientRolePaused.load();
+#else
+    return false;
+#endif
+}
+bool HunterNative::ResumeLocalNetworkCryptidControl() {
+#ifdef FCH_STANDALONE
+    if(!gClientRoleActive.load())return false;
+    gClientRolePaused.store(false);
+    return true;
+#else
+    return false;
+#endif
 }
 
 
@@ -2222,7 +5201,11 @@ bool HunterNative::ESPEnabled() {
     return gEsp.load(std::memory_order_relaxed);
 }
 bool HunterNative::MonsterModeActive() {
-    return gMonsterActive.load(std::memory_order_relaxed);
+    return gMonsterActive.load(std::memory_order_relaxed)
+#ifdef FCH_STANDALONE
+        || (gClientRoleActive.load() && !gClientRolePaused.load())
+#endif
+        ;
 }
 void HunterNative::SetJournalOpen(bool isOpen) {
     gJournalOpen.store(isOpen,std::memory_order_relaxed);
@@ -2239,14 +5222,47 @@ void HunterNative::FeedRawMouse(LPARAM lParam) {
     auto raw=reinterpret_cast<const RAWINPUT*>(buffer);
     if(raw->header.dwType!=RIM_TYPEMOUSE)return;
     // Camera look stays independent of creature AI/controller movement graphs.
-    constexpr double sensitivity=0.12;
-    gMonsterYaw+=static_cast<double>(raw->data.mouse.lLastX)*sensitivity;
-    gMonsterPitch=std::clamp(gMonsterPitch-
-        static_cast<double>(raw->data.mouse.lLastY)*sensitivity,-82.0,82.0);
+    gMonsterYaw+=static_cast<double>(raw->data.mouse.lLastX)*
+        static_cast<double>(gCryptidYawSensitivity.load());
+    const double sign=gCryptidInvertPitch.load()?1.0:-1.0;
+    gMonsterPitch=std::clamp(gMonsterPitch+sign*
+        static_cast<double>(raw->data.mouse.lLastY)*
+        static_cast<double>(gCryptidPitchSensitivity.load()),-82.0,82.0);
     if(gMonsterYaw>180.0)gMonsterYaw-=360.0;
     if(gMonsterYaw< -180.0)gMonsterYaw+=360.0;
 }
 void HunterNative::DrawMonsterHUD(ImVec2 screen) {
+#ifdef FCH_STANDALONE
+    if(!gMonsterActive.load() && gClientRoleActive.load()) {
+        const int species=gClientRoleSpecies.load();
+        const bool paused=gClientRolePaused.load();
+        const auto draw=ImGui::GetForegroundDrawList();
+        const ImU32 accent=species==1?IM_COL32(129,169,236,255):
+            species==2?IM_COL32(220,80,88,255):IM_COL32(194,223,173,255);
+        const ImVec2 end{std::min(screen.x-14.f,570.f),118.f};
+        if(end.x<220.f)return;
+        draw->AddRectFilled({14.f,14.f},end,IM_COL32(10,16,17,234),7.f);
+        draw->AddRect({14.f,14.f},end,accent,7.f,0,1.4f);
+        draw->AddText({26.f,24.f},accent,
+            species==1?"REMOTE MOTHMAN / NATIVE OWNER":
+            species==2?"REMOTE VAMPIRE / NATIVE OWNER":
+                       "REMOTE WENDIGO / NATIVE OWNER");
+        draw->AddText({26.f,45.f},IM_COL32(225,211,186,255),
+            paused?"INPUT PAUSED - F8 TO RESUME":
+            species==1?"FLIGHT INPUT UNVERIFIED - HOST MUST RESTORE HUMAN":
+                "WASD MOVE / SPACE JUMP / LMB SERVER ATTACK (EXPERIMENTAL)");
+        char info[180]{};
+        const double hp=gClientRoleHealth.load();
+        const double maxHp=gClientRoleMaxHealth.load();
+        if(species!=1 && hp>=0 && maxHp>0)
+            snprintf(info,sizeof(info),"HP %.0f / %.0f  |  F11 PAUSE INPUT  |  HOST RETURNS HUMAN",hp,maxHp);
+        else snprintf(info,sizeof(info),"HP UNKNOWN  |  F11 PAUSE INPUT  |  HOST RETURNS HUMAN");
+        draw->AddText({26.f,67.f},IM_COL32(216,224,214,255),info);
+        draw->AddText({26.f,89.f},IM_COL32(177,183,177,255),
+            "Owned RPC and movement visibility require a second-client test.");
+        return;
+    }
+#endif
     if(!gMonsterActive.load())return;
     MonsterHUDState snap{};
     {
@@ -2272,13 +5288,30 @@ void HunterNative::DrawMonsterHUD(ImVec2 screen) {
     draw->AddRect(tl,tr,mainColor,6.f,0,2.f);
     draw->AddText(ImVec2(28,24),mainColor,title);
     draw->AddText(ImVec2(28,45),IM_COL32(214,219,209,255),trait);
-    const float pct=snap.maxHealth>0?std::clamp(
-        static_cast<float>(snap.health/snap.maxHealth),0.f,1.f):0.f;
-    draw->AddRectFilled(ImVec2(28,70),ImVec2(tr.x-20,83),IM_COL32(44,53,48,245),3.f);
-    draw->AddRectFilled(ImVec2(28,70),ImVec2(28+(tr.x-48)*pct,83),mainColor,3.f);
-    char health[110]{};
-    snprintf(health,sizeof(health),"HEALTH %.0f / %.0f  |  CAMERA %s",
-        snap.health,snap.maxHealth,snap.cameraReady?"CHASE":"FALLBACK");
+    if(snap.maxHealth>0.0) {
+        const float pct=std::clamp(
+            static_cast<float>(snap.health/snap.maxHealth),0.f,1.f);
+        draw->AddRectFilled(ImVec2(28,70),ImVec2(tr.x-20,83),
+            IM_COL32(44,53,48,245),3.f);
+        draw->AddRectFilled(ImVec2(28,70),
+            ImVec2(28+(tr.x-48)*pct,83),mainColor,3.f);
+    }
+    char health[140]{};
+    if(snap.respawning)
+        snprintf(health,sizeof(health),"RESPAWN IN %.1fs  |  CAMERA %s",
+            snap.respawnSeconds,snap.cameraReady?"ATTACHED":"NOT READY");
+    else if(snap.species==1)
+        snprintf(health,sizeof(health),"MOTHMAN HP UNKNOWN | NATIVE STEALTH %s | CAMERA %s",
+            snap.mothmanStealthed?"ON":"OFF",
+            snap.cameraReady?"CHASE":"FALLBACK");
+    else if(snap.species==2)
+        snprintf(health,sizeof(health),"HEALTH %.0f / %.0f | INVIS %s | CAMERA %s",
+            snap.health,snap.maxHealth,
+            snap.vampireInvisible?"ON":"OFF",
+            snap.cameraReady?"CHASE":"FALLBACK");
+    else
+        snprintf(health,sizeof(health),"HEALTH %.0f / %.0f  |  CAMERA %s",
+            snap.health,snap.maxHealth,snap.cameraReady?"CHASE":"FALLBACK");
     draw->AddText(ImVec2(28,88),IM_COL32(223,209,180,255),health);
     const float x=screen.x*.5f,y=screen.y*.5f;
     draw->AddCircle({x,y},9.f,mainColor,20,1.3f);
@@ -2286,20 +5319,142 @@ void HunterNative::DrawMonsterHUD(ImVec2 screen) {
     draw->AddLine({x+7,y},{x+16,y},mainColor,1.3f);
     draw->AddLine({x,y-16},{x,y-7},mainColor,1.3f);
     draw->AddLine({x,y+7},{x,y+16},mainColor,1.3f);
-    const float panelWidth=std::min(screen.x-30.f,745.f);
-    const ImVec2 bottom{(screen.x-panelWidth)*.5f,screen.y-73.f};
-    draw->AddRectFilled(bottom,ImVec2(bottom.x+panelWidth,bottom.y+55),
-        IM_COL32(10,14,13,223),6.f);
-    draw->AddRect(bottom,ImVec2(bottom.x+panelWidth,bottom.y+55),mainColor,6.f,0,1.f);
-    draw->AddText(ImVec2(bottom.x+14,bottom.y+10),IM_COL32(232,215,177,255),
-        "WASD MOVE   |   MOUSE LOOK   |   SPACE UP   |   CTRL DOWN   |   SHIFT BOOST");
-    draw->AddText(ImVec2(bottom.x+14,bottom.y+29),mainColor,
-        "LMB ATTACK   |   Q SCREAM   |   E INVISIBILITY   |   R STANCE   |   F11 HUMAN");
+    const float panelWidth=std::min(screen.x-30.f,790.f);
+    const ImVec2 bottom{(screen.x-panelWidth)*.5f,screen.y-146.f};
+    const ImVec2 endPanel{bottom.x+panelWidth,bottom.y+128.f};
+    draw->AddRectFilled(bottom,endPanel,IM_COL32(10,14,13,232),6.f);
+    draw->AddRect(bottom,endPanel,mainColor,6.f,0,1.f);
+    const char* moveHint=snap.species==1 ?
+        "MOTHMAN  |  WASD FLY  |  SPACE ASCEND  |  CTRL DESCEND  |  SHIFT BOOST" :
+        snap.species==3 ?
+        "WENDIGO  |  WASD WALK  |  SPACE JUMP  |  SHIFT SPRINT  |  NO FLIGHT" :
+        snap.species==2 ?
+        "VAMPIRE  |  WASD WALK  |  SPACE JUMP  |  SHIFT SPRINT  |  NO FLIGHT" :
+        "CRYPTID  |  WASD WALK  |  SPACE JUMP  |  SHIFT SPRINT";
+    draw->AddText(ImVec2(bottom.x+14,bottom.y+10),
+        IM_COL32(232,215,177,255),snap.respawning?
+        "RESPAWNING: CAMERA AND HUD WILL FOLLOW NEW CREATURE":moveHint);
+    draw->AddText(ImVec2(bottom.x+14,bottom.y+32),mainColor,
+        "ACTIVE NATIVE SKILLS (ONLY THIS CRYPTID)  |  F11 RETURN HUMAN");
+    int shown=0;
+    for(int slot=0;slot<4;++slot) {
+        if(!snap.available[static_cast<size_t>(slot)] ||
+           snap.skills[static_cast<size_t>(slot)].empty())continue;
+        const auto& skill=snap.skills[static_cast<size_t>(slot)];
+        const int column=shown%2,row=shown/2;
+        draw->AddText(ImVec2(bottom.x+14+column*(panelWidth*.5f),
+                             bottom.y+57+row*22),
+                      IM_COL32(223,230,209,255),skill.c_str());
+        ++shown;
+    }
+    if(snap.species==1)
+        draw->AddText(ImVec2(bottom.x+14,bottom.y+110),
+            IM_COL32(213,186,148,255),
+            "LMB: no verified basic melee  |  R: DarknessAttack power (NOT melee)");
+    else if(shown==0)
+        draw->AddText(ImVec2(bottom.x+14,bottom.y+63),
+            IM_COL32(179,187,181,255),
+            "No compatible native attack/skill methods loaded for this creature");
+    if(snap.respawning)
+        draw->AddText(ImVec2(bottom.x+14,bottom.y+108),
+            IM_COL32(227,179,109,255),"Skill actions paused while respawning");
+
+}
+
+int HunterNative::GetCryptidHuntNightState() {
+    return gHuntNightCached.load(); // render thread: no unordered_map/UE reads
+}
+bool HunterNative::CryptidHuntOptedIn() {
+#ifdef FCH_STANDALONE
+    return gCryptidHuntOptedIn.load();
+#else
+    return false;
+#endif
+}
+void HunterNative::SetCryptidHuntOptedIn(bool enabled) {
+#ifdef FCH_STANDALONE
+    const bool was=gCryptidHuntOptedIn.exchange(enabled);
+    if(was && !enabled && gMonsterActive.load())
+        RequestRestoreHuman(); // native game-thread cleanup
+    if(was && !enabled && gNativeRolePlayerId.load()>=0)
+        RequestRestoreRemoteHuman(); // host-native restoration, never client-side
+    if(was!=enabled)
+        FHJDiag::Log(enabled?
+            L"CRYPTID HUNT: opted into custom mode for this running session only. Normal lobby contract and save system untouched.":
+            L"CRYPTID HUNT: custom mode disabled. Next launch defaults OFF; no SaveGame writes.");
+#else
+    (void)enabled;
+#endif
+}
+int HunterNative::CryptidHuntMapSpecies() {
+    return gCryptidHuntMapSpecies.load();
+}
+const char* HunterNative::CryptidHuntSpeciesName(int species) {
+    switch(species) {
+        case 1:return "MOTHMAN";
+        case 2:return "VAMPIRE";
+        case 3:return "WENDIGO";
+        default:return "UNSUPPORTED / UNKNOWN";
+    }
+}
+int HunterNative::WendigoCameraDayRemaining() {
+    return gWendigoCameraDayRemaining.load();
+}
+void HunterNative::DrawCryptidHuntDaylightVision(ImVec2 screen) {
+#ifdef FCH_STANDALONE
+    if(gHuntNightCached.load()!=0)return;
+    if(!gMonsterActive.load() && !gClientRoleActive.load())return;
+    const auto species=gMonsterActive.load()?MonsterSpecies():gClientRoleSpecies.load();
+    if(species!=2 && species!=3)return;
+    // A local possession-camera rendering rule, NOT a replicated
+    // material or physics change. Night always restores clear vision.
+    // Vampire is nearly blinded by sunrise; Wendigo only mildly.
+    const int alpha=species==2?235:67;
+    const ImU32 veil=IM_COL32(241,232,190,alpha);
+    const auto viewport=ImGui::GetForegroundDrawList();
+    viewport->AddRectFilled({0,0},{screen.x,screen.y},veil);
+    viewport->AddText({screen.x*.5f-120.f,screen.y*.21f},
+         IM_COL32(52,40,30,255),
+         species==2?"SUNLIGHT: VAMPIRE BLINDED / ATTACKS LOCKED":
+                    "DAYLIGHT: WENDIGO VISION IMPAIRED");
+#else
+    (void)screen;
+#endif
+}
+bool HunterNative::RequestWendigoDeployCamera() {
+#ifdef FCH_STANDALONE
+    return IsControllingWendigo() &&
+        Enqueue({ActionType::WendigoPlaceCamera,"",0,0.f,-1,0.});
+#else
+    return false;
+#endif
+}
+bool HunterNative::RequestWendigoCycleCamera() {
+#ifdef FCH_STANDALONE
+    return IsControllingWendigo() &&
+        Enqueue({ActionType::WendigoCycleCamera,"",0,0.f,-1,0.});
+#else
+    return false;
+#endif
+}
+bool HunterNative::RequestWendigoExitCamera() {
+#ifdef FCH_STANDALONE
+    return IsControllingWendigo() &&
+        Enqueue({ActionType::WendigoCloseCamera,"",0,0.f,-1,0.});
+#else
+    return false;
+#endif
+}
+int HunterNative::WendigoCameraCount() {
+    return gWendigoWatchCount.load();
 }
 
 bool HunterNative::RequestMonsterAbility(int slot) {
     if(slot<0 || slot>5 || !gMonsterActive.load())return false;
     return Enqueue({ActionType::MonsterAbility,"",slot,0,-1,0});
+}
+void HunterNative::SetMonsterAttackSound(int soundObjectIndex) {
+    gMonsterAttackSoundIndex.store(soundObjectIndex>=0?soundObjectIndex:-1);
 }
 
 bool HunterNative::RequestEquipVanity(const std::string& name) {

@@ -128,7 +128,11 @@ void FHJDiag::Start(HMODULE self) {
     wchar_t base[MAX_PATH]{};
     const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
     if (n && n < MAX_PATH) {
+#ifdef FCH_STANDALONE
+        gDirectory = std::wstring(base) + L"\\FolkloreCryptidHunt";
+#else
         gDirectory = std::wstring(base) + L"\\FolkloreHunterJournal";
+#endif
         CreateDirectoryW(gDirectory.c_str(), nullptr);
         gLogPath = gDirectory + L"\\journal.log";
         gIniPath = gDirectory + L"\\journal.ini";

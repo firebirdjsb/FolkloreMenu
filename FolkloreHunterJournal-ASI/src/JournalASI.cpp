@@ -31,6 +31,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #pragma comment(lib, "dxgi.lib")
 
 static HMODULE gJournalModule = nullptr;
+static HANDLE gOverlayOwnerMutex = nullptr;
 namespace {
     using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
     using ResizeFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
@@ -62,6 +63,65 @@ namespace {
     std::deque<QueuedMessage> gInputQueue;
     RECT gClipBeforeJournal{};
     bool gClipSaved = false;
+
+    // One DXGI hook owner, separate module callbacks. Both plugins may
+    // coexist without a second MinHook patch of the same Present address.
+    using BridgeAttach=void (*)(void*,HWND);
+    using BridgeFrame=void (*)(void*,bool);
+    using BridgeMessage=void (*)(UINT);
+    using BridgeMouse=void (*)(LPARAM);
+    using BridgeBool=bool (*)();
+    using BridgeVoid=void (*)();
+    HMODULE gCompanionModule=nullptr;
+    BridgeAttach gBridgeAttach=nullptr;
+    BridgeFrame gBridgeFrame=nullptr;
+    BridgeMessage gBridgeMessage=nullptr;
+    BridgeMouse gBridgeMouse=nullptr;
+    BridgeBool gBridgeMonsterActive=nullptr;
+    BridgeVoid gBridgeRestoreHuman=nullptr;
+    std::atomic_bool gBridgeReady{false};
+
+    void TryConnectCompanion() {
+        if(gBridgeReady.load(std::memory_order_acquire) ||
+           !gGameWindow || !ImGui::GetCurrentContext())return;
+#ifdef FCH_STANDALONE
+        constexpr const wchar_t* other=L"FolkloreHunterJournal.asi";
+#else
+        constexpr const wchar_t* other=L"FolkloreCryptidHunt.asi";
+#endif
+        const auto module=GetModuleHandleW(other);
+        if(!module || module==gJournalModule)return;
+        auto attach=reinterpret_cast<BridgeAttach>(
+            GetProcAddress(module,"FHJ_ModuleBridgeAttach"));
+        auto frame=reinterpret_cast<BridgeFrame>(
+            GetProcAddress(module,"FHJ_ModuleBridgeFrame"));
+        auto message=reinterpret_cast<BridgeMessage>(
+            GetProcAddress(module,"FHJ_ModuleBridgeMessage"));
+        auto mouse=reinterpret_cast<BridgeMouse>(
+            GetProcAddress(module,"FHJ_ModuleBridgeMouse"));
+        auto active=reinterpret_cast<BridgeBool>(
+            GetProcAddress(module,"FHJ_ModuleBridgeMonsterActive"));
+        auto restore=reinterpret_cast<BridgeVoid>(
+            GetProcAddress(module,"FHJ_ModuleBridgeRestoreHuman"));
+        if(!attach || !frame || !message || !mouse || !active || !restore)
+            return;
+        // Only publish pointers to WndProc after the second module has
+        // received the owning ImGui context and game HWND.
+        gCompanionModule=module;
+        gBridgeAttach=attach;
+        gBridgeFrame=frame;
+        gBridgeMessage=message;
+        gBridgeMouse=mouse;
+        gBridgeMonsterActive=active;
+        gBridgeRestoreHuman=restore;
+        attach(static_cast<void*>(ImGui::GetCurrentContext()),gGameWindow);
+        gBridgeReady.store(true,std::memory_order_release);
+        FHJDiag::Log(L"Shared hook bridge: companion ASI registered independent UI/engine callbacks; no second DXGI or WndProc patch.");
+    }
+    bool CompanionMonsterActive() {
+        return gBridgeReady.load(std::memory_order_acquire) &&
+               gBridgeMonsterActive && gBridgeMonsterActive();
+    }
 
     void ReleaseGamePointer(HWND hwnd) {
         // Unreal may use a confined or relative mouse while the game is playing.
@@ -143,17 +203,23 @@ namespace {
     }
 
     LRESULT CALLBACK JournalWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
-        if (msg == WM_INPUT && HunterNative::MonsterModeActive()) {
-            HunterNative::FeedRawMouse(lparam);
-            // Prevent the human-pawn camera from turning during remote monster control.
+        if (msg == WM_INPUT &&
+            (HunterNative::MonsterModeActive() || CompanionMonsterActive())) {
+            if(HunterNative::MonsterModeActive())
+                HunterNative::FeedRawMouse(lparam);
+            if(CompanionMonsterActive())gBridgeMouse(lparam);
             return DefWindowProcW(hwnd,msg,wparam,lparam);
         }
-        if (msg == WM_KEYUP && wparam == VK_F11 && HunterNative::MonsterModeActive()) {
-            HunterNative::RequestRestoreHuman(); // emergency escape if chase view is obstructed
+        if (msg == WM_KEYUP && wparam == VK_F11 &&
+            (HunterNative::MonsterModeActive() || CompanionMonsterActive())) {
+            if(HunterNative::MonsterModeActive())HunterNative::RequestRestoreHuman();
+            if(CompanionMonsterActive())gBridgeRestoreHuman();
             return 0;
         }
         if (msg == HunterNative::kGameTick || msg == HunterNative::kGameAction) {
             HunterNative::HandleWindowMessage(msg);
+            if(gBridgeReady.load(std::memory_order_acquire) &&
+               gBridgeMessage)gBridgeMessage(msg);
             return 0;
         }
         if (msg == WM_KEYUP && wparam == VK_F9) { FHJDiag::ToggleOverlay(); return 0; }
@@ -166,20 +232,28 @@ namespace {
             else RestoreGamePointer();
             return 0;
         }
+        // Only puppet mode takes the human pawn's controls. Noclip keeps the
+        // normal game input pipeline active so walking keys are not starved.
         if(!gShowMenu.load(std::memory_order_acquire) &&
-           (HunterNative::MonsterModeActive() || HunterNative::NoclipActive())) {
-            if(HunterNative::MonsterModeActive() &&
-               msg==WM_KEYUP && (wparam=='Q'||wparam=='E'||wparam=='R')) {
-                HunterNative::RequestMonsterAbility(wparam=='Q'?1:wparam=='E'?2:3);
+           (HunterNative::MonsterModeActive() || CompanionMonsterActive())) {
+            // Q/E/R ability presses are polled as key-down edges by the
+            // native cryptid tick. Do not dispatch again on WM_KEYUP: holding
+            // E used to activate and then deactivate invisibility on release.
+            if(msg==WM_KEYUP && (wparam=='Q'||wparam=='E'||wparam=='R'))
                 return 0;
-            }
-            if(HunterNative::MonsterModeActive() &&
+#ifdef FCH_STANDALONE
+            if((msg==WM_KEYDOWN || msg==WM_KEYUP) &&
+               (wparam=='C' || wparam=='V'))
+                return 0; // Wendigo's private watchpoint shortcuts
+#endif
+            if((HunterNative::MonsterModeActive() || CompanionMonsterActive()) &&
                 (msg==WM_LBUTTONDOWN || msg==WM_LBUTTONUP))return 0;
             if((msg==WM_KEYDOWN || msg==WM_KEYUP) &&
                (wparam=='W'||wparam=='A'||wparam=='S'||wparam=='D'||
                 wparam==VK_SPACE || wparam==VK_CONTROL || wparam==VK_SHIFT ||
-                (HunterNative::MonsterModeActive() &&
-                (wparam=='Q' || wparam=='E' || wparam=='R'))))return 0;
+                ((HunterNative::MonsterModeActive() || CompanionMonsterActive()) &&
+                (wparam=='Q' || wparam=='E' || wparam=='R' ||
+                 wparam=='C' || wparam=='V'))))return 0;
         }
         if (gShowMenu.load(std::memory_order_acquire) && msg == WM_SETCURSOR) {
             SetCursor(nullptr); // Dear ImGui draws the visible cursor above the game.
@@ -346,6 +420,7 @@ namespace {
         if (gRenderReady.load(std::memory_order_acquire) && chain == gCurrentSwapChain && gContext) {
             // Always progress the frame, including when the journal is hidden.
             FHJDiag::SetStage("rendering ImGui DX11 frame");
+            TryConnectCompanion();
             ConsumeQueuedInput();
             ImGui_ImplDX11_NewFrame();
             ImGui_ImplWin32_NewFrame();
@@ -359,7 +434,14 @@ namespace {
             ImGui::NewFrame();
             HunterNative::RequestTick();
             HunterNative::DrawESP(ImGui::GetIO().DisplaySize);
+#ifdef FCH_STANDALONE
+            FHJ::DrawCryptidHuntLoadBanner();
+            HunterNative::DrawCryptidHuntDaylightVision(ImGui::GetIO().DisplaySize);
+#endif
             HunterNative::DrawMonsterHUD(ImGui::GetIO().DisplaySize);
+            if(gBridgeReady.load(std::memory_order_acquire) && gBridgeFrame)
+                gBridgeFrame(static_cast<void*>(ImGui::GetCurrentContext()),
+                             editingJournal);
             FHJDiag::PollGameLog();
             if (gShowMenu.load(std::memory_order_relaxed)) FHJ::DrawJournal();
             if (HunterScares::ConsumeHideJournal() &&
@@ -371,7 +453,12 @@ namespace {
             // World ESP and custom monster HUD must be presented without the journal open.
             if (gShowMenu.load(std::memory_order_relaxed) || FHJDiag::OverlayVisible() ||
                 HunterNative::ESPEnabled() || HunterNative::MonsterModeActive() ||
-                HunterScares::IsScareActive()) {
+                HunterScares::IsScareActive() ||
+                gBridgeReady.load(std::memory_order_acquire)
+#ifdef FCH_STANDALONE
+                || true // standalone mode badge on original main menu
+#endif
+                ) {
                 if (!gIsDX12 && !gRenderTarget) CreateRenderTarget(chain);
                 if (gIsDX12) {
                     IDXGISwapChain3* chain3=nullptr;
@@ -553,6 +640,19 @@ namespace {
             return 0;
         }
         Log(L"Folklore Hunter executable confirmed. Native ASI loaded successfully.");
+        // Only the first loaded plugin owns MinHook/DXGI. The second
+        // registers UI/engine callbacks with that first module, using
+        // a different module API rather than patching Present twice.
+        gOverlayOwnerMutex=CreateMutexW(nullptr,TRUE,
+                              L"Local\\FolkloreHunter_Journal_CryptidHunt_OneOverlay_v1");
+        if(!gOverlayOwnerMutex || GetLastError()==ERROR_ALREADY_EXISTS) {
+            Log(L"Companion ASI mode: skipping duplicate graphics/window hooks. Existing DXGI owner will discover and render this module through independent callbacks.");
+            if(gOverlayOwnerMutex) {
+                CloseHandle(gOverlayOwnerMutex);
+                gOverlayOwnerMutex=nullptr;
+            }
+            return 0;
+        }
         Log(GetModuleHandleW(L"d3d11.dll") ? L"Module: d3d11.dll loaded" : L"Module: d3d11.dll not loaded yet");
         Log(GetModuleHandleW(L"d3d12.dll") ? L"Module: d3d12.dll loaded" : L"Module: d3d12.dll not loaded yet");
         Log(L"Loaded graphics modules do not prove which Unreal rendering API is active.");
@@ -573,6 +673,44 @@ namespace {
             Log(L"Graphics hook initialization failed; inspect journal.log.");
         return 0;
     }
+}
+
+// Companion ABI: both DLLs export these routines. Exactly one module
+// owns Win32/DXGI hooks; the other accepts the shared ImGui context and
+// HWND without hooking either. The native engines stay module-private.
+extern "C" __declspec(dllexport) void FHJ_ModuleBridgeAttach(
+    void* context,HWND hwnd) {
+    if(!context || !hwnd)return;
+    ImGui::SetCurrentContext(static_cast<ImGuiContext*>(context));
+    HunterNative::AttachWindow(hwnd);
+}
+extern "C" __declspec(dllexport) void FHJ_ModuleBridgeFrame(
+    void* context,bool menuOpen) {
+    if(!context)return;
+    ImGui::SetCurrentContext(static_cast<ImGuiContext*>(context));
+    HunterNative::SetJournalOpen(menuOpen);
+    HunterNative::RequestTick();
+    HunterNative::DrawESP(ImGui::GetIO().DisplaySize);
+#ifdef FCH_STANDALONE
+    FHJ::DrawCryptidHuntLoadBanner();
+    HunterNative::DrawCryptidHuntDaylightVision(ImGui::GetIO().DisplaySize);
+#endif
+    HunterNative::DrawMonsterHUD(ImGui::GetIO().DisplaySize);
+    if(menuOpen)FHJ::DrawJournal();
+}
+extern "C" __declspec(dllexport) void FHJ_ModuleBridgeMessage(UINT message) {
+    if(message==HunterNative::kGameTick ||
+       message==HunterNative::kGameAction)
+        HunterNative::HandleWindowMessage(message);
+}
+extern "C" __declspec(dllexport) void FHJ_ModuleBridgeMouse(LPARAM input) {
+    HunterNative::FeedRawMouse(input);
+}
+extern "C" __declspec(dllexport) bool FHJ_ModuleBridgeMonsterActive() {
+    return HunterNative::MonsterModeActive();
+}
+extern "C" __declspec(dllexport) void FHJ_ModuleBridgeRestoreHuman() {
+    HunterNative::RequestRestoreHuman();
 }
 
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {

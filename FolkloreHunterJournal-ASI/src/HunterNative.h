@@ -11,6 +11,33 @@ namespace HunterNative {
         int objectIndex = -1;
         std::string displayName;
         bool isPawn = false;
+        double health = -1.0;
+        double maxHealth = -1.0;
+    };
+    struct CameraShakeInfo {
+        int objectIndex = -1;
+        std::string displayName;
+    };
+    struct SoundInfo {
+        int objectIndex = -1;
+        std::string displayName;
+    };
+    struct CryptidSpawnClass {
+        int objectIndex = -1; // live GUObject index of validated UClass
+        std::string displayName;
+        bool mothman = false;
+        bool presentAsLiveActor = false; // same UClass already active on this map
+    };
+    struct CryptidSpawnPoint {
+        int objectIndex = -1; // actor index in active streamed UWorld
+        std::string displayName;
+    };
+    struct CryptidCameraSettings {
+        float yawSensitivity = .12f;
+        float pitchSensitivity = .12f;
+        float followRate = 32.f;
+        bool invertPitch = false;
+        bool clearBlurDuringPossession = true;
     };
     struct VanityItem {
         std::string label;
@@ -29,6 +56,10 @@ namespace HunterNative {
         bool worldReady = false;
         bool host = false;
         bool cameraReady = false;
+        std::string activeHuntName;
+        std::string selectedLobbyMap;
+        bool isGameLobby=false;
+        int mapCryptid=0; // 0=unsupported/unknown, 1=Mothman, 2=Vampire, 3=Wendigo
         double localHealth = -1.0;
         double localMaxHealth = -1.0;
         bool invuln = false;
@@ -49,6 +80,8 @@ namespace HunterNative {
         int activeQuestObjects = 0;
         int activeLoot = 0;
         int activeMobSpawners = 0;
+        int pendingSpawnTriggers = 0;
+        int confirmedSpawned = 0;
     };
     void AttachWindow(HWND window);
     void RequestTick();
@@ -56,6 +89,14 @@ namespace HunterNative {
     Status GetStatus();
     std::vector<PlayerInfo> GetPlayers();
     std::vector<CreatureInfo> GetCreatures();
+    std::vector<SoundInfo> GetSounds();
+    std::vector<CameraShakeInfo> GetCameraShakes();
+    std::vector<CryptidSpawnClass> GetSpawnableCryptidClasses();
+    std::vector<CryptidSpawnPoint> GetActiveMapSpawners();
+    CryptidCameraSettings GetCryptidCameraSettings();
+    void SetCryptidCameraSettings(const CryptidCameraSettings& value);
+    bool MothmanLocalSmokeReduction();
+    void SetMothmanLocalSmokeReduction(bool enabled);
     std::vector<VanityItem> GetVanityItems();
     bool RequestEquipVanity(const std::string& className);
     // Gameplay changes are runtime experiments and may not replicate to clients.
@@ -64,14 +105,51 @@ namespace HunterNative {
     bool RequestJumpBoost(float multiplier, bool entireLobby = false);
     bool RequestGravity(float gravityScale, bool entireLobby);
     bool RequestSpawnMobWave(int count, int selectedLiveCryptidIndex = -1);
+    // Spawn a class loaded in the active hunt at a selected native map
+    // spawner (-1 = automatic; host-pawn fallback if the map has none).
+    bool RequestSpawnCryptidClass(int classObjectIndex, int count,
+                                  int mapSpawnerIndex = -1, bool autoControl = false);
+    bool RequestSetMapSpawnerEnabled(int mapSpawnerIndex, bool enabled);
     bool RequestPossessCryptid(int objectIndex);
     bool RequestRestoreHuman();
+    // Experimental authoritative network role handoff. Only the host may
+    // swap a remote PlayerController to a live cryptid; its former human
+    // pawn and AI controller are retained for rollback on the same world.
+    // A participating remote player must install this ASI and opt into
+    // Cryptid Hunt; a controller swap alone cannot guarantee usable input.
+    bool RequestAssignRemoteCryptid(int playerPawnIndex, int cryptidPawnIndex);
+    bool RequestRestoreRemoteHuman();
+    int ActiveRemoteRolePlayerIndex(); // -1 if no confirmed host handoff
+    int ActiveRemoteRoleCryptidIndex();
+    bool LocalNetworkCryptidRoleActive();
+    bool LocalNetworkCryptidRolePaused();
+    bool ResumeLocalNetworkCryptidControl();
+    // Separate game-mode controls. Day state is authoritative when the
+    // live FL_Gamemode_C.Director component is accessible; -1 = unknown.
+    int GetCryptidHuntNightState();
+    bool CryptidHuntOptedIn();
+    void SetCryptidHuntOptedIn(bool enabled); // session-only, no save writes
+    int CryptidHuntMapSpecies();
+    const char* CryptidHuntSpeciesName(int species);
+    int WendigoCameraDayRemaining();
+    void DrawCryptidHuntDaylightVision(ImVec2 screen);
+    bool RequestWendigoDeployCamera();
+    bool RequestWendigoCycleCamera();
+    bool RequestWendigoExitCamera();
+    int WendigoCameraCount();
     // Only abilities exposed by the matching creature's reflected class are invoked.
     bool RequestMonsterAbility(int slot);
+    // -1 uses automatic native sound matching; otherwise a loaded USoundBase
+    // GUObject index chosen from the Journal's sound catalog.
+    void SetMonsterAttackSound(int soundObjectIndex);
     bool RequestNoclip(bool enabled);
     bool RequestTargetHealth(int targetObjectIndex, double value);
     bool RequestTargetItem(int targetObjectIndex, const std::string& itemClass, int amount);
     bool RequestTargetNoise(int targetObjectIndex, double loudness, double rangeMeters);
+    // PlayerController.ClientPlaySound is a native owning-client RPC.
+    // Target -1 sends one request per scanned player on the authoritative host.
+    bool RequestTargetSound(int targetObjectIndex, int soundObjectIndex, float volume);
+    bool RequestTargetCameraShake(int targetObjectIndex, int shakeClassObjectIndex, float scale);
     bool RequestTargetRevive(int targetObjectIndex);
     bool RequestTargetKill(int targetObjectIndex);
     bool RequestTargetKick(int targetObjectIndex);
@@ -88,6 +166,7 @@ namespace HunterNative {
     bool RequestGiveItem(const std::string& itemName, int amount);
     bool RequestGodMode();
     bool RequestAddXP(int xp);
+    bool RequestAddLevels(int levels);
     bool RequestTime(float hour);
     bool RequestTimeScale(float scale);
     bool RequestAddSilver(int amount);
@@ -99,6 +178,7 @@ namespace HunterNative {
     bool RequestSmoreMode();
     bool RequestRain(double intensity);
     bool RequestSnow(double intensity);
+    bool RequestClearWeather();
     bool RequestVampireScream();
     bool RequestFlickerLights(bool cancel);
 }

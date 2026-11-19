@@ -1,6 +1,8 @@
 name: Build Folklore Hunter Journal
 on:
   push:
+    branches: [main, 'fix/**']
+  pull_request:
     branches: [main]
   workflow_dispatch:
 permissions:
@@ -17,58 +19,93 @@ jobs:
       - name: Show toolchains
         shell: pwsh
         run: cmake --version
+      - name: Validate isolated save profile and rollback
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/Test-CryptidHunt-Isolation.ps1
       - name: Configure x64
         shell: pwsh
         run: cmake -S FolkloreHunterJournal-ASI -B FolkloreHunterJournal-ASI/build -G "Visual Studio 18 2026" -A x64
       - name: Compile Release x64
         shell: pwsh
         run: cmake --build FolkloreHunterJournal-ASI/build --config Release --parallel
-      - name: Stage ASI and DLL
+      - name: Stage separate Journal and Cryptid Hunt x64 plugins
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $output = Get-ChildItem FolkloreHunterJournal-ASI/build -Recurse -File -Filter "FolkloreHunterJournal.asi" | Where-Object {$_.DirectoryName -match "Release"} | Select-Object -First 1
-          if (-not $output) { throw "Compiled ASI not found" }
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item $output.FullName dist/FolkloreHunterJournal.asi
-          Copy-Item $output.FullName dist/FolkloreHunterJournal.dll
-          $pdb = Get-ChildItem FolkloreHunterJournal-ASI/build -Recurse -File -Filter "FolkloreHunterJournal.pdb" | Select-Object -First 1
-          if ($pdb) { Copy-Item $pdb.FullName dist/FolkloreHunterJournal.pdb }
-          $map = Get-ChildItem FolkloreHunterJournal-ASI/build -Recurse -File -Filter "FolkloreHunterJournal.map" | Select-Object -First 1
-          if ($map) { Copy-Item $map.FullName dist/FolkloreHunterJournal.map }
-          $bytes = [IO.File]::ReadAllBytes("dist/FolkloreHunterJournal.asi")
-          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { throw "Not PE" }
-          $pe = [BitConverter]::ToInt32($bytes,0x3C)
-          if ([BitConverter]::ToUInt16($bytes,$pe+4) -ne 0x8664) { throw "Not x64" }
+          foreach ($module in @('FolkloreHunterJournal','FolkloreCryptidHunt')) {
+            $output = Get-ChildItem FolkloreHunterJournal-ASI/build -Recurse -File -Filter "$module.asi" |
+              Where-Object { $_.DirectoryName -match 'Release' } | Select-Object -First 1
+            if (-not $output) { throw "Compiled $module.asi not found" }
+            New-Item -ItemType Directory -Force "dist/$module" | Out-Null
+            Copy-Item $output.FullName "dist/$module/$module.asi"
+            $pdb = Get-ChildItem FolkloreHunterJournal-ASI/build -Recurse -File -Filter "$module.pdb" | Select-Object -First 1
+            if ($pdb) { Copy-Item $pdb.FullName "dist/$module/$module.pdb" }
+            $map = Get-ChildItem FolkloreHunterJournal-ASI/build -Recurse -File -Filter "$module.map" | Select-Object -First 1
+            if ($map) { Copy-Item $map.FullName "dist/$module/$module.map" }
+            $bytes = [IO.File]::ReadAllBytes("dist/$module/$module.asi")
+            if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { throw "$module is not PE" }
+            $pe = [BitConverter]::ToInt32($bytes,0x3C)
+            if ([BitConverter]::ToUInt16($bytes,$pe+4) -ne 0x8664) { throw "$module is not PE x64" }
+            Get-FileHash "dist/$module/$module.asi" -Algorithm SHA256
+          }
           @'
-          Folklore Hunter - THE HUNTER'S JOURNAL v0.5 experimental
-          Native ASI plugin; Windows x64; Ultimate ASI Loader required.
-          IMPORTANT: Remove old .asi versions before copying FolkloreHunterJournal.asi.
-          Do NOT copy the DLL and ASI simultaneously to the plugins folder.
-
-          F8: journal + capture mouse for UI, F9: debug overlay, F10: native console.
-          F9 overlay is visible by default. F10 console can be hidden from Options.
-          DX11/DX12 graphics support uses existing bridge.
-          Journal and diagnostic windows use dark hunter styling and adaptive size.\n          Supplies page: 19 clickable, searchable SDK-derived inventory items (no IDs typed).\n          Pranks page: host time, speed, weather, native experimental Bean/Ranger/Smores modes.
-
-          Crypto/Player ESP: 110ms actor cache, capped 180 markers; disabled
-          by default; enable under CRYPTIDS. Camera projection is experimental.
-          Host actions: only where World.AuthorityGameMode exists.
-          GiveItem prefers FL_Gamemode_C Blueprint implementation, then native.
-          Native action effects are NOT YET verified in the running game.
-          Item names must match those recognized by the game's own function.
-          Kick/ban, vanity, and other player-specific multiplayer controls
-          remain pending verified implementation; no claim of full coverage.
-
-          Settings: %LOCALAPPDATA%\FolkloreHunterJournal\journal.ini
-          Logs: journal.log and crash-trace.log in the same folder.
-          Set SafeMode=1 if the game crashes, or restore your previous ASI.
-          Test in an offline/private authorized session. No anti-cheat bypass.
-          '@ | Set-Content dist/README.txt
-          Get-FileHash dist/FolkloreHunterJournal.asi -Algorithm SHA256
-      - name: Upload binaries
+          THE HUNTER'S JOURNAL — Windows x64
+          Admin tools, ESP, host creature spawning and general features.
+          Possession/creature abilities are now removed from the Journal UI.
+          Install FolkloreHunterJournal.asi via the existing ASI loader.
+          Journal and Cryptid Hunt are separate DLLs; they can now be
+          loaded together using ONE shared DXGI/Win32 hook owner and
+          independently registered native update/render callbacks.
+          One may also be installed alone. F8 opens both panels when
+          both are present. F9 diagnostics, F10 console.
+          '@ | Set-Content dist/FolkloreHunterJournal/README.txt
+          @'
+          FOLKLORE CRYPTID HUNT — Windows x64, experimental mode v0.2
+          Standalone session-only custom mode, species rules and private
+          Wendigo CameraActor watchpoints. Own F8 game-mode menu and F11 return.
+          Native replicated FL_Gamestate.IsNight day/night rules:
+          Vampire daytime melee/scream locked and severe local glare.
+          Wendigo daytime attacks locked and mild local glare.
+          Wendigo has 2 watch-camera deployments per in-game day,
+          4 active max, and briefly hides when placing a camera.
+          Vampire other skill effects and remote player role handoff need testing.
+          C deploy Wendigo watchpoint, V cycle (includes chase view).
+          Host draws a participating player in host-local UI and may
+          explicitly hand off a live map cryptid to a remote controller
+          through native authority-side Controller.Possess(APawn*).
+          On the remote modded client, owning-pawn detection and guarded
+          ground movement/Server_Attack dispatch are experimental.
+          Mothman remote flight, Q/E/R, join/ready RPC, round scoring,
+          native camera and full remote gameplay remain UNVERIFIED.
+          Host restores remote human; remote F11 pauses INPUT ONLY.
+          See docs/CRYPTID_HUNT_V0_3_NATIVE_ROLES_SAVE_ISOLATION.md.
+          For optional separate LOCAL SaveGames profile (not cloud/
+          achievements), use tools/Start-CryptidHunt-Isolated.ps1
+          BEFORE game start. Do not call this a completed PvP mode.
+          Install FolkloreCryptidHunt.asi via the existing ASI loader.
+          May coexist with FolkloreHunterJournal.asi: only the first
+          ASI hooks DXGI/Win32, second uses exported bridge callbacks.
+          Do NOT copy both an ASI and renamed DLL of the same mod.
+          The native MAIN MENU gets a CRYPTID HUNT LOADED badge;
+          F8 selects the custom mode for THIS SESSION only (OFF on launch).
+          Use the game's normal create/join lobby and choose map there:
+          Night of the Wendigo -> Wendigo; Bloodfang -> Vampire;
+          Operation Blackwing -> Mothman.
+          No SaveGame APIs or chosen contract overrides in this module.
+          The base game can still write its normal progress and saves.
+          Camera settings: %LOCALAPPDATA%\FolkloreCryptidHunt\cryptid-hunt.ini.
+          F8 mode panels, F9 diagnostics, F11 return human.
+          This is an experimental private-game development candidate.
+          '@ | Set-Content dist/FolkloreCryptidHunt/README.txt
+      - name: Upload Journal
         uses: actions/upload-artifact@v4
         with:
-          name: FolkloreHunterJournal-x64-v12-SmoothMovement-Creatures-Cheats
-          path: dist/*
+          name: FolkloreHunterJournal-x64-Admin-NoPossession
+          path: dist/FolkloreHunterJournal/*
+          if-no-files-found: error
+      - name: Upload standalone Cryptid Hunt game mode
+        uses: actions/upload-artifact@v4
+        with:
+          name: FolkloreCryptidHunt-x64-Standalone-GameMode-Prototype
+          path: dist/FolkloreCryptidHunt/*
           if-no-files-found: error

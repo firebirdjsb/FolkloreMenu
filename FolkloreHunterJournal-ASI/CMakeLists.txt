@@ -27,3 +27,23 @@ if(MSVC)
     target_link_options(FolkloreHunterJournal PRIVATE /DEBUG:FULL /MAP)
 endif()
 set_target_properties(FolkloreHunterJournal PROPERTIES PREFIX "" SUFFIX ".asi")
+
+# A separate distributable ASI. Shares the verified native reflection bridge
+# for now, but has its own restricted game-mode interface and rule compilation.
+# The two render-hook ASIs must not be active in the same game process until
+# a shared overlay dispatch/hook owner has been implemented.
+add_library(FolkloreCryptidHunt SHARED
+    src/JournalASI.cpp
+    src/CryptidHuntUI.cpp
+    src/JournalDiagnostics.cpp
+    src/HunterNative.cpp
+    src/HunterScares.cpp)
+target_compile_features(FolkloreCryptidHunt PRIVATE cxx_std_20)
+target_include_directories(FolkloreCryptidHunt PRIVATE src)
+target_compile_definitions(FolkloreCryptidHunt PRIVATE NOMINMAX FCH_STANDALONE=1)
+target_link_libraries(FolkloreCryptidHunt PRIVATE imgui_journal minhook d3d11 d3d12 dxgi user32 dwmapi imm32 winmm)
+if(MSVC)
+    target_compile_options(FolkloreCryptidHunt PRIVATE /W4 /EHsc /utf-8 /Zi)
+    target_link_options(FolkloreCryptidHunt PRIVATE /DEBUG:FULL /MAP)
+endif()
+set_target_properties(FolkloreCryptidHunt PROPERTIES PREFIX "" SUFFIX ".asi")
