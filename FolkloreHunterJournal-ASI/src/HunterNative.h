@@ -22,6 +22,21 @@ namespace HunterNative {
         int objectIndex = -1;
         std::string displayName;
     };
+    struct CryptidSpawnClass {
+        int objectIndex = -1; // live GUObject index of validated UClass
+        std::string displayName;
+        bool mothman = false;
+    };
+    struct CryptidSpawnPoint {
+        int objectIndex = -1; // actor index in active streamed UWorld
+        std::string displayName;
+    };
+    struct CryptidCameraSettings {
+        float yawSensitivity = .12f;
+        float pitchSensitivity = .12f;
+        float followRate = 32.f;
+        bool invertPitch = false;
+    };
     struct VanityItem {
         std::string label;
         std::string className;
@@ -70,6 +85,10 @@ namespace HunterNative {
     std::vector<CreatureInfo> GetCreatures();
     std::vector<SoundInfo> GetSounds();
     std::vector<CameraShakeInfo> GetCameraShakes();
+    std::vector<CryptidSpawnClass> GetSpawnableCryptidClasses();
+    std::vector<CryptidSpawnPoint> GetActiveMapSpawners();
+    CryptidCameraSettings GetCryptidCameraSettings();
+    void SetCryptidCameraSettings(const CryptidCameraSettings& value);
     std::vector<VanityItem> GetVanityItems();
     bool RequestEquipVanity(const std::string& className);
     // Gameplay changes are runtime experiments and may not replicate to clients.
@@ -78,6 +97,10 @@ namespace HunterNative {
     bool RequestJumpBoost(float multiplier, bool entireLobby = false);
     bool RequestGravity(float gravityScale, bool entireLobby);
     bool RequestSpawnMobWave(int count, int selectedLiveCryptidIndex = -1);
+    // Spawn a class loaded in the active hunt at a selected native map
+    // spawner (-1 = automatic; host-pawn fallback if the map has none).
+    bool RequestSpawnCryptidClass(int classObjectIndex, int count,
+                                  int mapSpawnerIndex = -1, bool autoControl = false);
     bool RequestPossessCryptid(int objectIndex);
     bool RequestRestoreHuman();
     // Only abilities exposed by the matching creature's reflected class are invoked.
