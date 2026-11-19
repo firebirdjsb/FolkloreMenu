@@ -54,8 +54,11 @@ void DrawJournal() {
         "CRYPTID HUNT // SURVIVORS AGAINST THE NIGHT");
     ImGui::SeparatorText("MAIN MENU / CUSTOM GAME MODE");
     bool custom=HunterNative::CryptidHuntOptedIn();
-    if(ImGui::Checkbox("ENABLE CUSTOM CRYPTID HUNT FOR THIS SESSION",&custom))
-        HunterNative::SetCryptidHuntOptedIn(custom);
+    if(ImGui::RadioButton("NORMAL GAME (NO CRYPTID HUNT RULES)",!custom))
+        HunterNative::SetCryptidHuntOptedIn(false);
+    if(ImGui::RadioButton("CUSTOM GAME MODE: CRYPTID HUNT",custom))
+        HunterNative::SetCryptidHuntOptedIn(true);
+    custom=HunterNative::CryptidHuntOptedIn();
     ImGui::TextWrapped(custom?
         "MODE SELECTED: start/join a normal Folklore Hunter lobby. The host chooses the map using the existing lobby. The chosen map determines the cryptid.":
         "NORMAL GAME: this ASI is loaded but its creature rules and possession are disabled. Enable Custom Cryptid Hunt above before starting a lobby.");
