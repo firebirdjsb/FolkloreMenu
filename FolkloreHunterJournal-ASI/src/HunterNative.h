@@ -26,6 +26,7 @@ namespace HunterNative {
         int objectIndex = -1; // live GUObject index of validated UClass
         std::string displayName;
         bool mothman = false;
+        bool presentAsLiveActor = false; // same UClass already active on this map
     };
     struct CryptidSpawnPoint {
         int objectIndex = -1; // actor index in active streamed UWorld
