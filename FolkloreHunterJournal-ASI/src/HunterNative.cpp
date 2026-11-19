@@ -3575,8 +3575,8 @@ void HunterNative::DrawESP(ImVec2 display) {
         double meters=0;
         ImVec2 pt{};
         if(!Project(marker.pos,camera,display,pt,meters))continue;
-        const ImU32 color=marker.mothman?
-            IM_COL32(129,169,236,245):colors[marker.kind];
+        // Mothman uses the same red ESP treatment as every other cryptid.
+        const ImU32 color=colors[marker.kind];
         const float radius=std::clamp(14.f-static_cast<float>(meters)*.018f,4.f,14.f);
         dl->AddCircle(pt,radius,color,12,1.4f);
         dl->AddLine({pt.x-5,pt.y},{pt.x+5,pt.y},color,1.2f);
