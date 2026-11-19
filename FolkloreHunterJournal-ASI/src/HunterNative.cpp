@@ -278,6 +278,7 @@ namespace {
     }
     bool GetObjects(int& count,uintptr_t& chunks);
     uintptr_t ObjectAt(int index,uintptr_t chunks);
+    int ClassKind(uintptr_t cls);
     bool IsCameraShakeClass(uintptr_t klass) {
         if(ClassName(klass)==L"CameraShakeBase")return false; // abstract base
         for(int depth=0;klass && depth<25;++depth) {
@@ -588,6 +589,7 @@ namespace {
         std::vector<Marker> markers;
         std::vector<HunterNative::PlayerInfo> playersOut;
         std::vector<HunterNative::CreatureInfo> creaturesOut;
+        std::vector<HunterNative::CryptidSpawnPoint> spawnPointsOut;
         status.worldReady=world!=0;
         if(world) {
             status.host=ReadPtr(world+0x158)!=0;
@@ -662,7 +664,7 @@ namespace {
                     snprintf(label,sizeof(label),"Map spawner #%d",point.index);
                 points.push_back({point.index,label});
             }
-            gSpawnPointCatalog=std::move(points);
+            spawnPointsOut=std::move(points);
             status.knownActors=static_cast<int>(gKnown.size());
             markers.reserve(kMaxActors);
             for(const auto& actor:gKnown) {
@@ -782,6 +784,7 @@ namespace {
             gRoster=std::move(playersOut);
             gCreatures=std::move(creaturesOut);
             gSpawnClassCatalog=gSpawnClassCandidates;
+            gSpawnPointCatalog=std::move(spawnPointsOut);
             gVanityChoices=std::move(vanity);
             gSounds=gSoundCandidates;
             gCameraShakes=gCameraShakeCandidates;
