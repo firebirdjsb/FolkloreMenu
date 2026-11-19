@@ -31,6 +31,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #pragma comment(lib, "dxgi.lib")
 
 static HMODULE gJournalModule = nullptr;
+static HANDLE gOverlayOwnerMutex = nullptr;
 namespace {
     using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
     using ResizeFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
@@ -148,10 +149,12 @@ namespace {
             // Prevent the human-pawn camera from turning during remote monster control.
             return DefWindowProcW(hwnd,msg,wparam,lparam);
         }
+#ifdef FCH_STANDALONE
         if (msg == WM_KEYUP && wparam == VK_F11 && HunterNative::MonsterModeActive()) {
             HunterNative::RequestRestoreHuman(); // emergency escape if chase view is obstructed
             return 0;
         }
+#endif
         if (msg == HunterNative::kGameTick || msg == HunterNative::kGameAction) {
             HunterNative::HandleWindowMessage(msg);
             return 0;
@@ -175,6 +178,11 @@ namespace {
             // E used to activate and then deactivate invisibility on release.
             if(msg==WM_KEYUP && (wparam=='Q'||wparam=='E'||wparam=='R'))
                 return 0;
+#ifdef FCH_STANDALONE
+            if((msg==WM_KEYDOWN || msg==WM_KEYUP) &&
+               (wparam=='C' || wparam=='V'))
+                return 0; // Wendigo's private watchpoint shortcuts
+#endif
             if(HunterNative::MonsterModeActive() &&
                 (msg==WM_LBUTTONDOWN || msg==WM_LBUTTONUP))return 0;
             if((msg==WM_KEYDOWN || msg==WM_KEYUP) &&
@@ -361,6 +369,9 @@ namespace {
             ImGui::NewFrame();
             HunterNative::RequestTick();
             HunterNative::DrawESP(ImGui::GetIO().DisplaySize);
+#ifdef FCH_STANDALONE
+            HunterNative::DrawCryptidHuntDaylightVision(ImGui::GetIO().DisplaySize);
+#endif
             HunterNative::DrawMonsterHUD(ImGui::GetIO().DisplaySize);
             FHJDiag::PollGameLog();
             if (gShowMenu.load(std::memory_order_relaxed)) FHJ::DrawJournal();
@@ -555,6 +566,19 @@ namespace {
             return 0;
         }
         Log(L"Folklore Hunter executable confirmed. Native ASI loaded successfully.");
+        // Two independent DLLs currently share MinHook/DXGI hook targets.
+        // Until a shared render dispatcher exists, never permit both to
+        // install the hooks in one process. The first loaded ASI owns them.
+        gOverlayOwnerMutex=CreateMutexW(nullptr,TRUE,
+                              L"Local\\FolkloreHunter_Journal_CryptidHunt_OneOverlay_v1");
+        if(!gOverlayOwnerMutex || GetLastError()==ERROR_ALREADY_EXISTS) {
+            Log(L"Another Folklore Journal/Cryptid Hunt ASI owns the graphics hooks. This plugin will stay inactive; install only one mod at a time.");
+            if(gOverlayOwnerMutex) {
+                CloseHandle(gOverlayOwnerMutex);
+                gOverlayOwnerMutex=nullptr;
+            }
+            return 0;
+        }
         Log(GetModuleHandleW(L"d3d11.dll") ? L"Module: d3d11.dll loaded" : L"Module: d3d11.dll not loaded yet");
         Log(GetModuleHandleW(L"d3d12.dll") ? L"Module: d3d12.dll loaded" : L"Module: d3d12.dll not loaded yet");
         Log(L"Loaded graphics modules do not prove which Unreal rendering API is active.");
