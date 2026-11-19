@@ -179,6 +179,12 @@ namespace {
     bool gHudRestorePending=false;
     int gVampireStance=0;
     bool gVampireInvisible=false;
+    struct VampireInvisibilityVerification {
+        uintptr_t pawn=0;
+        int32_t actorIndex=-1;
+        bool wanted=false;
+        ULONGLONG verifyAt=0;
+    } gVampireVerify;
     std::array<ULONGLONG,5> gAbilityTicks{};
     std::array<bool,3> gAbilityKeyDown{};
     std::atomic_int gMonsterAttackSoundIndex{-1};
@@ -248,6 +254,7 @@ namespace {
     void ApplyPossessionClarity(uintptr_t pc,uintptr_t cameraComponent);
     void RestorePossessionClarity(uintptr_t pc);
     void RefreshPossessionClarity(uintptr_t pc);
+    void VerifyVampireInvisibility(ULONGLONG now);
     void TickNativeMothmanFlight(uintptr_t pawn,const Vec3& desiredInput,
                                   bool boosting,double dt,ULONGLONG now);
     uintptr_t CreatureSkillFunction(int species,int slot);
@@ -641,6 +648,7 @@ namespace {
             gMonsterMovement=0;gMonsterSpeedsSaved=false;gPuppeteering=false;
             gMonsterPathActive=false;gMonsterLastMoveRequest=0;
             gMonsterFunctions.clear();
+            gVampireVerify=VampireInvisibilityVerification{};
             gControlledCryptidClass=0;
             gControlledRespawnSpawner=0;gControlledRespawnSpawnerIndex=-1;
             gControlledExistingIds.clear();
@@ -2188,14 +2196,15 @@ namespace {
     // parameter layout. No generic vampire skills are assigned to Wendigo.
     uintptr_t CreatureSkillFunction(int species,int slot) {
         switch(slot) {
-            case 0: 
-                // BP_FlyingPawnTest_C is the SDK's Mothman APawn:
-                // DarknessAttack is its actual exposed attack event.
-                if(species==1)return NoArgCryptidAction({
-                    L"DarknessAttack",L"Multicast_All_DarknessAttack"});
+            case 0:
+                // Mothman is an APawn: the three-map SDK declares NO
+                // standard melee UFunction. DarknessAttack is a separate
+                // special attack, NOT LMB. Do not activate it on click.
+                if(species==1)return 0;
+                // Ground cryptids are native ACharacters; use the
+                // authoritative base attack that selects native montages.
                 return NoArgCryptidAction({
-                L"Server_Attack",L"AUTH_Attack",L"Attack",L"PerformAttack",
-                L"StartAttack",L"Melee",L"PrimaryAttack",L"DoMeleeAttack"});
+                    L"Server_Attack",L"Melee"});
             case 1:
                 if(species==1) return NoArgCryptidAction({
                     L"ForceScreech",L"RetriggerScreech"});
@@ -2224,7 +2233,8 @@ namespace {
                 }
                 return 0;
             case 3:
-                if(species==1)return 0; // no SDK-confirmed R ability
+                if(species==1)return NoArgCryptidAction({
+                    L"DarknessAttack"}); // special power on R, never LMB
                 if(species==3)return NoArgCryptidAction({
                     L"Rage",L"AUTH_Rage",L"Enrage",L"AUTH_Enrage",
                     L"Frenzy",L"FeralRoar"});
@@ -2247,7 +2257,7 @@ namespace {
     }
     std::string CreatureSkillLabel(int species,int slot,uintptr_t fn) {
         if(!fn)return {};
-        if(slot==0)return "LMB MELEE";
+        if(slot==0)return "LMB NATIVE MELEE";
         // Show the *actual* reflected method, not a guessed gameplay power.
         const auto method=ObjectName(fn);
         const std::string name(method.begin(),method.end());
@@ -2256,6 +2266,7 @@ namespace {
     }
 
     void RestoreMonsterAI() {
+        gVampireVerify=VampireInvisibilityVerification{};
         int32_t actorId=-1;
         const bool actorLive=gMonsterPawn &&
             Read(gMonsterPawn+0xC,actorId) && actorId==gMonsterIndex;
@@ -2380,11 +2391,17 @@ namespace {
         bool advanceStance=false;
         // Only Vampire supports the reflected invisibility/stance setters.
         // Ground Wendigo cannot inherit either skill or Mothman's flying.
+        bool vampireWasInvisible=false;
+        bool verifyVampire=false;
         if(species==2 && slot==2 && fn) {
+            // BP_VampireBase_C.IsInvisible at 0x7D0 is the real
+            // replicated gameplay flag. Never trust an internal toggle
+            // that can diverge from actual character state.
+            verifyVampire=Read(gMonsterPawn+0x7D0,vampireWasInvisible);
             const auto name=ObjectName(fn);
             if(name==L"SetInvisible" || name==L"SetInvisibility" ||
                name==L"AUTH_SetInvisible" || name==L"SetIsInvisible")
-                args[0]=gVampireInvisible?0:1;
+                args[0]=vampireWasInvisible?0:1;
         }
         if(species==2 && slot==3 && fn) {
             const auto name=ObjectName(fn);
@@ -2407,7 +2424,14 @@ namespace {
         if(Invoke(gMonsterPawn,fn,args)) {
             gAbilityTicks[static_cast<size_t>(slot)]=now;
             if(slot==0)PlayControlledMeleeAudio();
-            if(species==2 && slot==2)gVampireInvisible=!gVampireInvisible;
+            if(species==2 && slot==2 && verifyVampire) {
+                const bool wanted=!vampireWasInvisible;
+                // Blueprint Invisible() can run a timeline; recheck
+                // state after it has had time to finish, not instantly.
+                gVampireVerify={gMonsterPawn,gMonsterIndex,wanted,now+1100};
+                gVampireInvisible=vampireWasInvisible;
+                FHJDiag::Log(L"VAMPIRE INVISIBILITY: native Invisible invoked; awaiting replicated IsInvisible state verification.");
+            }
             if(advanceStance)gVampireStance=(gVampireStance+1)%3;
             wchar_t msg[220]{};
             swprintf_s(msg,L"CRYPTID ABILITY slot %d: invoked native %s; effects must be verified on the host.",slot,name.c_str());
@@ -2417,6 +2441,53 @@ namespace {
             swprintf_s(msg,L"CRYPTID ABILITY: ProcessEvent failed for %s.",name.c_str());
             FHJDiag::Log(msg);
         }
+    }
+    void VerifyVampireInvisibility(ULONGLONG now) {
+        if(!gVampireVerify.verifyAt || now<gVampireVerify.verifyAt)return;
+        const auto pending=gVampireVerify;
+        gVampireVerify=VampireInvisibilityVerification{};
+        if(!gMonsterActive.load() || !ReadPtr(World()+0x158) ||
+           !pending.pawn || gMonsterPawn!=pending.pawn)return;
+        int32_t currentId=-1;
+        bool actual=false;
+        if(!Read(pending.pawn+0xC,currentId) ||
+           currentId!=pending.actorIndex ||
+           !Read(pending.pawn+0x7D0,actual))return;
+        if(actual==pending.wanted) {
+            gVampireInvisible=actual;
+            FHJDiag::Log(actual?
+                L"VAMPIRE INVISIBILITY: native function confirmed replicated IsInvisible=true.":
+                L"VAMPIRE INVISIBILITY: native function confirmed replicated IsInvisible=false.");
+            return;
+        }
+        // The native no-arg Invisible() sometimes fires without
+        // changing the replicated field. The SDK supplies matching
+        // multicast appearance functions and the exact server-owned
+        // replicated bool at 0x7D0. Use those as a guarded fallback.
+        const auto visual=NoArgCryptidAction(pending.wanted?
+            std::initializer_list<const wchar_t*>{L"All_Disapear"}:
+            std::initializer_list<const wchar_t*>{L"All_Reappear"});
+        if(!visual) {
+            FHJDiag::Log(L"VAMPIRE INVISIBILITY: native state unchanged; no verified multicast appearance function available.");
+            return;
+        }
+        if(!TryWrite(pending.pawn+0x7D0,pending.wanted)) {
+            FHJDiag::Log(L"VAMPIRE INVISIBILITY: replicated flag write rejected; no appearance effect invoked.");
+            return;
+        }
+        bool readback=false;
+        if(!Read(pending.pawn+0x7D0,readback) ||
+           readback!=pending.wanted)return;
+        const bool dispatched=Invoke(pending.pawn,visual,nullptr);
+        // OnRep updates local materials; other clients get the property
+        // through normal replication and multicast appearance event.
+        const auto onRep=NoArgCryptidAction({L"OnRep_IsInvisiblie"});
+        if(onRep)Invoke(pending.pawn,onRep,nullptr);
+        ForceActorNetUpdate(pending.pawn);
+        gVampireInvisible=readback;
+        FHJDiag::Log(dispatched?
+            L"VAMPIRE INVISIBILITY: fallback applied replicated IsInvisible and native All_Disapear/All_Reappear + OnRep. Verify with second player.":
+            L"VAMPIRE INVISIBILITY: replicated IsInvisible changed but native appearance multicast failed. Check runtime.");
     }
     void ResetControlledRespawnSession() {
         gControlledCryptidClass=0;
@@ -2692,6 +2763,7 @@ namespace {
     }
     void FreeflightTick() {
         const ULONGLONG now=GetTickCount64();
+        VerifyVampireInvisibility(now);
         const ULONGLONG elapsed=gLastMotionTick?now-gLastMotionTick:16;
         gLastMotionTick=now;
         const auto world=World();
