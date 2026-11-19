@@ -1911,8 +1911,9 @@ namespace {
                                input.y*gMonsterMoveDirY;
         const double remaining=std::hypot(
             gMonsterMoveGoal.x-origin.x,gMonsterMoveGoal.y-origin.y);
-        if(gMonsterPathActive && alignment>.972 && remaining>150.0)
-            return true; // keep one continuous native path instead of jerky 180ms reissues
+        if(gMonsterPathActive && alignment>.972 && remaining>150.0 &&
+           now-gMonsterLastMoveRequest<1250)
+            return true; // use native path for up to 1.25s, then refresh
         if(gMonsterPathActive && now-gMonsterLastMoveRequest<85)
             return true; // short directional debounce keeps animation continuous
         // Project farther ahead so the AI follows a continuous path until
@@ -2654,12 +2655,17 @@ namespace {
                 if(lenXY>1e-3) {
                     horizontal.x/=lenXY;horizontal.y/=lenXY;
                     if(!MoveCryptidWithAI(horizontal,now)) {
-                        Vec3 pos{};
-                        if(Position(pawn,pos)) {
-                            const double speed=boost?850.0:500.0;
-                            const Vec3 dest{pos.x+horizontal.x*speed*dt,
-                                            pos.y+horizontal.y*speed*dt,pos.z};
-                            SetActorLocationSafe(pawn,dest,true,false);
+                        // SDK-verified APawn::AddMovementInput(FVector,
+                        // float, bool): UE's CharacterMovement performs
+                        // collision, speed and animation updates. Never
+                        // teleport a grounded cryptid as an AI fallback,
+                        // which causes foot sliding, jitter, and snapping.
+                        if(!AddSmoothMovement(pawn,horizontal,boost?1.f:.70f)) {
+                            static ULONGLONG lastNativeMoveWarn=0;
+                            if(now-lastNativeMoveWarn>5000) {
+                                lastNativeMoveWarn=now;
+                                FHJDiag::Log(L"GROUND CRYPTID: both native AI MoveToLocation and Pawn.AddMovementInput rejected; leaving physics intact instead of teleporting.");
+                            }
                         }
                     }
                 } else StopCryptidPath();
