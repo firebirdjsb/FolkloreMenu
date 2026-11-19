@@ -35,7 +35,11 @@ namespace {
     struct Rot { double pitch{},yaw{},roll{}; };
     struct Name { int32_t index{}; uint32_t number{}; };
     struct FStringView { wchar_t* data{}; int32_t size{},capacity{}; };
-    struct Marker { Vec3 pos{}; int kind{}; double health{-1.0}, maxHealth{-1.0}; };
+    struct Marker {
+        Vec3 pos{}; int kind{};
+        double health{-1.0},maxHealth{-1.0};
+        bool mothman=false; // APawn species has no base-cryptid HP fields
+    };
     struct Camera { Vec3 pos{}; Rot rot{}; float fov{}; };
     struct ActorEntry { uintptr_t address{}; int index{}; int kind{}; };
     struct LevelView { uintptr_t data{}; int32_t count{}; int32_t start{}; };
@@ -737,7 +741,9 @@ namespace {
                     if(!Read(actor.address+0x8A8,actorMaxHealth) ||
                        !std::isfinite(actorMaxHealth) || actorMaxHealth<=0)actorMaxHealth=-1.0;
                 }
-                markers.push_back({loc,actor.kind,actorHealth,actorMaxHealth});
+                markers.push_back({loc,actor.kind,actorHealth,actorMaxHealth,
+                    actor.kind==2 &&
+                    ClassName(ReadPtr(actor.address+0x10))==L"BP_FlyingPawnTest_C"});
             }
             status.espCandidates=static_cast<int>(markers.size());
             status.fallProtectionEnabled=gProtectFall.load();
@@ -3545,23 +3551,28 @@ void HunterNative::DrawESP(ImVec2 display) {
         double meters=0;
         ImVec2 pt{};
         if(!Project(marker.pos,camera,display,pt,meters))continue;
-        const ImU32 color=colors[marker.kind];
+        const ImU32 color=marker.mothman?
+            IM_COL32(129,169,236,245):colors[marker.kind];
         const float radius=std::clamp(14.f-static_cast<float>(meters)*.018f,4.f,14.f);
         dl->AddCircle(pt,radius,color,12,1.4f);
         dl->AddLine({pt.x-5,pt.y},{pt.x+5,pt.y},color,1.2f);
         dl->AddLine({pt.x,pt.y-5},{pt.x,pt.y+5},color,1.2f);
         char label[160]{};
         const bool showHealth=marker.kind==1 || marker.kind==2;
-        if(showHealth && marker.health>=0 && marker.maxHealth>0)
+        const char* category=marker.mothman?"MOTHMAN":names[marker.kind];
+        if(marker.mothman)
+            snprintf(label,sizeof(label),"MOTHMAN %.0fm | HP not exposed",
+                meters);
+        else if(showHealth && marker.health>=0 && marker.maxHealth>0)
             snprintf(label,sizeof(label),"%s %.0fm | HP %.0f / %.0f",
-                names[marker.kind],meters,marker.health,marker.maxHealth);
+                category,meters,marker.health,marker.maxHealth);
         else if(showHealth && marker.health>=0)
             snprintf(label,sizeof(label),"%s %.0fm | HP %.0f",
-                names[marker.kind],meters,marker.health);
+                category,meters,marker.health);
         else if(showHealth)
-            snprintf(label,sizeof(label),"%s %.0fm | HP ?",names[marker.kind],meters);
+            snprintf(label,sizeof(label),"%s %.0fm | HP ?",category,meters);
         else
-            snprintf(label,sizeof(label),"%s %.0fm",names[marker.kind],meters);
+            snprintf(label,sizeof(label),"%s %.0fm",category,meters);
         const float left=pt.x+radius+4;
         dl->AddText({left,pt.y-11},color,label);
         if(showHealth && marker.health>=0 && marker.maxHealth>0) {
@@ -3772,14 +3783,21 @@ void HunterNative::DrawMonsterHUD(ImVec2 screen) {
     draw->AddRect(tl,tr,mainColor,6.f,0,2.f);
     draw->AddText(ImVec2(28,24),mainColor,title);
     draw->AddText(ImVec2(28,45),IM_COL32(214,219,209,255),trait);
-    const float pct=snap.maxHealth>0?std::clamp(
-        static_cast<float>(snap.health/snap.maxHealth),0.f,1.f):0.f;
-    draw->AddRectFilled(ImVec2(28,70),ImVec2(tr.x-20,83),IM_COL32(44,53,48,245),3.f);
-    draw->AddRectFilled(ImVec2(28,70),ImVec2(28+(tr.x-48)*pct,83),mainColor,3.f);
+    if(snap.maxHealth>0.0) {
+        const float pct=std::clamp(
+            static_cast<float>(snap.health/snap.maxHealth),0.f,1.f);
+        draw->AddRectFilled(ImVec2(28,70),ImVec2(tr.x-20,83),
+            IM_COL32(44,53,48,245),3.f);
+        draw->AddRectFilled(ImVec2(28,70),
+            ImVec2(28+(tr.x-48)*pct,83),mainColor,3.f);
+    }
     char health[140]{};
     if(snap.respawning)
         snprintf(health,sizeof(health),"RESPAWN IN %.1fs  |  CAMERA %s",
             snap.respawnSeconds,snap.cameraReady?"ATTACHED":"NOT READY");
+    else if(snap.species==1)
+        snprintf(health,sizeof(health),"MOTHMAN ACTIVE / HP UNAVAILABLE  |  CAMERA %s",
+            snap.cameraReady?"CHASE":"FALLBACK");
     else
         snprintf(health,sizeof(health),"HEALTH %.0f / %.0f  |  CAMERA %s",
             snap.health,snap.maxHealth,snap.cameraReady?"CHASE":"FALLBACK");
