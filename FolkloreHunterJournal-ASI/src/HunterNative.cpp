@@ -126,6 +126,7 @@ namespace {
     bool gMonsterBrainWasRunning=false;
     uintptr_t gMonsterMovement=0;
     float gMonsterOriginalWalkSpeed=0.f, gMonsterOriginalFlySpeed=0.f;
+    float gMonsterNativeWalkSpeed=0.f, gMonsterNativeRunSpeed=0.f;
     bool gMonsterSpeedsSaved=false;
     bool gMonsterModeSaved=false;
     bool gMonsterFlightActive=false;
@@ -2097,6 +2098,7 @@ namespace {
         }
         gMonsterMovement=0;
         gMonsterSpeedsSaved=false;gMonsterModeSaved=false;
+        gMonsterNativeWalkSpeed=0.f;gMonsterNativeRunSpeed=0.f;
         gMonsterFlightActive=false;gGroundJumpHeld=false;
         gMothFlight=NativeMothmanFlight{};
         if(controllerLive && gMonsterBrain && gMonsterBrainWasRunning) {
@@ -2135,11 +2137,20 @@ namespace {
         gMonsterSpeedsSaved=Read(gMonsterMovement+0x268,gMonsterOriginalWalkSpeed) &&
             Read(gMonsterMovement+0x274,gMonsterOriginalFlySpeed);
         if(!gMonsterSpeedsSaved)return;
-        const float walk=species==2?610.f:species==3?540.f:700.f;
-        const float fly=species==1?1200.f:850.f;
-        TryWrite(gMonsterMovement+0x268,walk);
-        TryWrite(gMonsterMovement+0x274,fly);
-        FHJDiag::Log(L"Monster Mode: native CharacterMovement speed profile enabled.");
+        // SDK BP_Cryptid_Base_C.WalkSpeed and RunSpeed are double
+        // properties at 0x698 and 0x6A0. Respect each species' own
+        // locomotion tuning instead of forcing arbitrary 540/610/700.
+        double naturalWalk=0.,naturalRun=0.;
+        if(Read(gMonsterPawn+0x698,naturalWalk) &&
+           std::isfinite(naturalWalk) && naturalWalk>=50. && naturalWalk<=1800.)
+            gMonsterNativeWalkSpeed=static_cast<float>(naturalWalk);
+        else gMonsterNativeWalkSpeed=gMonsterOriginalWalkSpeed;
+        if(Read(gMonsterPawn+0x6A0,naturalRun) &&
+           std::isfinite(naturalRun) && naturalRun>=50. && naturalRun<=2500.)
+            gMonsterNativeRunSpeed=static_cast<float>(naturalRun);
+        else gMonsterNativeRunSpeed=gMonsterNativeWalkSpeed*1.45f;
+        TryWrite(gMonsterMovement+0x268,gMonsterNativeWalkSpeed);
+        FHJDiag::Log(L"GROUND CRYPTID: live BP_Cryptid_Base WalkSpeed/RunSpeed now drive native CharacterMovement and species locomotion.");
     }
     void PlayControlledMeleeAudio() {
         // Prefer the creature's original Blueprint sound event when present.
@@ -2695,15 +2706,13 @@ namespace {
                     }
                 }
             }
-            if(monster && gMonsterSpeedsSaved) {
-                const float speed=boost?1.7f:1.f;
-                const float walk=(species==2?610.f:species==3?540.f:700.f)*speed;
-                const float fly=(species==1?1200.f:850.f)*speed;
-                float current=0;
-                if(Read(movement+0x268,current) && std::fabs(current-walk)>.5f)
-                    TryWrite(movement+0x268,walk);
-                if(Read(movement+0x274,current) && std::fabs(current-fly)>.5f)
-                    TryWrite(movement+0x274,fly);
+            if(monster && species!=1 && gMonsterSpeedsSaved) {
+                const float authentic=boost?
+                    gMonsterNativeRunSpeed:gMonsterNativeWalkSpeed;
+                float current=0.f;
+                if(authentic>0.f && Read(movement+0x268,current) &&
+                   std::fabs(current-authentic)>1.f)
+                    TryWrite(movement+0x268,authentic);
             } else if(!monster && gFlySpeedSaved && movement==gOriginalFlyMovement) {
                 const float wanted=boost?1850.f:1150.f;
                 float current=0;
@@ -2736,7 +2745,10 @@ namespace {
         // Ground cryptids face camera yaw. Mothman's native
         // TorqueTowardsVelocity and wing animation need control of its
         // orientation: never hard-snap the aerial pawn to camera yaw.
-        if(species!=1) {
+        if(species!=1 && length<1e-3) {
+            // While navigating, let AIController/path-following rotate the
+            // creature naturally. Only face the camera while stationary;
+            // per-frame hard yaw writes interfere with native turning.
             const Rot desired{0.0,gMonsterYaw,0.0};
             if(FindFunction(L"Actor",L"K2_SetActorRotation"))
                 SetActorRotationSafe(pawn,desired);
