@@ -1,2 +1,2 @@
 #pragma once
-namespace FHJ { void DrawJournal(); }
+namespace FHJ { void DrawJournal(); void DrawCryptidHuntLoadBanner(); }
