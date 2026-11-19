@@ -223,6 +223,21 @@ namespace {
     std::vector<WendigoWatchCamera> gWendigoWatchCameras;
     std::atomic_int gWendigoWatchCount{0};
     std::atomic_int gHuntNightCached{-1};
+    // In-memory only; ON means custom Hunt rules apply to this process.
+    // Never change SaveGame objects, contract selection, map path or game mode.
+    std::atomic_bool gCryptidHuntOptedIn{false};
+    std::atomic_int gCryptidHuntMapSpecies{0};
+    constexpr int kWendigoCamerasPerDay=2;
+    int gWendigoCamerasUsedToday=0;
+    std::atomic_int gWendigoCameraDayRemaining{kWendigoCamerasPerDay};
+    int gWendigoLastNightNum=-1,gWendigoPriorPhase=-1;
+    uintptr_t gWendigoDayWorld=0;
+    struct WendigoPlacingStealth {
+        uintptr_t pawn=0;
+        int32_t id=-1;
+        bool wasHidden=false;
+        ULONGLONG restoreAt=0;
+    } gWendigoPlacingStealth;
     ULONGLONG gHuntNightLastRead=0;
     int gWendigoViewIndex=-1;
     bool gWendigoPlaceKey=false,gWendigoCycleKey=false;
@@ -299,6 +314,10 @@ namespace {
     void RefreshPossessionClarity(uintptr_t pc);
     void VerifyVampireInvisibility(ULONGLONG now);
     int NativeHuntNightState();
+    int HuntSpeciesFromName(const std::wstring& name);
+    void UpdateWendigoCameraQuota(int phase);
+    void RestoreWendigoPlacementStealth();
+    void FinishWendigoStealthIfDue(ULONGLONG now);
     void ClearWendigoWatchCameras();
     bool PlaceWendigoWatchCamera();
     bool CycleWendigoWatchCamera(bool returnToChase);
@@ -709,6 +728,11 @@ namespace {
             gMonsterFunctions.clear();
             gWendigoWatchCameras.clear();gWendigoWatchCount.store(0);
             gHuntNightCached.store(-1);gHuntNightLastRead=0;
+            gCryptidHuntMapSpecies.store(0);
+            gWendigoCamerasUsedToday=0;
+            gWendigoCameraDayRemaining.store(kWendigoCamerasPerDay);
+            gWendigoLastNightNum=-1;gWendigoPriorPhase=-1;
+            gWendigoDayWorld=0;gWendigoPlacingStealth=WendigoPlacingStealth{};
             gWendigoViewIndex=-1;gWendigoPlaceKey=false;gWendigoCycleKey=false;
             gVampireVerify=VampireInvisibilityVerification{};
             gControlledCryptidClass=0;
@@ -741,12 +765,29 @@ namespace {
         if(world) {
             status.host=ReadPtr(world+0x158)!=0;
             const auto gameState=ReadPtr(world+0x160); // Engine.UWorld::GameState
-            if(gameState && ClassName(ReadPtr(gameState+0x10))==L"FL_Gamestate_C") {
-                const auto huntClass=ReadPtr(gameState+0x340); // FL_Gamestate_C::HuntData
-                const auto hunt=ObjectName(huntClass);
-                if(!hunt.empty())
-                    status.activeHuntName.assign(hunt.begin(),hunt.end());
+            if(gameState && IsGameStateBasedOn(gameState,L"FL_Gamestate_C")) {
+                // GameState_Lobby_C *derives* from FL_Gamestate_C.
+                // Its SelectedContract (+0x388) begins with the actual
+                // UHuntDataBase UClass pointer selected by the stock lobby.
+                const bool inLobby=IsGameStateBasedOn(gameState,L"GameState_Lobby_C");
+                status.isGameLobby=inLobby;
+                if(inLobby) {
+                    const auto contract=ReadPtr(gameState+0x388);
+                    const auto name=ObjectName(contract);
+                    if(!name.empty())
+                        status.selectedLobbyMap.assign(name.begin(),name.end());
+                    status.mapCryptid=HuntSpeciesFromName(name);
+                } else {
+                    const auto huntClass=ReadPtr(gameState+0x340);
+                    const auto name=ObjectName(huntClass);
+                    if(!name.empty())
+                        status.activeHuntName.assign(name.begin(),name.end());
+                    status.mapCryptid=HuntSpeciesFromName(name);
+                }
             }
+#ifdef FCH_STANDALONE
+            gCryptidHuntMapSpecies.store(status.isGameLobby?0:status.mapCryptid);
+#endif
             cam=GetCamera(world);
             status.cameraReady=cam.fov>=20.f;
             const auto gi=ReadPtr(world+0x1D8);
@@ -2727,12 +2768,40 @@ namespace {
         if(!Invoke(pc,play,args))
             FHJDiag::Log(L"CRYPTID AUDIO: user-selected diagnostic sound failed; native attack remains unchanged.");
     }
+    int HuntSpeciesFromName(const std::wstring& name) {
+        const auto lowered=Lower(name);
+        // The three loaded HuntData classes and contract names from the
+        // complete user-supplied Dumper-7 map snapshots.
+        if(lowered.find(L"wendigo")!=std::wstring::npos)return 3;
+        if(lowered.find(L"bloodfang")!=std::wstring::npos ||
+           lowered.find(L"vampire")!=std::wstring::npos)return 2;
+        if(lowered.find(L"mothman")!=std::wstring::npos ||
+           lowered.find(L"blackwing")!=std::wstring::npos)return 1;
+        return 0;
+    }
+    bool IsGameStateBasedOn(uintptr_t obj,const wchar_t* baseName) {
+        auto cls=ReadPtr(obj+0x10);
+        for(int depth=0;cls && depth<20;++depth) {
+            if(ClassName(cls)==baseName)return true;
+            const auto parent=ReadPtr(cls+0x40);
+            if(!parent || parent==cls)break;
+            cls=parent;
+        }
+        return false;
+    }
     int NativeHuntNightState() {
 #ifdef FCH_STANDALONE
-        // Original SDK: World.AuthorityGameMode (+0x158), FL_Gamemode_C
-        // Director (+0x348), Director_C.IsNight (+0xB0). Director.IsNight
-        // is not replicated, so clients MUST NOT infer daylight from it.
+        // FL_Gamestate_C.IsNight (+0x33C) IS replicated in the exact
+        // SDK. Prefer it: it also gives spectators and remote clients
+        // the server's phase without inventing a local daylight clock.
         const auto world=World();
+        const auto state=ReadPtr(world+0x160);
+        if(state && IsGameStateBasedOn(state,L"FL_Gamestate_C") &&
+           !IsGameStateBasedOn(state,L"GameState_Lobby_C")) {
+            bool night=false;
+            if(Read(state+0x33C,night))return night?1:0;
+        }
+        // Host-only fallback if game state has not initialized yet.
         const auto gm=ReadPtr(world+0x158);
         const auto director=ReadPtr(gm+0x348);
         if(!director || ClassName(ReadPtr(director+0x10))!=L"Director_C")
